@@ -1,0 +1,41 @@
+[package]
+name = "ondrive"
+version = "0.0.1"
+edition = "2024"
+description = "Rust motion-control / path-tracking library for mobile robots (PID, pure pursuit, Stanley, LQR, MPC, MPPI, ...)"
+license = "MIT"
+readme = "README.md"
+publish = false
+include = [
+    "Cargo.toml",
+    "pyproject.toml",
+    "README.md",
+    "include/**/*.h",
+    "src/**/*.rs",
+    "examples/**/*.rs",
+    "tests/**/*.rs",
+]
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+python = ["dep:pyo3", "pyo3/abi3-py39", "pyo3/auto-initialize"]
+python-extension = ["python", "pyo3/extension-module"]
+
+[dependencies]
+datapod = { path = "../datapod" }
+stateup = { git = "https://codeberg.org/robolibs/stateup.git" }
+nalgebra = "0.33"
+rand = "0.8"
+rand_distr = "0.4"
+pyo3 = { version = "0.23", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+[dev-dependencies]
+rerun = { version = "0.31.2", default-features = false, features = ["sdk", "server"] }
+approx = "0.5"
