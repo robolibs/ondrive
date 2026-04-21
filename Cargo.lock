@@ -885,10 +885,6 @@ dependencies = [
 [[package]]
 name = "datapod"
 version = "0.0.1"
-
-[[package]]
-name = "datapod"
-version = "0.0.1"
 source = "git+https://codeberg.org/robolibs/datapod.git#cddb51e98ab4002bbc5de9198973bc137eabbaa0"
 
 [[package]]
@@ -2121,7 +2117,7 @@ name = "ondrive"
 version = "0.0.1"
 dependencies = [
  "approx",
- "datapod 0.0.1",
+ "datapod",
  "nalgebra",
  "pyo3",
  "rand 0.8.6",
@@ -3906,7 +3902,7 @@ name = "stateup"
 version = "0.0.1"
 source = "git+https://codeberg.org/robolibs/stateup.git#5eac6ef5e9f35b7e8bbd69b5ee4bf43519b10789"
 dependencies = [
- "datapod 0.0.1 (git+https://codeberg.org/robolibs/datapod.git)",
+ "datapod",
  "parking_lot",
  "rand 0.8.6",
  "rayon",

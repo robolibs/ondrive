@@ -26,7 +26,7 @@ python = ["dep:pyo3", "pyo3/abi3-py39", "pyo3/auto-initialize"]
 python-extension = ["python", "pyo3/extension-module"]
 
 [dependencies]
-datapod = { path = "../datapod" }
+datapod = { git = "https://codeberg.org/robolibs/datapod.git" }
 stateup = { git = "https://codeberg.org/robolibs/stateup.git" }
 nalgebra = "0.33"
 rand = "0.8"
