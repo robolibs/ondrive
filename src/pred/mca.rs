@@ -216,10 +216,7 @@ impl McaFollower {
             return collision_probs;
         }
 
-        let max_obstacle_radius = obstacles
-            .iter()
-            .map(|o| o.radius)
-            .fold(0.0_f64, f64::max);
+        let max_obstacle_radius = obstacles.iter().map(|o| o.radius).fold(0.0_f64, f64::max);
         let total_radius = robot_radius + max_obstacle_radius;
 
         x_min -= total_radius;
@@ -277,8 +274,8 @@ impl McaFollower {
             }
 
             if count_in_region > 0 {
-                let p = (collision_area / count_in_region as f64) * sum_prob / bbox_area
-                    * nmc as f64;
+                let p =
+                    (collision_area / count_in_region as f64) * sum_prob / bbox_area * nmc as f64;
                 collision_probs[k_idx] = p.clamp(0.0, 1.0);
             }
         }
@@ -299,7 +296,9 @@ impl Controller for McaFollower {
         // Without obstacles, behave exactly like MPPI.
         let has_obstacles = world.is_some_and(|w| !w.obstacles.is_empty());
         if !has_obstacles {
-            let cmd = self.mppi.compute_control(state, goal, constraints, dt, world);
+            let cmd = self
+                .mppi
+                .compute_control(state, goal, constraints, dt, world);
             // keep our own status mirrored so callers observe MCA state.
             return cmd;
         }
@@ -396,7 +395,10 @@ impl Controller for McaFollower {
                 }
                 yaw = normalize_angle(yaw);
                 v += a * dt_internal;
-                v = v.clamp(constraints.min_linear_velocity, constraints.max_linear_velocity);
+                v = v.clamp(
+                    constraints.min_linear_velocity,
+                    constraints.max_linear_velocity,
+                );
 
                 trajectories[sample_idx].push(Point::new(x, y, 0.0));
 
@@ -476,11 +478,15 @@ impl Controller for McaFollower {
             self.mean_steering[i] += d_delta;
             self.mean_acceleration[i] += d_acc;
             if is_diff {
-                self.mean_steering[i] = self.mean_steering[i]
-                    .clamp(-constraints.max_angular_velocity, constraints.max_angular_velocity);
+                self.mean_steering[i] = self.mean_steering[i].clamp(
+                    -constraints.max_angular_velocity,
+                    constraints.max_angular_velocity,
+                );
             } else {
-                self.mean_steering[i] = self.mean_steering[i]
-                    .clamp(-constraints.max_steering_angle, constraints.max_steering_angle);
+                self.mean_steering[i] = self.mean_steering[i].clamp(
+                    -constraints.max_steering_angle,
+                    constraints.max_steering_angle,
+                );
             }
             self.mean_acceleration[i] = self.mean_acceleration[i].clamp(
                 -constraints.max_linear_acceleration,
@@ -517,11 +523,15 @@ impl Controller for McaFollower {
         target_velocity = target_velocity.clamp(min_vel, constraints.max_linear_velocity);
 
         let angular_output = if is_diff {
-            steering_or_omega
-                .clamp(-constraints.max_angular_velocity, constraints.max_angular_velocity)
+            steering_or_omega.clamp(
+                -constraints.max_angular_velocity,
+                constraints.max_angular_velocity,
+            )
         } else {
-            steering_or_omega
-                .clamp(-constraints.max_steering_angle, constraints.max_steering_angle)
+            steering_or_omega.clamp(
+                -constraints.max_steering_angle,
+                constraints.max_steering_angle,
+            )
         };
 
         let (linear, angular) = match cfg.output_units {

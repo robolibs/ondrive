@@ -131,9 +131,10 @@ impl Tracker {
             return Some(g.target_pose.point);
         }
         let path = self.path.as_ref()?;
-        let idx = self.controller.get_path_index().min(
-            path.waypoints.len().saturating_sub(1),
-        );
+        let idx = self
+            .controller
+            .get_path_index()
+            .min(path.waypoints.len().saturating_sub(1));
         Some(path.waypoints.get(idx)?.point)
     }
 
@@ -188,7 +189,10 @@ fn densify_path(waypoints: &[Pose], max_segment_m: f64) -> Vec<Pose> {
                 start.point.z + t * dz,
             );
             let rot = slerp(start.rotation, end.rotation, t);
-            out.push(Pose { point: p, rotation: rot });
+            out.push(Pose {
+                point: p,
+                rotation: rot,
+            });
         }
         out.push(end);
     }
@@ -213,7 +217,12 @@ fn slerp(a: Quaternion, b: Quaternion, t: f64) -> Quaternion {
         let y = a.y + t * (by - a.y);
         let z = a.z + t * (bz - a.z);
         let n = (w * w + x * x + y * y + z * z).sqrt().max(1e-12);
-        return Quaternion { w: w / n, x: x / n, y: y / n, z: z / n };
+        return Quaternion {
+            w: w / n,
+            x: x / n,
+            y: y / n,
+            z: z / n,
+        };
     }
 
     let half = cos_half.acos();

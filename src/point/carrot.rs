@@ -68,8 +68,10 @@ impl Controller for CarrotFollower {
                 valid: true,
                 status_message: "Turning to align".into(),
                 linear_velocity: 0.0,
-                angular_velocity: angular_control
-                    .clamp(-constraints.max_angular_velocity, constraints.max_angular_velocity),
+                angular_velocity: angular_control.clamp(
+                    -constraints.max_angular_velocity,
+                    constraints.max_angular_velocity,
+                ),
                 ..VelocityCommand::default()
             };
         }
@@ -83,8 +85,10 @@ impl Controller for CarrotFollower {
             valid: true,
             status_message: "Chasing carrot".into(),
             linear_velocity: linear_control.clamp(0.0, constraints.max_linear_velocity),
-            angular_velocity: angular_control
-                .clamp(-constraints.max_angular_velocity, constraints.max_angular_velocity),
+            angular_velocity: angular_control.clamp(
+                -constraints.max_angular_velocity,
+                constraints.max_angular_velocity,
+            ),
             ..VelocityCommand::default()
         }
     }

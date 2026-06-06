@@ -1,9 +1,9 @@
 //! Stanley path-following example.
 
+#![allow(clippy::field_reassign_with_default)]
+
 use datapod::{Euler, Point, Pose, Quaternion};
-use ondrive::{
-    ControllerConfig, Goal, Path, RobotConstraints, RobotState, Tracker, TrackerKind,
-};
+use ondrive::{ControllerConfig, Goal, Path, RobotConstraints, RobotState, Tracker, TrackerKind};
 
 fn pose_at(x: f64, y: f64) -> Pose {
     Pose {

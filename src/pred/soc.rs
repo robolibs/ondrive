@@ -11,6 +11,8 @@
 //!      from Gaussians centred at the best guide with those variances.
 //!   4. MPPI-weight the final particles to produce the output command.
 
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+
 use crate::controller::{Controller, ControllerBase, is_goal_reached};
 use crate::core::math::normalize_angle;
 use crate::types::{
@@ -300,12 +302,9 @@ impl SocFollower {
                 if pair_sq.is_empty() {
                     self.soc_config.kernel_bandwidth.powi(2).max(1e-6)
                 } else {
-                    pair_sq.sort_by(|a, b| {
-                        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                    });
+                    pair_sq.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                     let median = pair_sq[pair_sq.len() / 2];
-                    let heuristic =
-                        median / (2.0 * (n_particles as f64).ln().max(1e-6));
+                    let heuristic = median / (2.0 * (n_particles as f64).ln().max(1e-6));
                     heuristic.max(self.soc_config.kernel_bandwidth.powi(2) * 1e-3)
                 }
             };
@@ -324,8 +323,7 @@ impl SocFollower {
                         // k(x_j, x_i) · ∇ log p(x_j)
                         phi[i][d] += kernel * grad_log_p[j][d];
                         // + ∇_{x_j} k(x_j, x_i) = -k · (x_j - x_i) / h²
-                        phi[i][d] +=
-                            -kernel * (flats[j][d] - flats[i][d]) / bandwidth_sq;
+                        phi[i][d] += -kernel * (flats[j][d] - flats[i][d]) / bandwidth_sq;
                     }
                 }
                 for d in 0..dims {
@@ -392,7 +390,9 @@ impl SocFollower {
                     let d = Normal::new(mean_steering[i], ss[i].sqrt().max(1e-9))
                         .unwrap()
                         .sample(rng);
-                    let a = Normal::new(mean_accel[i], aa[i].sqrt().max(1e-9)).unwrap().sample(rng);
+                    let a = Normal::new(mean_accel[i], aa[i].sqrt().max(1e-9))
+                        .unwrap()
+                        .sample(rng);
                     (d, a)
                 }
                 _ => (mean_steering[i], mean_accel[i]),
@@ -433,7 +433,10 @@ impl SocFollower {
             }
             yaw = normalize_angle(yaw);
             v += a * dt;
-            v = v.clamp(constraints.min_linear_velocity, constraints.max_linear_velocity);
+            v = v.clamp(
+                constraints.min_linear_velocity,
+                constraints.max_linear_velocity,
+            );
 
             // Cost: min distance from current point to any path waypoint
             let mut min_path_dist = f64::MAX;
@@ -601,10 +604,14 @@ impl Controller for SocFollower {
             }
             sv /= k_guide as f64;
             av /= k_guide as f64;
-            adapted_steer_cov[i] =
-                sv.clamp(self.soc_config.min_steer_variance, self.soc_config.max_steer_variance);
-            adapted_accel_cov[i] =
-                av.clamp(self.soc_config.min_steer_variance, self.soc_config.max_steer_variance);
+            adapted_steer_cov[i] = sv.clamp(
+                self.soc_config.min_steer_variance,
+                self.soc_config.max_steer_variance,
+            );
+            adapted_accel_cov[i] = av.clamp(
+                self.soc_config.min_steer_variance,
+                self.soc_config.max_steer_variance,
+            );
         }
 
         // Final MPPI sampling around best guide with adapted variance.
@@ -687,11 +694,15 @@ impl Controller for SocFollower {
         target_velocity = target_velocity.clamp(min_vel, constraints.max_linear_velocity);
 
         let angular_output = if is_diff {
-            steering_cmd
-                .clamp(-constraints.max_angular_velocity, constraints.max_angular_velocity)
+            steering_cmd.clamp(
+                -constraints.max_angular_velocity,
+                constraints.max_angular_velocity,
+            )
         } else {
-            steering_cmd
-                .clamp(-constraints.max_steering_angle, constraints.max_steering_angle)
+            steering_cmd.clamp(
+                -constraints.max_steering_angle,
+                constraints.max_steering_angle,
+            )
         };
 
         let (linear, angular) = match cfg.output_units {
@@ -717,8 +728,7 @@ impl Controller for SocFollower {
             OutputUnits::Physical => (target_velocity, angular_output),
         };
 
-        self.base.status.distance_to_goal =
-            state.pose.point.distance_to(goal.target_pose.point);
+        self.base.status.distance_to_goal = state.pose.point.distance_to(goal.target_pose.point);
         self.base.status.goal_reached = false;
         self.base.status.mode = "soc_tracking".into();
 

@@ -187,8 +187,7 @@ impl Controller for PurePursuitFollower {
         let dy = target_point.y - rear_y;
         let alpha = normalize_angle(dy.atan2(dx) - yaw);
 
-        self.base.status.distance_to_goal =
-            state.pose.point.distance_to(goal.target_pose.point);
+        self.base.status.distance_to_goal = state.pose.point.distance_to(goal.target_pose.point);
         self.base.status.cross_track_error = (alpha.sin() * dx.hypot(dy)).abs();
         self.base.status.goal_reached = false;
         self.base.status.mode = "pure_pursuit".into();
@@ -201,7 +200,9 @@ impl Controller for PurePursuitFollower {
                 constraints.max_angular_velocity,
             );
             let (linear, angular) = match cfg.output_units {
-                OutputUnits::Normalized => (0.0, angular_physical / constraints.max_angular_velocity),
+                OutputUnits::Normalized => {
+                    (0.0, angular_physical / constraints.max_angular_velocity)
+                }
                 OutputUnits::Physical => (0.0, angular_physical),
             };
             self.base.status.mode = "turning".into();

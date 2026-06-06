@@ -1,3 +1,5 @@
+#![allow(clippy::needless_range_loop)]
+
 use crate::controller::{Controller, ControllerBase, is_goal_reached};
 use crate::core::math::normalize_angle;
 use crate::types::{
@@ -51,10 +53,7 @@ fn compute_lqr_gain(
     is_diff_drive: bool,
 ) -> Vector4<f64> {
     let a = Matrix4::new(
-        1.0, dt, 0.0, 0.0,
-        0.0, 1.0, velocity, 0.0,
-        0.0, 0.0, 1.0, dt,
-        0.0, 0.0, 0.0, 1.0,
+        1.0, dt, 0.0, 0.0, 0.0, 1.0, velocity, 0.0, 0.0, 0.0, 1.0, dt, 0.0, 0.0, 0.0, 1.0,
     );
 
     let b_last = if is_diff_drive {
@@ -133,8 +132,7 @@ impl LqrFollower {
         let dx = state.pose.point.x - nearest_point.x;
         let dy = state.pose.point.y - nearest_point.y;
         let lateral_error = -dx * path_heading.sin() + dy * path_heading.cos();
-        let heading_error =
-            normalize_angle(state.pose.rotation.to_euler().yaw - path_heading);
+        let heading_error = normalize_angle(state.pose.rotation.to_euler().yaw - path_heading);
 
         let path_curvature = if nearest_idx > 0 && nearest_idx + 1 < waypoints.len() {
             let prev = waypoints[nearest_idx - 1].point;
@@ -252,8 +250,7 @@ impl Controller for LqrFollower {
         );
         let feedback_control = -k.dot(&state_error);
 
-        self.base.status.distance_to_goal =
-            state.pose.point.distance_to(goal.target_pose.point);
+        self.base.status.distance_to_goal = state.pose.point.distance_to(goal.target_pose.point);
         self.base.status.cross_track_error = error.lateral_error.abs();
         self.base.status.heading_error = error.heading_error.abs();
         self.base.status.goal_reached = false;
@@ -268,8 +265,7 @@ impl Controller for LqrFollower {
                 constraints.max_angular_velocity,
             )
         } else {
-            let feedforward_steering =
-                (constraints.wheelbase * error.path_curvature).atan2(1.0);
+            let feedforward_steering = (constraints.wheelbase * error.path_curvature).atan2(1.0);
             let steering_angle = (feedforward_steering + feedback_control).clamp(
                 -constraints.max_steering_angle,
                 constraints.max_steering_angle,

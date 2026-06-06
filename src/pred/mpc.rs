@@ -1,3 +1,9 @@
+#![allow(
+    clippy::implicit_saturating_sub,
+    clippy::needless_range_loop,
+    clippy::type_complexity
+)]
+
 use crate::controller::{Controller, ControllerBase, is_goal_reached};
 use crate::core::math::normalize_angle;
 use crate::types::{
@@ -257,11 +263,15 @@ impl MpcFollower {
         let clamp_controls = |ctrl: &mut [f64]| {
             for i in 0..horizon {
                 if is_diff {
-                    ctrl[2 * i] = ctrl[2 * i]
-                        .clamp(-constraints.max_angular_velocity, constraints.max_angular_velocity);
+                    ctrl[2 * i] = ctrl[2 * i].clamp(
+                        -constraints.max_angular_velocity,
+                        constraints.max_angular_velocity,
+                    );
                 } else {
-                    ctrl[2 * i] = ctrl[2 * i]
-                        .clamp(-constraints.max_steering_angle, constraints.max_steering_angle);
+                    ctrl[2 * i] = ctrl[2 * i].clamp(
+                        -constraints.max_steering_angle,
+                        constraints.max_steering_angle,
+                    );
                 }
                 ctrl[2 * i + 1] = ctrl[2 * i + 1].clamp(
                     -constraints.max_linear_acceleration,
@@ -333,7 +343,10 @@ impl MpcFollower {
                         yaw += 2.0 * PI;
                     }
                     v += accel * dt;
-                    v = v.clamp(constraints.min_linear_velocity, constraints.max_linear_velocity);
+                    v = v.clamp(
+                        constraints.min_linear_velocity,
+                        constraints.max_linear_velocity,
+                    );
 
                     if collect {
                         traj_x.push(x);
@@ -341,11 +354,27 @@ impl MpcFollower {
                     }
 
                     let ref_len = ref_traj.x.len();
-                    let ref_idx = if ref_len == 0 { 0 } else { (i + 1).min(ref_len - 1) };
+                    let ref_idx = if ref_len == 0 {
+                        0
+                    } else {
+                        (i + 1).min(ref_len - 1)
+                    };
 
-                    let ref_x = if ref_traj.x.is_empty() { x } else { ref_traj.x[ref_idx] };
-                    let ref_y = if ref_traj.y.is_empty() { y } else { ref_traj.y[ref_idx] };
-                    let ref_yaw = if ref_traj.yaw.is_empty() { yaw } else { ref_traj.yaw[ref_idx] };
+                    let ref_x = if ref_traj.x.is_empty() {
+                        x
+                    } else {
+                        ref_traj.x[ref_idx]
+                    };
+                    let ref_y = if ref_traj.y.is_empty() {
+                        y
+                    } else {
+                        ref_traj.y[ref_idx]
+                    };
+                    let ref_yaw = if ref_traj.yaw.is_empty() {
+                        yaw
+                    } else {
+                        ref_traj.yaw[ref_idx]
+                    };
                     let ref_v = if ref_traj.velocity.is_empty() {
                         config.ref_velocity
                     } else {
@@ -568,8 +597,7 @@ impl Controller for MpcFollower {
             self.predicted_trajectory.push(Point::new(*x, *y, 0.0));
         }
 
-        self.base.status.distance_to_goal =
-            state.pose.point.distance_to(goal.target_pose.point);
+        self.base.status.distance_to_goal = state.pose.point.distance_to(goal.target_pose.point);
         self.base.status.cross_track_error = error.cte.abs();
         self.base.status.heading_error = error.epsi.abs();
         self.base.status.goal_reached = false;
@@ -588,13 +616,15 @@ impl Controller for MpcFollower {
         target_velocity = target_velocity.clamp(min_vel, constraints.max_linear_velocity);
 
         let angular_output = if is_diff {
-            solution
-                .steering
-                .clamp(-constraints.max_angular_velocity, constraints.max_angular_velocity)
+            solution.steering.clamp(
+                -constraints.max_angular_velocity,
+                constraints.max_angular_velocity,
+            )
         } else {
-            solution
-                .steering
-                .clamp(-constraints.max_steering_angle, constraints.max_steering_angle)
+            solution.steering.clamp(
+                -constraints.max_steering_angle,
+                constraints.max_steering_angle,
+            )
         };
 
         let (linear, angular) = match cfg.output_units {
@@ -620,7 +650,11 @@ impl Controller for MpcFollower {
             OutputUnits::Physical => (target_velocity, angular_output),
         };
 
-        let linear = if self.is_turning_in_place { 0.0 } else { linear };
+        let linear = if self.is_turning_in_place {
+            0.0
+        } else {
+            linear
+        };
 
         VelocityCommand {
             valid: true,

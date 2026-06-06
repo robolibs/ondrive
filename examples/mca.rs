@@ -4,6 +4,8 @@
 //! budget for the demo (the default 20 000 MC samples per horizon step is
 //! too heavy for an interactive run).
 
+#![allow(clippy::field_reassign_with_default)]
+
 use datapod::{Euler, Point, Pose, Quaternion};
 use ondrive::{
     Controller, ControllerConfig, GaussianMode, Goal, McaConfig, McaFollower, Obstacle,
@@ -94,15 +96,18 @@ fn main() {
         state.velocity.linear = cmd.linear_velocity;
         t += dt;
 
-        let clearance =
-            ((state.pose.point.x - 6.0).powi(2) + state.pose.point.y.powi(2)).sqrt();
+        let clearance = ((state.pose.point.x - 6.0).powi(2) + state.pose.point.y.powi(2)).sqrt();
         min_clearance = min_clearance.min(clearance);
 
         if t - last_print >= 0.5 {
             println!(
                 "t={:5.2} pos=({:5.2},{:5.2}) v={:.2} w={:.2} clearance={:.3}",
-                t, state.pose.point.x, state.pose.point.y, cmd.linear_velocity,
-                cmd.angular_velocity, clearance
+                t,
+                state.pose.point.x,
+                state.pose.point.y,
+                cmd.linear_velocity,
+                cmd.angular_velocity,
+                clearance
             );
             last_print = t;
         }

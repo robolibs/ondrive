@@ -1,6 +1,8 @@
+#![allow(clippy::field_reassign_with_default)]
+
 use datapod::{Euler, Point, Pose, Quaternion};
 use ondrive::{
-    ControllerConfig, Controller, Goal, MppiConfig, MppiFollower, OutputUnits, Path,
+    Controller, ControllerConfig, Goal, MppiConfig, MppiFollower, OutputUnits, Path,
     RobotConstraints, RobotState, Velocity,
 };
 

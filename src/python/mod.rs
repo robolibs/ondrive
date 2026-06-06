@@ -5,6 +5,8 @@
 //! and keyword-argument constructors so they feel native on the Python
 //! side.
 
+#![allow(clippy::too_many_arguments)]
+
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
@@ -191,39 +193,120 @@ impl PyControllerConfig {
 
     #[staticmethod]
     fn default_() -> Self {
-        Self { inner: ControllerConfig::default() }
+        Self {
+            inner: ControllerConfig::default(),
+        }
     }
 
-    #[getter] fn output_units(&self) -> &'static str { units_to_str(self.inner.output_units) }
-    #[setter] fn set_output_units(&mut self, v: &str) -> PyResult<()> { self.inner.output_units = units_from_str(v)?; Ok(()) }
+    #[getter]
+    fn output_units(&self) -> &'static str {
+        units_to_str(self.inner.output_units)
+    }
+    #[setter]
+    fn set_output_units(&mut self, v: &str) -> PyResult<()> {
+        self.inner.output_units = units_from_str(v)?;
+        Ok(())
+    }
 
-    #[getter] fn kp_linear(&self) -> f64 { self.inner.kp_linear }
-    #[setter] fn set_kp_linear(&mut self, v: f64) { self.inner.kp_linear = v; }
-    #[getter] fn ki_linear(&self) -> f64 { self.inner.ki_linear }
-    #[setter] fn set_ki_linear(&mut self, v: f64) { self.inner.ki_linear = v; }
-    #[getter] fn kd_linear(&self) -> f64 { self.inner.kd_linear }
-    #[setter] fn set_kd_linear(&mut self, v: f64) { self.inner.kd_linear = v; }
+    #[getter]
+    fn kp_linear(&self) -> f64 {
+        self.inner.kp_linear
+    }
+    #[setter]
+    fn set_kp_linear(&mut self, v: f64) {
+        self.inner.kp_linear = v;
+    }
+    #[getter]
+    fn ki_linear(&self) -> f64 {
+        self.inner.ki_linear
+    }
+    #[setter]
+    fn set_ki_linear(&mut self, v: f64) {
+        self.inner.ki_linear = v;
+    }
+    #[getter]
+    fn kd_linear(&self) -> f64 {
+        self.inner.kd_linear
+    }
+    #[setter]
+    fn set_kd_linear(&mut self, v: f64) {
+        self.inner.kd_linear = v;
+    }
 
-    #[getter] fn kp_angular(&self) -> f64 { self.inner.kp_angular }
-    #[setter] fn set_kp_angular(&mut self, v: f64) { self.inner.kp_angular = v; }
-    #[getter] fn ki_angular(&self) -> f64 { self.inner.ki_angular }
-    #[setter] fn set_ki_angular(&mut self, v: f64) { self.inner.ki_angular = v; }
-    #[getter] fn kd_angular(&self) -> f64 { self.inner.kd_angular }
-    #[setter] fn set_kd_angular(&mut self, v: f64) { self.inner.kd_angular = v; }
+    #[getter]
+    fn kp_angular(&self) -> f64 {
+        self.inner.kp_angular
+    }
+    #[setter]
+    fn set_kp_angular(&mut self, v: f64) {
+        self.inner.kp_angular = v;
+    }
+    #[getter]
+    fn ki_angular(&self) -> f64 {
+        self.inner.ki_angular
+    }
+    #[setter]
+    fn set_ki_angular(&mut self, v: f64) {
+        self.inner.ki_angular = v;
+    }
+    #[getter]
+    fn kd_angular(&self) -> f64 {
+        self.inner.kd_angular
+    }
+    #[setter]
+    fn set_kd_angular(&mut self, v: f64) {
+        self.inner.kd_angular = v;
+    }
 
-    #[getter] fn lookahead_distance(&self) -> f64 { self.inner.lookahead_distance }
-    #[setter] fn set_lookahead_distance(&mut self, v: f64) { self.inner.lookahead_distance = v; }
-    #[getter] fn k_cross_track(&self) -> f64 { self.inner.k_cross_track }
-    #[setter] fn set_k_cross_track(&mut self, v: f64) { self.inner.k_cross_track = v; }
-    #[getter] fn k_heading(&self) -> f64 { self.inner.k_heading }
-    #[setter] fn set_k_heading(&mut self, v: f64) { self.inner.k_heading = v; }
+    #[getter]
+    fn lookahead_distance(&self) -> f64 {
+        self.inner.lookahead_distance
+    }
+    #[setter]
+    fn set_lookahead_distance(&mut self, v: f64) {
+        self.inner.lookahead_distance = v;
+    }
+    #[getter]
+    fn k_cross_track(&self) -> f64 {
+        self.inner.k_cross_track
+    }
+    #[setter]
+    fn set_k_cross_track(&mut self, v: f64) {
+        self.inner.k_cross_track = v;
+    }
+    #[getter]
+    fn k_heading(&self) -> f64 {
+        self.inner.k_heading
+    }
+    #[setter]
+    fn set_k_heading(&mut self, v: f64) {
+        self.inner.k_heading = v;
+    }
 
-    #[getter] fn allow_reverse(&self) -> bool { self.inner.allow_reverse }
-    #[setter] fn set_allow_reverse(&mut self, v: bool) { self.inner.allow_reverse = v; }
-    #[getter] fn goal_tolerance(&self) -> f64 { self.inner.goal_tolerance }
-    #[setter] fn set_goal_tolerance(&mut self, v: f64) { self.inner.goal_tolerance = v; }
-    #[getter] fn angular_tolerance(&self) -> f64 { self.inner.angular_tolerance }
-    #[setter] fn set_angular_tolerance(&mut self, v: f64) { self.inner.angular_tolerance = v; }
+    #[getter]
+    fn allow_reverse(&self) -> bool {
+        self.inner.allow_reverse
+    }
+    #[setter]
+    fn set_allow_reverse(&mut self, v: bool) {
+        self.inner.allow_reverse = v;
+    }
+    #[getter]
+    fn goal_tolerance(&self) -> f64 {
+        self.inner.goal_tolerance
+    }
+    #[setter]
+    fn set_goal_tolerance(&mut self, v: f64) {
+        self.inner.goal_tolerance = v;
+    }
+    #[getter]
+    fn angular_tolerance(&self) -> f64 {
+        self.inner.angular_tolerance
+    }
+    #[setter]
+    fn set_angular_tolerance(&mut self, v: f64) {
+        self.inner.angular_tolerance = v;
+    }
 
     fn __repr__(&self) -> String {
         format!(
@@ -299,46 +382,145 @@ impl PyRobotConstraints {
 
     #[staticmethod]
     fn default_() -> Self {
-        Self { inner: RsConstraints::default() }
+        Self {
+            inner: RsConstraints::default(),
+        }
     }
 
-    #[getter] fn steering_type(&self) -> &'static str { steering_to_str(self.inner.steering_type) }
-    #[setter] fn set_steering_type(&mut self, v: &str) -> PyResult<()> { self.inner.steering_type = steering_from_str(v)?; Ok(()) }
+    #[getter]
+    fn steering_type(&self) -> &'static str {
+        steering_to_str(self.inner.steering_type)
+    }
+    #[setter]
+    fn set_steering_type(&mut self, v: &str) -> PyResult<()> {
+        self.inner.steering_type = steering_from_str(v)?;
+        Ok(())
+    }
 
-    #[getter] fn wheelbase(&self) -> f64 { self.inner.wheelbase }
-    #[setter] fn set_wheelbase(&mut self, v: f64) { self.inner.wheelbase = v; }
-    #[getter] fn track_width(&self) -> f64 { self.inner.track_width }
-    #[setter] fn set_track_width(&mut self, v: f64) { self.inner.track_width = v; }
-    #[getter] fn wheel_radius(&self) -> f64 { self.inner.wheel_radius }
-    #[setter] fn set_wheel_radius(&mut self, v: f64) { self.inner.wheel_radius = v; }
+    #[getter]
+    fn wheelbase(&self) -> f64 {
+        self.inner.wheelbase
+    }
+    #[setter]
+    fn set_wheelbase(&mut self, v: f64) {
+        self.inner.wheelbase = v;
+    }
+    #[getter]
+    fn track_width(&self) -> f64 {
+        self.inner.track_width
+    }
+    #[setter]
+    fn set_track_width(&mut self, v: f64) {
+        self.inner.track_width = v;
+    }
+    #[getter]
+    fn wheel_radius(&self) -> f64 {
+        self.inner.wheel_radius
+    }
+    #[setter]
+    fn set_wheel_radius(&mut self, v: f64) {
+        self.inner.wheel_radius = v;
+    }
 
-    #[getter] fn max_linear_velocity(&self) -> f64 { self.inner.max_linear_velocity }
-    #[setter] fn set_max_linear_velocity(&mut self, v: f64) { self.inner.max_linear_velocity = v; }
-    #[getter] fn min_linear_velocity(&self) -> f64 { self.inner.min_linear_velocity }
-    #[setter] fn set_min_linear_velocity(&mut self, v: f64) { self.inner.min_linear_velocity = v; }
-    #[getter] fn max_angular_velocity(&self) -> f64 { self.inner.max_angular_velocity }
-    #[setter] fn set_max_angular_velocity(&mut self, v: f64) { self.inner.max_angular_velocity = v; }
-    #[getter] fn max_linear_acceleration(&self) -> f64 { self.inner.max_linear_acceleration }
-    #[setter] fn set_max_linear_acceleration(&mut self, v: f64) { self.inner.max_linear_acceleration = v; }
-    #[getter] fn max_angular_acceleration(&self) -> f64 { self.inner.max_angular_acceleration }
-    #[setter] fn set_max_angular_acceleration(&mut self, v: f64) { self.inner.max_angular_acceleration = v; }
+    #[getter]
+    fn max_linear_velocity(&self) -> f64 {
+        self.inner.max_linear_velocity
+    }
+    #[setter]
+    fn set_max_linear_velocity(&mut self, v: f64) {
+        self.inner.max_linear_velocity = v;
+    }
+    #[getter]
+    fn min_linear_velocity(&self) -> f64 {
+        self.inner.min_linear_velocity
+    }
+    #[setter]
+    fn set_min_linear_velocity(&mut self, v: f64) {
+        self.inner.min_linear_velocity = v;
+    }
+    #[getter]
+    fn max_angular_velocity(&self) -> f64 {
+        self.inner.max_angular_velocity
+    }
+    #[setter]
+    fn set_max_angular_velocity(&mut self, v: f64) {
+        self.inner.max_angular_velocity = v;
+    }
+    #[getter]
+    fn max_linear_acceleration(&self) -> f64 {
+        self.inner.max_linear_acceleration
+    }
+    #[setter]
+    fn set_max_linear_acceleration(&mut self, v: f64) {
+        self.inner.max_linear_acceleration = v;
+    }
+    #[getter]
+    fn max_angular_acceleration(&self) -> f64 {
+        self.inner.max_angular_acceleration
+    }
+    #[setter]
+    fn set_max_angular_acceleration(&mut self, v: f64) {
+        self.inner.max_angular_acceleration = v;
+    }
 
-    #[getter] fn max_steering_angle(&self) -> f64 { self.inner.max_steering_angle }
-    #[setter] fn set_max_steering_angle(&mut self, v: f64) { self.inner.max_steering_angle = v; }
-    #[getter] fn max_steering_rate(&self) -> f64 { self.inner.max_steering_rate }
-    #[setter] fn set_max_steering_rate(&mut self, v: f64) { self.inner.max_steering_rate = v; }
-    #[getter] fn min_turning_radius(&self) -> f64 { self.inner.min_turning_radius }
-    #[setter] fn set_min_turning_radius(&mut self, v: f64) { self.inner.min_turning_radius = v; }
+    #[getter]
+    fn max_steering_angle(&self) -> f64 {
+        self.inner.max_steering_angle
+    }
+    #[setter]
+    fn set_max_steering_angle(&mut self, v: f64) {
+        self.inner.max_steering_angle = v;
+    }
+    #[getter]
+    fn max_steering_rate(&self) -> f64 {
+        self.inner.max_steering_rate
+    }
+    #[setter]
+    fn set_max_steering_rate(&mut self, v: f64) {
+        self.inner.max_steering_rate = v;
+    }
+    #[getter]
+    fn min_turning_radius(&self) -> f64 {
+        self.inner.min_turning_radius
+    }
+    #[setter]
+    fn set_min_turning_radius(&mut self, v: f64) {
+        self.inner.min_turning_radius = v;
+    }
 
-    #[getter] fn rear_wheelbase(&self) -> f64 { self.inner.rear_wheelbase }
-    #[setter] fn set_rear_wheelbase(&mut self, v: f64) { self.inner.rear_wheelbase = v; }
-    #[getter] fn max_rear_steering_angle(&self) -> f64 { self.inner.max_rear_steering_angle }
-    #[setter] fn set_max_rear_steering_angle(&mut self, v: f64) { self.inner.max_rear_steering_angle = v; }
+    #[getter]
+    fn rear_wheelbase(&self) -> f64 {
+        self.inner.rear_wheelbase
+    }
+    #[setter]
+    fn set_rear_wheelbase(&mut self, v: f64) {
+        self.inner.rear_wheelbase = v;
+    }
+    #[getter]
+    fn max_rear_steering_angle(&self) -> f64 {
+        self.inner.max_rear_steering_angle
+    }
+    #[setter]
+    fn set_max_rear_steering_angle(&mut self, v: f64) {
+        self.inner.max_rear_steering_angle = v;
+    }
 
-    #[getter] fn robot_width(&self) -> f64 { self.inner.robot_width }
-    #[setter] fn set_robot_width(&mut self, v: f64) { self.inner.robot_width = v; }
-    #[getter] fn robot_length(&self) -> f64 { self.inner.robot_length }
-    #[setter] fn set_robot_length(&mut self, v: f64) { self.inner.robot_length = v; }
+    #[getter]
+    fn robot_width(&self) -> f64 {
+        self.inner.robot_width
+    }
+    #[setter]
+    fn set_robot_width(&mut self, v: f64) {
+        self.inner.robot_width = v;
+    }
+    #[getter]
+    fn robot_length(&self) -> f64 {
+        self.inner.robot_length
+    }
+    #[setter]
+    fn set_robot_length(&mut self, v: f64) {
+        self.inner.robot_length = v;
+    }
 
     fn __repr__(&self) -> String {
         format!(
@@ -394,23 +576,61 @@ impl PyRobotState {
         }
     }
 
-    #[getter] fn pose(&self) -> PoseTuple { pose_to_tuple(self.inner.pose) }
-    #[setter] fn set_pose(&mut self, v: PoseTuple) { self.inner.pose = pose_from_tuple(v); }
-    #[getter] fn velocity(&self) -> VelocityTuple { velocity_to_tuple(self.inner.velocity) }
-    #[setter] fn set_velocity(&mut self, v: VelocityTuple) { self.inner.velocity = velocity_from_tuple(v); }
-    #[getter] fn timestamp(&self) -> f64 { self.inner.timestamp }
-    #[setter] fn set_timestamp(&mut self, v: f64) { self.inner.timestamp = v; }
-    #[getter] fn allow_reverse(&self) -> bool { self.inner.allow_reverse }
-    #[setter] fn set_allow_reverse(&mut self, v: bool) { self.inner.allow_reverse = v; }
-    #[getter] fn turn_first(&self) -> bool { self.inner.turn_first }
-    #[setter] fn set_turn_first(&mut self, v: bool) { self.inner.turn_first = v; }
-    #[getter] fn allow_move(&self) -> bool { self.inner.allow_move }
-    #[setter] fn set_allow_move(&mut self, v: bool) { self.inner.allow_move = v; }
+    #[getter]
+    fn pose(&self) -> PoseTuple {
+        pose_to_tuple(self.inner.pose)
+    }
+    #[setter]
+    fn set_pose(&mut self, v: PoseTuple) {
+        self.inner.pose = pose_from_tuple(v);
+    }
+    #[getter]
+    fn velocity(&self) -> VelocityTuple {
+        velocity_to_tuple(self.inner.velocity)
+    }
+    #[setter]
+    fn set_velocity(&mut self, v: VelocityTuple) {
+        self.inner.velocity = velocity_from_tuple(v);
+    }
+    #[getter]
+    fn timestamp(&self) -> f64 {
+        self.inner.timestamp
+    }
+    #[setter]
+    fn set_timestamp(&mut self, v: f64) {
+        self.inner.timestamp = v;
+    }
+    #[getter]
+    fn allow_reverse(&self) -> bool {
+        self.inner.allow_reverse
+    }
+    #[setter]
+    fn set_allow_reverse(&mut self, v: bool) {
+        self.inner.allow_reverse = v;
+    }
+    #[getter]
+    fn turn_first(&self) -> bool {
+        self.inner.turn_first
+    }
+    #[setter]
+    fn set_turn_first(&mut self, v: bool) {
+        self.inner.turn_first = v;
+    }
+    #[getter]
+    fn allow_move(&self) -> bool {
+        self.inner.allow_move
+    }
+    #[setter]
+    fn set_allow_move(&mut self, v: bool) {
+        self.inner.allow_move = v;
+    }
 
     fn __repr__(&self) -> String {
         let ((x, y, _), yaw) = pose_to_tuple(self.inner.pose);
-        format!("RobotState(x={:.3}, y={:.3}, yaw={:.3}, v={:.3})",
-            x, y, yaw, self.inner.velocity.linear)
+        format!(
+            "RobotState(x={:.3}, y={:.3}, yaw={:.3}, v={:.3})",
+            x, y, yaw, self.inner.velocity.linear
+        )
     }
 }
 
@@ -445,12 +665,30 @@ impl PyGoal {
         }
     }
 
-    #[getter] fn target_pose(&self) -> PoseTuple { pose_to_tuple(self.inner.target_pose) }
-    #[setter] fn set_target_pose(&mut self, v: PoseTuple) { self.inner.target_pose = pose_from_tuple(v); }
-    #[getter] fn tolerance_position(&self) -> f64 { self.inner.tolerance_position }
-    #[setter] fn set_tolerance_position(&mut self, v: f64) { self.inner.tolerance_position = v; }
-    #[getter] fn tolerance_orientation(&self) -> f64 { self.inner.tolerance_orientation }
-    #[setter] fn set_tolerance_orientation(&mut self, v: f64) { self.inner.tolerance_orientation = v; }
+    #[getter]
+    fn target_pose(&self) -> PoseTuple {
+        pose_to_tuple(self.inner.target_pose)
+    }
+    #[setter]
+    fn set_target_pose(&mut self, v: PoseTuple) {
+        self.inner.target_pose = pose_from_tuple(v);
+    }
+    #[getter]
+    fn tolerance_position(&self) -> f64 {
+        self.inner.tolerance_position
+    }
+    #[setter]
+    fn set_tolerance_position(&mut self, v: f64) {
+        self.inner.tolerance_position = v;
+    }
+    #[getter]
+    fn tolerance_orientation(&self) -> f64 {
+        self.inner.tolerance_orientation
+    }
+    #[setter]
+    fn set_tolerance_orientation(&mut self, v: f64) {
+        self.inner.tolerance_orientation = v;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -465,15 +703,32 @@ pub struct PyVelocityCommand {
 
 #[pymethods]
 impl PyVelocityCommand {
-    #[getter] fn valid(&self) -> bool { self.inner.valid }
-    #[getter] fn linear_velocity(&self) -> f64 { self.inner.linear_velocity }
-    #[getter] fn angular_velocity(&self) -> f64 { self.inner.angular_velocity }
-    #[getter] fn lateral_velocity(&self) -> f64 { self.inner.lateral_velocity }
-    #[getter] fn status_message(&self) -> String { self.inner.status_message.clone() }
+    #[getter]
+    fn valid(&self) -> bool {
+        self.inner.valid
+    }
+    #[getter]
+    fn linear_velocity(&self) -> f64 {
+        self.inner.linear_velocity
+    }
+    #[getter]
+    fn angular_velocity(&self) -> f64 {
+        self.inner.angular_velocity
+    }
+    #[getter]
+    fn lateral_velocity(&self) -> f64 {
+        self.inner.lateral_velocity
+    }
+    #[getter]
+    fn status_message(&self) -> String {
+        self.inner.status_message.clone()
+    }
 
     fn __repr__(&self) -> String {
-        format!("VelocityCommand(valid={}, v={:.3}, w={:.3})",
-            self.inner.valid, self.inner.linear_velocity, self.inner.angular_velocity)
+        format!(
+            "VelocityCommand(valid={}, v={:.3}, w={:.3})",
+            self.inner.valid, self.inner.linear_velocity, self.inner.angular_velocity
+        )
     }
 }
 
@@ -485,16 +740,35 @@ pub struct PyControllerStatus {
 
 #[pymethods]
 impl PyControllerStatus {
-    #[getter] fn goal_reached(&self) -> bool { self.inner.goal_reached }
-    #[getter] fn distance_to_goal(&self) -> f64 { self.inner.distance_to_goal }
-    #[getter] fn cross_track_error(&self) -> f64 { self.inner.cross_track_error }
-    #[getter] fn heading_error(&self) -> f64 { self.inner.heading_error }
-    #[getter] fn mode(&self) -> String { self.inner.mode.clone() }
+    #[getter]
+    fn goal_reached(&self) -> bool {
+        self.inner.goal_reached
+    }
+    #[getter]
+    fn distance_to_goal(&self) -> f64 {
+        self.inner.distance_to_goal
+    }
+    #[getter]
+    fn cross_track_error(&self) -> f64 {
+        self.inner.cross_track_error
+    }
+    #[getter]
+    fn heading_error(&self) -> f64 {
+        self.inner.heading_error
+    }
+    #[getter]
+    fn mode(&self) -> String {
+        self.inner.mode.clone()
+    }
 
     fn __repr__(&self) -> String {
-        format!("ControllerStatus(mode={}, dist={:.3}, cte={:.3}, goal_reached={})",
-            self.inner.mode, self.inner.distance_to_goal,
-            self.inner.cross_track_error, self.inner.goal_reached)
+        format!(
+            "ControllerStatus(mode={}, dist={:.3}, cte={:.3}, goal_reached={})",
+            self.inner.mode,
+            self.inner.distance_to_goal,
+            self.inner.cross_track_error,
+            self.inner.goal_reached
+        )
     }
 }
 
@@ -531,7 +805,9 @@ impl PyPath {
 
     #[pyo3(signature = (x, y, yaw=None, speed=None))]
     fn add_waypoint_xy(&mut self, x: f64, y: f64, yaw: Option<f64>, speed: Option<f64>) {
-        self.inner.waypoints.push(pose_from_tuple(((x, y, 0.0), yaw.unwrap_or(0.0))));
+        self.inner
+            .waypoints
+            .push(pose_from_tuple(((x, y, 0.0), yaw.unwrap_or(0.0))));
         self.inner.speeds.push(speed.unwrap_or(0.0));
     }
 
@@ -540,10 +816,18 @@ impl PyPath {
         self.inner.speeds.clear();
     }
 
-    #[getter] fn is_closed(&self) -> bool { self.inner.is_closed }
-    #[setter] fn set_is_closed(&mut self, v: bool) { self.inner.is_closed = v; }
+    #[getter]
+    fn is_closed(&self) -> bool {
+        self.inner.is_closed
+    }
+    #[setter]
+    fn set_is_closed(&mut self, v: bool) {
+        self.inner.is_closed = v;
+    }
 
-    fn __len__(&self) -> usize { self.inner.waypoints.len() }
+    fn __len__(&self) -> usize {
+        self.inner.waypoints.len()
+    }
 
     fn waypoint(&self, idx: usize) -> PyResult<PoseTuple> {
         self.inner
@@ -554,7 +838,12 @@ impl PyPath {
     }
 
     fn waypoints(&self) -> Vec<PoseTuple> {
-        self.inner.waypoints.iter().copied().map(pose_to_tuple).collect()
+        self.inner
+            .waypoints
+            .iter()
+            .copied()
+            .map(pose_to_tuple)
+            .collect()
     }
 
     fn smoothen(&mut self, max_segment_m: f64) {
@@ -576,7 +865,9 @@ pub struct PyWorld {
 impl PyWorld {
     #[new]
     fn new() -> Self {
-        Self { inner: RsWorld::default() }
+        Self {
+            inner: RsWorld::default(),
+        }
     }
 
     #[pyo3(signature = (
@@ -645,7 +936,9 @@ impl PyWorld {
         self.inner.zones.clear();
     }
 
-    fn obstacle_count(&self) -> usize { self.inner.obstacles.len() }
+    fn obstacle_count(&self) -> usize {
+        self.inner.obstacles.len()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -661,11 +954,15 @@ pub struct PyTracker {
 impl PyTracker {
     #[new]
     fn new(kind: &str) -> PyResult<Self> {
-        Ok(Self { inner: RsTracker::new(kind_from_str(kind)?) })
+        Ok(Self {
+            inner: RsTracker::new(kind_from_str(kind)?),
+        })
     }
 
     #[getter]
-    fn kind(&self) -> &'static str { kind_to_str(self.inner.kind()) }
+    fn kind(&self) -> &'static str {
+        kind_to_str(self.inner.kind())
+    }
 
     fn init(&mut self, constraints: PyRobotConstraints) {
         self.inner.init(constraints.inner);
@@ -676,7 +973,9 @@ impl PyTracker {
     }
 
     fn get_config(&self) -> PyControllerConfig {
-        PyControllerConfig { inner: self.inner.get_config() }
+        PyControllerConfig {
+            inner: self.inner.get_config(),
+        }
     }
 
     fn set_goal(&mut self, goal: PyGoal) {
@@ -704,23 +1003,22 @@ impl PyTracker {
     }
 
     #[pyo3(signature = (state, dt, world = None))]
-    fn tick(
-        &mut self,
-        state: PyRobotState,
-        dt: f64,
-        world: Option<PyWorld>,
-    ) -> PyVelocityCommand {
+    fn tick(&mut self, state: PyRobotState, dt: f64, world: Option<PyWorld>) -> PyVelocityCommand {
         let w = world.map(|w| w.inner);
         let cmd = self.inner.tick(&state.inner, dt, w.as_ref());
         PyVelocityCommand { inner: cmd }
     }
 
     fn emergency_stop(&mut self) -> PyVelocityCommand {
-        PyVelocityCommand { inner: self.inner.emergency_stop() }
+        PyVelocityCommand {
+            inner: self.inner.emergency_stop(),
+        }
     }
 
     fn get_status(&self) -> PyControllerStatus {
-        PyControllerStatus { inner: self.inner.get_status() }
+        PyControllerStatus {
+            inner: self.inner.get_status(),
+        }
     }
 
     fn is_goal_reached(&self) -> bool {
@@ -754,8 +1052,18 @@ fn normalize_angle(a: f64) -> f64 {
 #[pyfunction]
 fn available_tracker_kinds() -> Vec<&'static str> {
     vec![
-        "pid", "carrot", "pure_pursuit", "stanley", "lqr", "mpc",
-        "mppi", "mca", "soc", "dwa", "teb", "flc",
+        "pid",
+        "carrot",
+        "pure_pursuit",
+        "stanley",
+        "lqr",
+        "mpc",
+        "mppi",
+        "mca",
+        "soc",
+        "dwa",
+        "teb",
+        "flc",
     ]
 }
 

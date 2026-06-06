@@ -34,8 +34,7 @@ Gaussian-mode obstacle predictions.
 ondrive = { path = "../ondrive" }
 ```
 
-The crate depends on `datapod` (geometry types) via a local path and
-`stateup` from Codeberg.
+The crate depends on the sibling `datapod` crate for geometry types.
 
 ## Quick start
 
@@ -157,9 +156,9 @@ the most recent thread-local message.
 
 ## Python bindings
 
-Built with `pyo3` + `maturin`. Enable the `python-extension` feature
+Built with `pyo3` + `maturin`. Enable the `python` feature
 when building with maturin; the ergonomic wrappers live in
-[`src/python.rs`](src/python.rs) and cover `Tracker`, `Path`, `World`,
+[`src/python/mod.rs`](src/python/mod.rs) and cover `Tracker`, `Path`, `World`,
 `Goal`, `RobotState`, `RobotConstraints`, `ControllerConfig`,
 `VelocityCommand`, and `ControllerStatus`.
 
@@ -216,6 +215,7 @@ make run EXAMPLE=mca
 nix develop             # provisions rustc, cargo, maturin, python3
 make build              # cargo build --lib --examples
 make test               # 29 tests across library + FFI smoke
+make bind               # check C ABI header + build Python wheel
 make c-demo             # build and run the C demo
 ```
 

@@ -1,3 +1,5 @@
+#![allow(clippy::needless_range_loop)]
+
 use crate::controller::{Controller, ControllerBase, is_goal_reached};
 use crate::core::math::{heading_error as heading_err_to_point, normalize_angle};
 use crate::types::{
@@ -191,8 +193,7 @@ impl Controller for StanleyFollower {
             constraints.max_angular_velocity,
         );
 
-        self.base.status.distance_to_goal =
-            state.pose.point.distance_to(goal.target_pose.point);
+        self.base.status.distance_to_goal = state.pose.point.distance_to(goal.target_pose.point);
         self.base.status.cross_track_error = cte;
         self.base.status.heading_error = heading_err;
         self.base.status.goal_reached = false;

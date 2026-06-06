@@ -1,5 +1,7 @@
 //! Dynamic Window Approach tests.
 
+#![allow(clippy::field_reassign_with_default)]
+
 use datapod::{Euler, Point, Pose, Quaternion};
 use ondrive::{
     Controller, ControllerConfig, DwaConfig, DwaFollower, GaussianMode, Goal, Obstacle,

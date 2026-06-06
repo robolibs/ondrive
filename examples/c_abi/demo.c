@@ -12,7 +12,7 @@ int main(void) {
     printf("ondrive version: %s\n", ondrive_version());
 
     /* ---------------- Build a straight path and smoothen it ------------- */
-    OndrivePathHandle* path = ondrive_path_new();
+    OndrivePath* path = ondrive_path_new();
     for (int i = 0; i < 6; ++i) {
         if (!ondrive_path_add_waypoint_xy(path, (double)i * 2.0, 0.0, 0.0, 0.5)) {
             fail("path_add_waypoint_xy");
@@ -25,7 +25,7 @@ int main(void) {
     printf("path after smoothen:  %zu waypoints\n", ondrive_path_len(path));
 
     /* ---------------- Configure a tracker ------------------------------- */
-    OndriveTrackerHandle* t = ondrive_tracker_new(ONDRIVE_KIND_PURE_PURSUIT);
+    OndriveTracker* t = ondrive_tracker_new(ONDRIVE_KIND_PURE_PURSUIT);
     if (t == NULL) {
         fail("tracker_new");
         ondrive_path_free(path);
@@ -141,7 +141,7 @@ int main(void) {
            ondrive_tracker_last_command_message());
 
     /* ---------------- World / obstacle demo ----------------------------- */
-    OndriveWorldHandle* world = ondrive_world_new();
+    OndriveWorld* world = ondrive_world_new();
     ondrive_world_add_static_gaussian_obstacle(world, 0, 3.0, 0.2, 0.3, 0.1, 0.1, 10);
     printf("world obstacles: %zu\n", ondrive_world_obstacle_count(world));
 

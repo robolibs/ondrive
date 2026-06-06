@@ -1,13 +1,14 @@
-//! C ABI for the ondrive library.
+//! C ABI for ondrive.
 //!
-//! Strategy:
-//!   * Plain-data inputs / outputs use `#[repr(C)]` structs so they can be
-//!     passed by value from C.
-//!   * Stateful objects (`Path`, `WorldConstraints`, `Tracker`) are exposed
-//!     as opaque boxed handles with explicit `*_new` / `*_free` pairs.
-//!   * Errors set a thread-local `LAST_ERROR` CString; retrieve via
-//!     `ondrive_last_error_message`. Boolean-returning entry points return
-//!     `false` on failure and set the message.
+//! Conventions: opaque Box-backed handles (free with the matching
+//! *_free); fallible calls return bool/int with the reason in the
+//! thread-local ondrive_last_error_message(); borrowed views are valid
+//! only for the lifetime documented by the handle they came from.
+//!
+//! `include/ondrive.h` is generated from this file by cbindgen.
+
+// extern "C" fns take raw pointers from C and deref them by design.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char};
@@ -34,9 +35,8 @@ fn clear_last_error() {
 fn set_last_error(msg: impl Into<String>) {
     let msg = msg.into().replace('\0', " ");
     LAST_ERROR.with(|s| {
-        *s.borrow_mut() = Some(
-            CString::new(msg).unwrap_or_else(|_| CString::new("ondrive ffi error").unwrap()),
-        );
+        *s.borrow_mut() =
+            Some(CString::new(msg).unwrap_or_else(|_| CString::new("ondrive ffi error").unwrap()));
     });
 }
 
@@ -252,7 +252,11 @@ fn vec3_to_point(v: OndriveVec3) -> Point {
     Point::new(v.x, v.y, v.z)
 }
 fn point_to_vec3(p: Point) -> OndriveVec3 {
-    OndriveVec3 { x: p.x, y: p.y, z: p.z }
+    OndriveVec3 {
+        x: p.x,
+        y: p.y,
+        z: p.z,
+    }
 }
 
 fn quat_to_rs(q: OndriveQuat) -> Quaternion {
@@ -264,7 +268,12 @@ fn quat_to_rs(q: OndriveQuat) -> Quaternion {
     }
 }
 fn quat_to_ffi(q: Quaternion) -> OndriveQuat {
-    OndriveQuat { x: q.x, y: q.y, z: q.z, w: q.w }
+    OndriveQuat {
+        x: q.x,
+        y: q.y,
+        z: q.z,
+        w: q.w,
+    }
 }
 
 fn pose_to_rs(p: OndrivePose) -> Pose {
@@ -424,16 +433,14 @@ fn cmd_to_ffi(c: &VelocityCommand) -> OndriveVelocityCommand {
 fn store_cmd_message(c: &VelocityCommand) {
     let s = c.status_message.clone().replace('\0', " ");
     LAST_CMD_MESSAGE.with(|slot| {
-        *slot.borrow_mut() =
-            Some(CString::new(s).unwrap_or_else(|_| CString::new("").unwrap()));
+        *slot.borrow_mut() = Some(CString::new(s).unwrap_or_else(|_| CString::new("").unwrap()));
     });
 }
 
 fn store_status_mode(s: &ControllerStatus) {
     let mode = s.mode.clone().replace('\0', " ");
     LAST_STATUS_MODE.with(|slot| {
-        *slot.borrow_mut() =
-            Some(CString::new(mode).unwrap_or_else(|_| CString::new("").unwrap()));
+        *slot.borrow_mut() = Some(CString::new(mode).unwrap_or_else(|_| CString::new("").unwrap()));
     });
 }
 
@@ -451,11 +458,7 @@ fn write_out<T>(out: *mut T, value: T) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_last_error_message() -> *const c_char {
-    LAST_ERROR.with(|s| {
-        s.borrow()
-            .as_ref()
-            .map_or(ptr::null(), |m| m.as_ptr())
-    })
+    LAST_ERROR.with(|s| s.borrow().as_ref().map_or(ptr::null(), |m| m.as_ptr()))
 }
 
 #[unsafe(no_mangle)]
@@ -483,20 +486,20 @@ pub extern "C" fn ondrive_quaternion_yaw(q: OndriveQuat) -> f64 {
 // Path opaque handle.
 // ===========================================================================
 
-pub struct OndrivePathHandle {
+pub struct OndrivePath {
     path: Path,
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_path_new() -> *mut OndrivePathHandle {
+pub extern "C" fn ondrive_path_new() -> *mut OndrivePath {
     clear_last_error();
-    Box::into_raw(Box::new(OndrivePathHandle {
+    Box::into_raw(Box::new(OndrivePath {
         path: Path::default(),
     }))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_path_free(h: *mut OndrivePathHandle) {
+pub extern "C" fn ondrive_path_free(h: *mut OndrivePath) {
     if h.is_null() {
         return;
     }
@@ -505,7 +508,7 @@ pub extern "C" fn ondrive_path_free(h: *mut OndrivePathHandle) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_path_add_waypoint(
-    h: *mut OndrivePathHandle,
+    h: *mut OndrivePath,
     pose: OndrivePose,
     speed: f64,
 ) -> bool {
@@ -520,7 +523,7 @@ pub extern "C" fn ondrive_path_add_waypoint(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_path_add_waypoint_xy(
-    h: *mut OndrivePathHandle,
+    h: *mut OndrivePath,
     x: f64,
     y: f64,
     yaw: f64,
@@ -534,7 +537,7 @@ pub extern "C" fn ondrive_path_add_waypoint_xy(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_path_len(h: *const OndrivePathHandle) -> usize {
+pub extern "C" fn ondrive_path_len(h: *const OndrivePath) -> usize {
     if h.is_null() {
         set_last_error("null path handle");
         return 0;
@@ -544,7 +547,7 @@ pub extern "C" fn ondrive_path_len(h: *const OndrivePathHandle) -> usize {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_path_waypoint(
-    h: *const OndrivePathHandle,
+    h: *const OndrivePath,
     idx: usize,
     out: *mut OndrivePose,
 ) -> bool {
@@ -559,7 +562,7 @@ pub extern "C" fn ondrive_path_waypoint(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_path_clear(h: *mut OndrivePathHandle) -> bool {
+pub extern "C" fn ondrive_path_clear(h: *mut OndrivePath) -> bool {
     if h.is_null() {
         return fail("null path handle");
     }
@@ -570,10 +573,7 @@ pub extern "C" fn ondrive_path_clear(h: *mut OndrivePathHandle) -> bool {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_path_set_closed(
-    h: *mut OndrivePathHandle,
-    closed: bool,
-) -> bool {
+pub extern "C" fn ondrive_path_set_closed(h: *mut OndrivePath, closed: bool) -> bool {
     if h.is_null() {
         return fail("null path handle");
     }
@@ -582,10 +582,7 @@ pub extern "C" fn ondrive_path_set_closed(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_path_smoothen(
-    h: *mut OndrivePathHandle,
-    max_segment_m: f64,
-) -> bool {
+pub extern "C" fn ondrive_path_smoothen(h: *mut OndrivePath, max_segment_m: f64) -> bool {
     if h.is_null() {
         return fail("null path handle");
     }
@@ -598,20 +595,20 @@ pub extern "C" fn ondrive_path_smoothen(
 // World (obstacles) opaque handle.
 // ===========================================================================
 
-pub struct OndriveWorldHandle {
+pub struct OndriveWorld {
     world: WorldConstraints,
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_world_new() -> *mut OndriveWorldHandle {
+pub extern "C" fn ondrive_world_new() -> *mut OndriveWorld {
     clear_last_error();
-    Box::into_raw(Box::new(OndriveWorldHandle {
+    Box::into_raw(Box::new(OndriveWorld {
         world: WorldConstraints::default(),
     }))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_world_free(h: *mut OndriveWorldHandle) {
+pub extern "C" fn ondrive_world_free(h: *mut OndriveWorld) {
     if h.is_null() {
         return;
     }
@@ -619,7 +616,7 @@ pub extern "C" fn ondrive_world_free(h: *mut OndriveWorldHandle) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_world_clear(h: *mut OndriveWorldHandle) -> bool {
+pub extern "C" fn ondrive_world_clear(h: *mut OndriveWorld) -> bool {
     if h.is_null() {
         return fail("null world handle");
     }
@@ -631,7 +628,7 @@ pub extern "C" fn ondrive_world_clear(h: *mut OndriveWorldHandle) -> bool {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_world_obstacle_count(h: *const OndriveWorldHandle) -> usize {
+pub extern "C" fn ondrive_world_obstacle_count(h: *const OndriveWorld) -> usize {
     if h.is_null() {
         set_last_error("null world handle");
         return 0;
@@ -643,7 +640,7 @@ pub extern "C" fn ondrive_world_obstacle_count(h: *const OndriveWorldHandle) -> 
 /// for `horizon_steps` time steps (standard deviations `std_x`, `std_y`).
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_world_add_static_gaussian_obstacle(
-    h: *mut OndriveWorldHandle,
+    h: *mut OndriveWorld,
     id: u64,
     x: f64,
     y: f64,
@@ -675,7 +672,7 @@ pub extern "C" fn ondrive_world_add_static_gaussian_obstacle(
 /// horizon. `mean_x` / `mean_y` must point to `horizon_steps` doubles.
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_world_add_trajectory_obstacle(
-    h: *mut OndriveWorldHandle,
+    h: *mut OndriveWorld,
     id: u64,
     radius: f64,
     mean_x: *const f64,
@@ -714,24 +711,24 @@ pub extern "C" fn ondrive_world_add_trajectory_obstacle(
 // Tracker opaque handle.
 // ===========================================================================
 
-pub struct OndriveTrackerHandle {
+pub struct OndriveTracker {
     tracker: Tracker,
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_tracker_new(kind: u32) -> *mut OndriveTrackerHandle {
+pub extern "C" fn ondrive_tracker_new(kind: u32) -> *mut OndriveTracker {
     let Some(k) = kind_from_u32(kind) else {
         set_last_error(format!("unknown tracker kind: {kind}"));
         return ptr::null_mut();
     };
     clear_last_error();
-    Box::into_raw(Box::new(OndriveTrackerHandle {
+    Box::into_raw(Box::new(OndriveTracker {
         tracker: Tracker::new(k),
     }))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_tracker_free(h: *mut OndriveTrackerHandle) {
+pub extern "C" fn ondrive_tracker_free(h: *mut OndriveTracker) {
     if h.is_null() {
         return;
     }
@@ -740,7 +737,7 @@ pub extern "C" fn ondrive_tracker_free(h: *mut OndriveTrackerHandle) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_tracker_init(
-    h: *mut OndriveTrackerHandle,
+    h: *mut OndriveTracker,
     constraints: OndriveRobotConstraints,
 ) -> bool {
     if h.is_null() {
@@ -755,7 +752,7 @@ pub extern "C" fn ondrive_tracker_init(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_tracker_set_config(
-    h: *mut OndriveTrackerHandle,
+    h: *mut OndriveTracker,
     config: OndriveControllerConfig,
 ) -> bool {
     if h.is_null() {
@@ -770,7 +767,7 @@ pub extern "C" fn ondrive_tracker_set_config(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_tracker_get_config(
-    h: *const OndriveTrackerHandle,
+    h: *const OndriveTracker,
     out: *mut OndriveControllerConfig,
 ) -> bool {
     if h.is_null() {
@@ -781,10 +778,7 @@ pub extern "C" fn ondrive_tracker_get_config(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_tracker_set_goal(
-    h: *mut OndriveTrackerHandle,
-    goal: OndriveGoal,
-) -> bool {
+pub extern "C" fn ondrive_tracker_set_goal(h: *mut OndriveTracker, goal: OndriveGoal) -> bool {
     if h.is_null() {
         return fail("null tracker handle");
     }
@@ -793,7 +787,7 @@ pub extern "C" fn ondrive_tracker_set_goal(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_tracker_clear_goal(h: *mut OndriveTrackerHandle) -> bool {
+pub extern "C" fn ondrive_tracker_clear_goal(h: *mut OndriveTracker) -> bool {
     if h.is_null() {
         return fail("null tracker handle");
     }
@@ -803,8 +797,8 @@ pub extern "C" fn ondrive_tracker_clear_goal(h: *mut OndriveTrackerHandle) -> bo
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_tracker_set_path(
-    h: *mut OndriveTrackerHandle,
-    path: *const OndrivePathHandle,
+    h: *mut OndriveTracker,
+    path: *const OndrivePath,
 ) -> bool {
     if h.is_null() {
         return fail("null tracker handle");
@@ -818,7 +812,7 @@ pub extern "C" fn ondrive_tracker_set_path(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_tracker_clear_path(h: *mut OndriveTrackerHandle) -> bool {
+pub extern "C" fn ondrive_tracker_clear_path(h: *mut OndriveTracker) -> bool {
     if h.is_null() {
         return fail("null tracker handle");
     }
@@ -827,7 +821,7 @@ pub extern "C" fn ondrive_tracker_clear_path(h: *mut OndriveTrackerHandle) -> bo
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_tracker_reset(h: *mut OndriveTrackerHandle) -> bool {
+pub extern "C" fn ondrive_tracker_reset(h: *mut OndriveTracker) -> bool {
     if h.is_null() {
         return fail("null tracker handle");
     }
@@ -836,10 +830,7 @@ pub extern "C" fn ondrive_tracker_reset(h: *mut OndriveTrackerHandle) -> bool {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_tracker_smoothen(
-    h: *mut OndriveTrackerHandle,
-    max_segment_m: f64,
-) -> bool {
+pub extern "C" fn ondrive_tracker_smoothen(h: *mut OndriveTracker, max_segment_m: f64) -> bool {
     if h.is_null() {
         return fail("null tracker handle");
     }
@@ -849,10 +840,10 @@ pub extern "C" fn ondrive_tracker_smoothen(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_tracker_tick(
-    h: *mut OndriveTrackerHandle,
+    h: *mut OndriveTracker,
     state: OndriveRobotState,
     dt: f64,
-    world: *const OndriveWorldHandle,
+    world: *const OndriveWorld,
     out_cmd: *mut OndriveVelocityCommand,
 ) -> bool {
     if h.is_null() {
@@ -863,17 +854,14 @@ pub extern "C" fn ondrive_tracker_tick(
     } else {
         Some(unsafe { &(*world).world })
     };
-    let cmd = unsafe {
-        (*h).tracker
-            .tick(&state_to_rs(state), dt, w_ref)
-    };
+    let cmd = unsafe { (*h).tracker.tick(&state_to_rs(state), dt, w_ref) };
     store_cmd_message(&cmd);
     write_out(out_cmd, cmd_to_ffi(&cmd))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_tracker_emergency_stop(
-    h: *mut OndriveTrackerHandle,
+    h: *mut OndriveTracker,
     out_cmd: *mut OndriveVelocityCommand,
 ) -> bool {
     if h.is_null() {
@@ -886,7 +874,7 @@ pub extern "C" fn ondrive_tracker_emergency_stop(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_tracker_status(
-    h: *const OndriveTrackerHandle,
+    h: *const OndriveTracker,
     out: *mut OndriveControllerStatus,
 ) -> bool {
     if h.is_null() {
@@ -899,26 +887,16 @@ pub extern "C" fn ondrive_tracker_status(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_tracker_status_mode() -> *const c_char {
-    LAST_STATUS_MODE.with(|s| {
-        s.borrow()
-            .as_ref()
-            .map_or(ptr::null(), |m| m.as_ptr())
-    })
+    LAST_STATUS_MODE.with(|s| s.borrow().as_ref().map_or(ptr::null(), |m| m.as_ptr()))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_tracker_last_command_message() -> *const c_char {
-    LAST_CMD_MESSAGE.with(|s| {
-        s.borrow()
-            .as_ref()
-            .map_or(ptr::null(), |m| m.as_ptr())
-    })
+    LAST_CMD_MESSAGE.with(|s| s.borrow().as_ref().map_or(ptr::null(), |m| m.as_ptr()))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_tracker_is_goal_reached(
-    h: *const OndriveTrackerHandle,
-) -> bool {
+pub extern "C" fn ondrive_tracker_is_goal_reached(h: *const OndriveTracker) -> bool {
     if h.is_null() {
         set_last_error("null tracker handle");
         return false;
@@ -928,7 +906,7 @@ pub extern "C" fn ondrive_tracker_is_goal_reached(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_tracker_current_target(
-    h: *const OndriveTrackerHandle,
+    h: *const OndriveTracker,
     out: *mut OndriveVec3,
 ) -> bool {
     if h.is_null() {
@@ -941,7 +919,7 @@ pub extern "C" fn ondrive_tracker_current_target(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn ondrive_tracker_kind(h: *const OndriveTrackerHandle) -> u32 {
+pub extern "C" fn ondrive_tracker_kind(h: *const OndriveTracker) -> u32 {
     if h.is_null() {
         set_last_error("null tracker handle");
         return u32::MAX;
@@ -965,7 +943,7 @@ pub extern "C" fn ondrive_tracker_kind(h: *const OndriveTrackerHandle) -> u32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_tracker_constraints(
-    h: *const OndriveTrackerHandle,
+    h: *const OndriveTracker,
     out: *mut OndriveRobotConstraints,
 ) -> bool {
     if h.is_null() {

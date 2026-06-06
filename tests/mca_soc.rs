@@ -1,3 +1,5 @@
+#![allow(clippy::field_reassign_with_default)]
+
 use datapod::{Euler, Point, Pose, Quaternion};
 use ondrive::{
     Controller, ControllerConfig, GaussianMode, Goal, McaConfig, McaFollower, Obstacle,
@@ -153,7 +155,6 @@ fn mca_avoids_static_gaussian_obstacle() {
     };
 
     let dt = 0.1;
-    let mut t = 0.0;
     let mut min_clearance: f64 = f64::MAX;
     let mut min_clearance_while_moving: f64 = f64::MAX;
     let mut max_x: f64 = 0.0;
@@ -168,8 +169,6 @@ fn mca_avoids_static_gaussian_obstacle() {
         let new_yaw = yaw + cmd.angular_velocity * dt;
         state.pose.rotation = Quaternion::from_euler(Euler::new(0.0, 0.0, new_yaw));
         state.velocity.linear = cmd.linear_velocity;
-        t += dt;
-
         let dx = state.pose.point.x - 6.0;
         let dy = state.pose.point.y - 0.0;
         let d = (dx * dx + dy * dy).sqrt();
@@ -247,7 +246,6 @@ fn soc_tracks_path() {
     };
 
     let dt = 0.1;
-    let mut t = 0.0;
     let mut min_dist: f64 = f64::MAX;
     let mut reached = false;
     for _ in 0..400 {
@@ -261,7 +259,6 @@ fn soc_tracks_path() {
         let new_yaw = yaw + cmd.angular_velocity * dt;
         state.pose.rotation = Quaternion::from_euler(Euler::new(0.0, 0.0, new_yaw));
         state.velocity.linear = cmd.linear_velocity;
-        t += dt;
         min_dist = min_dist.min(state.pose.point.distance_to(final_wp.point));
         if follower.get_status().goal_reached {
             reached = true;
@@ -325,6 +322,12 @@ fn soc_svgd_produces_valid_command() {
         cmd.valid
     };
 
-    assert!(run(0, 123), "SOC with svgd_iterations=0 should produce a valid command");
-    assert!(run(2, 123), "SOC with svgd_iterations=2 should produce a valid command");
+    assert!(
+        run(0, 123),
+        "SOC with svgd_iterations=0 should produce a valid command"
+    );
+    assert!(
+        run(2, 123),
+        "SOC with svgd_iterations=2 should produce a valid command"
+    );
 }

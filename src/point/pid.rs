@@ -85,8 +85,10 @@ impl Controller for PidFollower {
                 valid: true,
                 status_message: "Turning to align".into(),
                 linear_velocity: 0.0,
-                angular_velocity: angular_control
-                    .clamp(-constraints.max_angular_velocity, constraints.max_angular_velocity),
+                angular_velocity: angular_control.clamp(
+                    -constraints.max_angular_velocity,
+                    constraints.max_angular_velocity,
+                ),
                 ..VelocityCommand::default()
             };
         }
@@ -110,10 +112,14 @@ impl Controller for PidFollower {
         VelocityCommand {
             valid: true,
             status_message: "Tracking goal".into(),
-            linear_velocity: linear_control
-                .clamp(constraints.min_linear_velocity, constraints.max_linear_velocity),
-            angular_velocity: angular_control
-                .clamp(-constraints.max_angular_velocity, constraints.max_angular_velocity),
+            linear_velocity: linear_control.clamp(
+                constraints.min_linear_velocity,
+                constraints.max_linear_velocity,
+            ),
+            angular_velocity: angular_control.clamp(
+                -constraints.max_angular_velocity,
+                constraints.max_angular_velocity,
+            ),
             ..VelocityCommand::default()
         }
     }

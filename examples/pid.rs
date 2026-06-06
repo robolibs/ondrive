@@ -3,13 +3,14 @@
 //! Run a rerun viewer or `rerun --serve` and this example streams its
 //! simulation to it. Without a viewer it still runs and prints progress.
 
+#![allow(clippy::field_reassign_with_default)]
+
 #[path = "common/viz.rs"]
 mod viz;
 
 use datapod::{Euler, Point, Pose, Quaternion};
 use ondrive::{
-    ControllerConfig, Goal, Path, RobotConstraints, RobotState, Tracker, TrackerKind,
-    smoothen_path,
+    ControllerConfig, Goal, Path, RobotConstraints, RobotState, Tracker, TrackerKind, smoothen_path,
 };
 
 fn make_pose(x: f64, y: f64, yaw: f64) -> Pose {
@@ -127,10 +128,7 @@ fn main() {
             }
 
             if tracker.is_goal_reached() {
-                println!(
-                    "reached waypoint ({:.2},{:.2}) at t={:.2}",
-                    wp.x, wp.y, t
-                );
+                println!("reached waypoint ({:.2},{:.2}) at t={:.2}", wp.x, wp.y, t);
                 break;
             }
         }

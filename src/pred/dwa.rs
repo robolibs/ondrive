@@ -111,8 +111,11 @@ impl Controller for DwaFollower {
         // Dynamic window: intersection of kinematic bounds and reachable
         // (v, ω) within one control period.
         let window_dt = dwa.dt;
-        let v_min = (v_now - dwa.max_accel * window_dt)
-            .max(if cfg.allow_reverse { constraints.min_linear_velocity } else { 0.0 });
+        let v_min = (v_now - dwa.max_accel * window_dt).max(if cfg.allow_reverse {
+            constraints.min_linear_velocity
+        } else {
+            0.0
+        });
         let v_max = (v_now + dwa.max_accel * window_dt).min(constraints.max_linear_velocity);
         let w_min =
             (w_now - dwa.max_angular_accel * window_dt).max(-constraints.max_angular_velocity);

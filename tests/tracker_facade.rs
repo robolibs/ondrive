@@ -1,8 +1,9 @@
+#![allow(clippy::field_reassign_with_default)]
+
 use approx::assert_relative_eq;
 use datapod::{Euler, Point, Pose, Quaternion};
 use ondrive::{
-    ControllerConfig, Goal, Path, RobotConstraints, RobotState, Tracker, TrackerKind,
-    smoothen_path,
+    ControllerConfig, Goal, Path, RobotConstraints, RobotState, Tracker, TrackerKind, smoothen_path,
 };
 
 fn pose_at(x: f64, y: f64, yaw: f64) -> Pose {
@@ -46,7 +47,9 @@ fn current_target_prefers_goal_then_path() {
     path.waypoints.push(pose_at(2.0, 0.0, 0.0));
     tracker.set_path(path);
 
-    let p = tracker.current_target().expect("path waypoint should be target");
+    let p = tracker
+        .current_target()
+        .expect("path waypoint should be target");
     assert_relative_eq!(p.x, 0.0, epsilon = 1e-9);
 
     tracker.set_goal(Goal {

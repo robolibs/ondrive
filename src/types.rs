@@ -1,3 +1,5 @@
+#![allow(clippy::derivable_impls)]
+
 use datapod::{Point, Pose};
 use serde::{Deserialize, Serialize};
 

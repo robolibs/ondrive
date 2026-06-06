@@ -1,3 +1,5 @@
+#![allow(clippy::field_reassign_with_default)]
+
 use approx::assert_relative_eq;
 use datapod::{Euler, Point, Pose, Quaternion};
 use nalgebra::{Matrix4, Vector4};
@@ -15,12 +17,7 @@ fn pose_at(x: f64, y: f64, yaw: f64) -> Pose {
 /// Re-implement the DARE solver locally to verify convergence (the one inside
 /// the crate is private; this test mirrors the same iteration to sanity-check
 /// that the Riccati residual is small at convergence).
-fn solve_dare(
-    a: &Matrix4<f64>,
-    b: &Vector4<f64>,
-    q: &Matrix4<f64>,
-    r: f64,
-) -> Matrix4<f64> {
+fn solve_dare(a: &Matrix4<f64>, b: &Vector4<f64>, q: &Matrix4<f64>, r: f64) -> Matrix4<f64> {
     let mut p = *q;
     let at = a.transpose();
     for _ in 0..500 {
@@ -50,10 +47,7 @@ fn dare_residual_is_small_at_convergence() {
     let wheelbase = 0.5;
 
     let a = Matrix4::new(
-        1.0, dt, 0.0, 0.0,
-        0.0, 1.0, velocity, 0.0,
-        0.0, 0.0, 1.0, dt,
-        0.0, 0.0, 0.0, 1.0,
+        1.0, dt, 0.0, 0.0, 0.0, 1.0, velocity, 0.0, 0.0, 0.0, 1.0, dt, 0.0, 0.0, 0.0, 1.0,
     );
     let b = Vector4::new(0.0, 0.0, 0.0, velocity / wheelbase);
     let mut q = Matrix4::zeros();
