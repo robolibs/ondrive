@@ -161,11 +161,7 @@ pub fn show_goal(rec: &RecordingStream, goal: &Goal, entity: &str, color: Color)
     );
 }
 
-pub fn show_controller_status(
-    rec: &RecordingStream,
-    status: &ControllerStatus,
-    entity: &str,
-) {
+pub fn show_controller_status(rec: &RecordingStream, status: &ControllerStatus, entity: &str) {
     let text = format!(
         "Mode: {}\nDistance to goal: {:.3}\nHeading error: {:.3}\nCTE: {:.3}\nGoal reached: {}",
         status.mode,

@@ -1,5 +1,7 @@
 //! Fuzzy Logic Controller tests.
 
+#![allow(clippy::field_reassign_with_default)]
+
 use datapod::{Euler, Point, Pose, Quaternion};
 use ondrive::{
     Controller, ControllerConfig, FlcConfig, FlcFollower, Goal, OutputUnits, Path,
@@ -78,8 +80,5 @@ fn flc_tracks_straight_path() {
         }
     }
     assert!(reached, "FLC did not reach goal (t={t:.2})");
-    assert!(
-        max_cte < 0.6,
-        "FLC post-settle CTE too large: {max_cte:.3}"
-    );
+    assert!(max_cte < 0.6, "FLC post-settle CTE too large: {max_cte:.3}");
 }

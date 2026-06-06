@@ -1,5 +1,7 @@
 //! MPC path-following example.
 
+#![allow(clippy::field_reassign_with_default)]
+
 use datapod::{Euler, Point, Pose, Quaternion};
 use ondrive::{
     ControllerConfig, Goal, OutputUnits, Path, RobotConstraints, RobotState, Tracker, TrackerKind,
@@ -76,8 +78,13 @@ fn main() {
             let s = tracker.get_status();
             println!(
                 "t={:5.2} pos=({:5.2},{:5.2}) v={:.2} w={:.2} cte={:.3} hdg={:.3}",
-                t, state.pose.point.x, state.pose.point.y, cmd.linear_velocity, cmd.angular_velocity,
-                s.cross_track_error, s.heading_error
+                t,
+                state.pose.point.x,
+                state.pose.point.y,
+                cmd.linear_velocity,
+                cmd.angular_velocity,
+                s.cross_track_error,
+                s.heading_error
             );
             last_print = t;
         }

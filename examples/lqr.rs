@@ -1,5 +1,7 @@
 //! LQR path-following example.
 
+#![allow(clippy::field_reassign_with_default)]
+
 use datapod::{Euler, Point, Pose, Quaternion};
 use ondrive::{
     ControllerConfig, Goal, OutputUnits, Path, RobotConstraints, RobotState, Tracker, TrackerKind,
@@ -74,7 +76,12 @@ fn main() {
             let s = tracker.get_status();
             println!(
                 "t={:5.2} pos=({:5.2},{:5.2}) yaw={:5.2} cte={:6.3} hdg_err={:5.2}",
-                t, state.pose.point.x, state.pose.point.y, yaw, s.cross_track_error, s.heading_error
+                t,
+                state.pose.point.x,
+                state.pose.point.y,
+                yaw,
+                s.cross_track_error,
+                s.heading_error
             );
             last_print = t;
         }

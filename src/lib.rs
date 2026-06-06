@@ -19,7 +19,9 @@ pub mod python;
 
 pub use crate::controller::{Controller, ControllerBase, is_goal_reached};
 pub use crate::core::error::{Error, Result};
-pub use crate::core::math::{distance, distance_2d, heading_error, normalize_angle, yaw_of, yaw_error};
+pub use crate::core::math::{
+    distance, distance_2d, heading_error, normalize_angle, yaw_error, yaw_of,
+};
 pub use crate::tracker::{Tracker, TrackerKind, smoothen_path};
 pub use crate::types::{
     ControllerConfig, ControllerStatus, GaussianMode, Goal, Obstacle, OutputType, OutputUnits,

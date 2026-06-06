@@ -1,3 +1,5 @@
+#![allow(clippy::field_reassign_with_default)]
+
 use datapod::{Euler, Point, Pose, Quaternion};
 use ondrive::{ControllerConfig, Goal, RobotConstraints, RobotState, Tracker, TrackerKind};
 
@@ -101,5 +103,8 @@ fn pid_reaches_diagonal_goal() {
     };
 
     let (reached, _, t) = simulate_until_goal(&mut tracker, start, goal, 3000, 0.05);
-    assert!(reached, "PID did not reach diagonal goal within budget (t={t:.2})");
+    assert!(
+        reached,
+        "PID did not reach diagonal goal within budget (t={t:.2})"
+    );
 }

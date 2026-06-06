@@ -3,6 +3,8 @@
 //! leak/double-free, and verifies that `last_error` is cleared on success
 //! and set on failure.
 
+#![allow(clippy::field_reassign_with_default)]
+
 use std::ffi::CStr;
 use std::ptr;
 
@@ -20,7 +22,13 @@ fn err_message() -> Option<String> {
 #[test]
 fn null_pointer_inputs_fail_cleanly() {
     // Path
-    assert!(!ondrive_path_add_waypoint_xy(ptr::null_mut(), 0.0, 0.0, 0.0, 0.0));
+    assert!(!ondrive_path_add_waypoint_xy(
+        ptr::null_mut(),
+        0.0,
+        0.0,
+        0.0,
+        0.0
+    ));
     assert!(err_message().is_some());
     assert!(!ondrive_path_set_closed(ptr::null_mut(), true));
     assert!(!ondrive_path_smoothen(ptr::null_mut(), 1.0));
@@ -32,12 +40,25 @@ fn null_pointer_inputs_fail_cleanly() {
     assert!(!ondrive_world_clear(ptr::null_mut()));
     assert_eq!(ondrive_world_obstacle_count(ptr::null()), 0);
     assert!(!ondrive_world_add_static_gaussian_obstacle(
-        ptr::null_mut(), 0, 0.0, 0.0, 0.3, 0.1, 0.1, 10,
+        ptr::null_mut(),
+        0,
+        0.0,
+        0.0,
+        0.3,
+        0.1,
+        0.1,
+        10,
     ));
 
     // Tracker
-    assert!(!ondrive_tracker_init(ptr::null_mut(), ondrive_default_constraints()));
-    assert!(!ondrive_tracker_set_config(ptr::null_mut(), ondrive_default_config()));
+    assert!(!ondrive_tracker_init(
+        ptr::null_mut(),
+        ondrive_default_constraints()
+    ));
+    assert!(!ondrive_tracker_set_config(
+        ptr::null_mut(),
+        ondrive_default_config()
+    ));
     assert!(!ondrive_tracker_get_config(ptr::null(), ptr::null_mut()));
     assert!(!ondrive_tracker_clear_goal(ptr::null_mut()));
     assert!(!ondrive_tracker_clear_path(ptr::null_mut()));
@@ -45,7 +66,10 @@ fn null_pointer_inputs_fail_cleanly() {
     assert!(!ondrive_tracker_smoothen(ptr::null_mut(), 1.0));
     assert!(!ondrive_tracker_status(ptr::null(), ptr::null_mut()));
     assert!(!ondrive_tracker_is_goal_reached(ptr::null()));
-    assert!(!ondrive_tracker_current_target(ptr::null(), ptr::null_mut()));
+    assert!(!ondrive_tracker_current_target(
+        ptr::null(),
+        ptr::null_mut()
+    ));
     assert_eq!(ondrive_tracker_kind(ptr::null()), u32::MAX);
     assert!(!ondrive_tracker_constraints(ptr::null(), ptr::null_mut()));
 
@@ -78,12 +102,21 @@ fn full_tracker_lifecycle_runs_to_goal() {
     let path = ondrive_path_new();
     assert!(!path.is_null());
     for i in 0..10 {
-        assert!(ondrive_path_add_waypoint_xy(path, i as f64 * 0.5, 0.0, 0.0, 0.5));
+        assert!(ondrive_path_add_waypoint_xy(
+            path,
+            i as f64 * 0.5,
+            0.0,
+            0.0,
+            0.5
+        ));
     }
     assert_eq!(ondrive_path_len(path), 10);
     assert!(ondrive_path_smoothen(path, 0.25));
     let dense = ondrive_path_len(path);
-    assert!(dense >= 10, "smoothen should never shrink the path: {dense}");
+    assert!(
+        dense >= 10,
+        "smoothen should never shrink the path: {dense}"
+    );
 
     let t = ondrive_tracker_new(ONDRIVE_KIND_PURE_PURSUIT);
     assert!(!t.is_null());
@@ -112,15 +145,28 @@ fn full_tracker_lifecycle_runs_to_goal() {
     assert!(ondrive_tracker_set_path(t, path));
 
     let mut final_pose = OndrivePose {
-        position: OndriveVec3 { x: 0.0, y: 0.0, z: 0.0 },
-        rotation: OndriveQuat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+        position: OndriveVec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        rotation: OndriveQuat {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            w: 1.0,
+        },
     };
     assert!(ondrive_path_waypoint(path, dense - 1, &mut final_pose));
 
     let goal = OndriveGoal {
         target_pose: final_pose,
         has_target_velocity: false,
-        target_velocity: OndriveVelocity { linear: 0.0, angular: 0.0, lateral: 0.0 },
+        target_velocity: OndriveVelocity {
+            linear: 0.0,
+            angular: 0.0,
+            lateral: 0.0,
+        },
         tolerance_position: 0.4,
         tolerance_orientation: 1.0,
     };
@@ -128,18 +174,35 @@ fn full_tracker_lifecycle_runs_to_goal() {
 
     let mut state = OndriveRobotState {
         pose: OndrivePose {
-            position: OndriveVec3 { x: 0.0, y: 0.0, z: 0.0 },
+            position: OndriveVec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
             rotation: ondrive_quaternion_from_yaw(0.0),
         },
-        velocity: OndriveVelocity { linear: 0.0, angular: 0.0, lateral: 0.0 },
+        velocity: OndriveVelocity {
+            linear: 0.0,
+            angular: 0.0,
+            lateral: 0.0,
+        },
         timestamp: 0.0,
         allow_reverse: false,
         turn_first: false,
         allow_move: true,
         has_trailer: false,
         trailer_pose: OndrivePose {
-            position: OndriveVec3 { x: 0.0, y: 0.0, z: 0.0 },
-            rotation: OndriveQuat { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+            position: OndriveVec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            rotation: OndriveQuat {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                w: 1.0,
+            },
         },
     };
 
@@ -159,8 +222,7 @@ fn full_tracker_lifecycle_runs_to_goal() {
         let yaw = ondrive_quaternion_yaw(state.pose.rotation);
         state.pose.position.x += cmd.linear_velocity * yaw.cos() * dt;
         state.pose.position.y += cmd.linear_velocity * yaw.sin() * dt;
-        state.pose.rotation =
-            ondrive_quaternion_from_yaw(yaw + cmd.angular_velocity * dt);
+        state.pose.rotation = ondrive_quaternion_from_yaw(yaw + cmd.angular_velocity * dt);
         state.velocity.linear = cmd.linear_velocity;
         state.velocity.angular = cmd.angular_velocity;
 
@@ -186,7 +248,11 @@ fn full_tracker_lifecycle_runs_to_goal() {
     assert_eq!(mode, "stopped");
 
     // Current target should be the final waypoint's point.
-    let mut tgt = OndriveVec3 { x: 0.0, y: 0.0, z: 0.0 };
+    let mut tgt = OndriveVec3 {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
     assert!(ondrive_tracker_current_target(t, &mut tgt));
     assert!((tgt.x - final_pose.position.x).abs() < 1e-9);
 
@@ -237,19 +303,40 @@ fn world_obstacles_round_trip() {
     let xs = [3.0_f64, 3.2, 3.4, 3.6];
     let ys = [0.0_f64, 0.1, 0.2, 0.3];
     assert!(ondrive_world_add_trajectory_obstacle(
-        w, 3, 0.2, xs.as_ptr(), ys.as_ptr(), 0.1, 0.1, xs.len(),
+        w,
+        3,
+        0.2,
+        xs.as_ptr(),
+        ys.as_ptr(),
+        0.1,
+        0.1,
+        xs.len(),
     ));
     assert_eq!(ondrive_world_obstacle_count(w), 3);
 
     // Null arrays should be rejected.
     assert!(!ondrive_world_add_trajectory_obstacle(
-        w, 4, 0.2, ptr::null(), ptr::null(), 0.1, 0.1, 4,
+        w,
+        4,
+        0.2,
+        ptr::null(),
+        ptr::null(),
+        0.1,
+        0.1,
+        4,
     ));
     assert!(err_message().is_some());
 
     // horizon_steps=0 should be rejected.
     assert!(!ondrive_world_add_trajectory_obstacle(
-        w, 5, 0.2, xs.as_ptr(), ys.as_ptr(), 0.1, 0.1, 0,
+        w,
+        5,
+        0.2,
+        xs.as_ptr(),
+        ys.as_ptr(),
+        0.1,
+        0.1,
+        0,
     ));
 
     assert!(ondrive_world_clear(w));

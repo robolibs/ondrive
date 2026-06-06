@@ -1,3 +1,5 @@
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+
 use crate::controller::{Controller, ControllerBase, is_goal_reached};
 use crate::core::math::normalize_angle;
 use crate::types::{
@@ -216,13 +218,12 @@ impl MppiFollower {
             ref_traj.yaw.push(yaw);
 
             let dist_to_end = remaining[target_idx];
-            let ref_vel = if working_cfg.decel_distance > 1e-6
-                && dist_to_end < working_cfg.decel_distance
-            {
-                (working_cfg.ref_velocity * (dist_to_end / working_cfg.decel_distance)).max(0.0)
-            } else {
-                working_cfg.ref_velocity
-            };
+            let ref_vel =
+                if working_cfg.decel_distance > 1e-6 && dist_to_end < working_cfg.decel_distance {
+                    (working_cfg.ref_velocity * (dist_to_end / working_cfg.decel_distance)).max(0.0)
+                } else {
+                    working_cfg.ref_velocity
+                };
             ref_traj.velocity.push(ref_vel);
         }
         ref_traj
@@ -303,7 +304,10 @@ pub(crate) fn rollout_sample<R: Rng>(
         }
         yaw = normalize_angle(yaw);
         v += a * dt;
-        v = v.clamp(constraints.min_linear_velocity, constraints.max_linear_velocity);
+        v = v.clamp(
+            constraints.min_linear_velocity,
+            constraints.max_linear_velocity,
+        );
 
         if collect_trajectory {
             trajectory.push(Point::new(x, y, 0.0));
@@ -470,11 +474,15 @@ impl Controller for MppiFollower {
             self.mean_acceleration[i] += d_acc;
 
             if is_diff {
-                self.mean_steering[i] = self.mean_steering[i]
-                    .clamp(-constraints.max_angular_velocity, constraints.max_angular_velocity);
+                self.mean_steering[i] = self.mean_steering[i].clamp(
+                    -constraints.max_angular_velocity,
+                    constraints.max_angular_velocity,
+                );
             } else {
-                self.mean_steering[i] = self.mean_steering[i]
-                    .clamp(-constraints.max_steering_angle, constraints.max_steering_angle);
+                self.mean_steering[i] = self.mean_steering[i].clamp(
+                    -constraints.max_steering_angle,
+                    constraints.max_steering_angle,
+                );
             }
             self.mean_acceleration[i] = self.mean_acceleration[i].clamp(
                 -constraints.max_linear_acceleration,
@@ -497,8 +505,7 @@ impl Controller for MppiFollower {
 
         self.predicted_trajectory = best_trajectory;
 
-        self.base.status.distance_to_goal =
-            state.pose.point.distance_to(goal.target_pose.point);
+        self.base.status.distance_to_goal = state.pose.point.distance_to(goal.target_pose.point);
         self.base.status.cross_track_error = error.cte.abs();
         self.base.status.heading_error = error.epsi.abs();
         self.base.status.goal_reached = false;
@@ -517,11 +524,15 @@ impl Controller for MppiFollower {
         target_velocity = target_velocity.clamp(min_vel, constraints.max_linear_velocity);
 
         let angular_output = if is_diff {
-            steering_or_omega
-                .clamp(-constraints.max_angular_velocity, constraints.max_angular_velocity)
+            steering_or_omega.clamp(
+                -constraints.max_angular_velocity,
+                constraints.max_angular_velocity,
+            )
         } else {
-            steering_or_omega
-                .clamp(-constraints.max_steering_angle, constraints.max_steering_angle)
+            steering_or_omega.clamp(
+                -constraints.max_steering_angle,
+                constraints.max_steering_angle,
+            )
         };
 
         let (linear, angular) = match cfg.output_units {
@@ -547,7 +558,11 @@ impl Controller for MppiFollower {
             OutputUnits::Physical => (target_velocity, angular_output),
         };
 
-        let linear = if self.is_turning_in_place { 0.0 } else { linear };
+        let linear = if self.is_turning_in_place {
+            0.0
+        } else {
+            linear
+        };
 
         VelocityCommand {
             valid: true,

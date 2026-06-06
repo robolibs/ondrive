@@ -16,6 +16,8 @@
 //!   v = dist(p_0, p_1) / Δt_0   (signed by yaw alignment)
 //!   ω = normalize(yaw_1 − yaw_0) / Δt_0
 
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+
 use crate::controller::{Controller, ControllerBase, is_goal_reached};
 use crate::core::math::normalize_angle;
 use crate::types::{
@@ -132,9 +134,7 @@ impl TebFollower {
             .iter()
             .enumerate()
             .map(|(i, p)| (i, state.pose.point.distance_to(p.point)))
-            .min_by(|a, b| {
-                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap_or((0, 0.0));
         self.base.path_index = start_idx;
 
@@ -160,8 +160,7 @@ impl TebFollower {
             self.band_y[i] = waypoints[idx].point.y;
             self.band_yaw[i] = if idx + 1 < waypoints.len() {
                 let next = waypoints[idx + 1].point;
-                (next.y - waypoints[idx].point.y)
-                    .atan2(next.x - waypoints[idx].point.x)
+                (next.y - waypoints[idx].point.y).atan2(next.x - waypoints[idx].point.x)
             } else {
                 waypoints[idx].rotation.to_euler().yaw
             };
@@ -188,8 +187,18 @@ impl TebFollower {
         // New tail extrapolates the last segment.
         let last = n - 1;
         let prev = n - 2;
-        let dx = self.band_x[prev] - (if n >= 3 { self.band_x[n - 3] } else { self.band_x[0] });
-        let dy = self.band_y[prev] - (if n >= 3 { self.band_y[n - 3] } else { self.band_y[0] });
+        let dx = self.band_x[prev]
+            - (if n >= 3 {
+                self.band_x[n - 3]
+            } else {
+                self.band_x[0]
+            });
+        let dy = self.band_y[prev]
+            - (if n >= 3 {
+                self.band_y[n - 3]
+            } else {
+                self.band_y[0]
+            });
         self.band_x[last] = self.band_x[prev] + dx;
         self.band_y[last] = self.band_y[prev] + dy;
         self.band_yaw[last] = self.band_yaw[prev];
@@ -481,7 +490,11 @@ impl Controller for TebFollower {
         let dx = self.band_x[1] - self.band_x[0];
         let dy = self.band_y[1] - self.band_y[0];
         let seg_len = (dx * dx + dy * dy).sqrt();
-        let seg_heading = if seg_len > 1e-6 { dy.atan2(dx) } else { self.band_yaw[0] };
+        let seg_heading = if seg_len > 1e-6 {
+            dy.atan2(dx)
+        } else {
+            self.band_yaw[0]
+        };
         let yaw0 = self.band_yaw[0];
         // Sign: if segment direction is opposite to current yaw, the
         // command is a reverse move.

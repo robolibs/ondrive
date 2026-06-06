@@ -1,5 +1,7 @@
 //! SOC (SVG-MPPI) example — same sine-curve path as the MPPI demo.
 
+#![allow(clippy::field_reassign_with_default)]
+
 use datapod::{Euler, Point, Pose, Quaternion};
 use ondrive::{
     ControllerConfig, Goal, OutputUnits, Path, RobotConstraints, RobotState, Tracker, TrackerKind,
@@ -70,7 +72,11 @@ fn main() {
         if t - last_print >= 0.5 {
             println!(
                 "t={:5.2} pos=({:5.2},{:5.2}) v={:.2} w={:.2}",
-                t, state.pose.point.x, state.pose.point.y, cmd.linear_velocity, cmd.angular_velocity
+                t,
+                state.pose.point.x,
+                state.pose.point.y,
+                cmd.linear_velocity,
+                cmd.angular_velocity
             );
             last_print = t;
         }

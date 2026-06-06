@@ -1,3 +1,5 @@
+#![allow(clippy::field_reassign_with_default)]
+
 use datapod::{Euler, Point, Pose, Quaternion};
 use ondrive::{ControllerConfig, Goal, RobotConstraints, RobotState, Tracker, TrackerKind};
 
@@ -52,5 +54,9 @@ fn carrot_reaches_forward_goal() {
             break;
         }
     }
-    assert!(reached, "Carrot did not reach goal; ended at {:?}", state.pose.point);
+    assert!(
+        reached,
+        "Carrot did not reach goal; ended at {:?}",
+        state.pose.point
+    );
 }

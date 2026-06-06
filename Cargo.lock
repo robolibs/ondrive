@@ -884,8 +884,22 @@ dependencies = [
 
 [[package]]
 name = "datapod"
+version = "0.4.0"
+source = "git+https://codeberg.org/robolibs/datapod.git?tag=0.4.0#e90e11ce9d3e6a2269b4c86b6b1a441b1b6981fe"
+dependencies = [
+ "bytemuck",
+ "datapod-macros",
+]
+
+[[package]]
+name = "datapod-macros"
 version = "0.0.1"
-source = "git+https://codeberg.org/robolibs/datapod.git#cddb51e98ab4002bbc5de9198973bc137eabbaa0"
+source = "git+https://codeberg.org/robolibs/datapod.git?tag=0.4.0#e90e11ce9d3e6a2269b4c86b6b1a441b1b6981fe"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "digest"
@@ -3900,9 +3914,8 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "stateup"
 version = "0.0.1"
-source = "git+https://codeberg.org/robolibs/stateup.git#5eac6ef5e9f35b7e8bbd69b5ee4bf43519b10789"
+source = "git+https://codeberg.org/robolibs/stateup.git#26ad75b1655fe62da42aa5c17abaf13c94c5fca6"
 dependencies = [
- "datapod",
  "parking_lot",
  "rand 0.8.6",
  "rayon",

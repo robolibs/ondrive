@@ -1,9 +1,11 @@
 //! Timed Elastic Band tests.
 
+#![allow(clippy::field_reassign_with_default)]
+
 use datapod::{Euler, Point, Pose, Quaternion};
 use ondrive::{
-    Controller, ControllerConfig, Goal, OutputUnits, Path, RobotConstraints, RobotState,
-    TebConfig, TebFollower,
+    Controller, ControllerConfig, Goal, OutputUnits, Path, RobotConstraints, RobotState, TebConfig,
+    TebFollower,
 };
 
 fn pose_at(x: f64, y: f64, yaw: f64) -> Pose {
@@ -58,7 +60,6 @@ fn teb_tracks_path() {
     };
 
     let dt = 0.1;
-    let mut t = 0.0;
     let mut max_x: f64 = 0.0;
     let mut reached = false;
     for _ in 0..600 {
@@ -73,7 +74,6 @@ fn teb_tracks_path() {
         state.pose.rotation = Quaternion::from_euler(Euler::new(0.0, 0.0, new_yaw));
         state.velocity.linear = cmd.linear_velocity;
         state.velocity.angular = cmd.angular_velocity;
-        t += dt;
         max_x = max_x.max(state.pose.point.x);
         if follower.get_status().goal_reached {
             reached = true;

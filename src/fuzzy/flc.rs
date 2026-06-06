@@ -6,6 +6,8 @@
 //! centroid defuzzification produces the steering output. Linear in the
 //! middle of each range, saturating near the edges.
 
+#![allow(clippy::needless_range_loop)]
+
 use crate::controller::{Controller, ControllerBase, is_goal_reached};
 use crate::core::math::normalize_angle;
 use crate::types::{
@@ -119,19 +121,14 @@ fn rule_output_idx(cte_idx: usize, heading_idx: usize) -> usize {
 
 fn defuzzify(activations: [f64; 7], output_range: f64) -> f64 {
     // Output-term centers mirror the input ones on [-output_range, +output_range].
-    const CENTERS_NORM: [f64; 7] =
-        [-1.0, -2.0 / 3.0, -1.0 / 3.0, 0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0];
+    const CENTERS_NORM: [f64; 7] = [-1.0, -2.0 / 3.0, -1.0 / 3.0, 0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0];
     let mut num = 0.0;
     let mut denom = 0.0;
     for i in 0..7 {
         num += activations[i] * CENTERS_NORM[i] * output_range;
         denom += activations[i];
     }
-    if denom.abs() < 1e-9 {
-        0.0
-    } else {
-        num / denom
-    }
+    if denom.abs() < 1e-9 { 0.0 } else { num / denom }
 }
 
 fn find_closest_path_point(
@@ -213,14 +210,10 @@ impl Controller for FlcFollower {
             };
         }
 
-        let (closest_idx, cte, path_heading) = find_closest_path_point(
-            &self.base.path.waypoints,
-            self.base.path_index,
-            &state.pose,
-        );
+        let (closest_idx, cte, path_heading) =
+            find_closest_path_point(&self.base.path.waypoints, self.base.path_index, &state.pose);
         self.base.path_index = closest_idx;
-        let heading_err =
-            normalize_angle(path_heading - state.pose.rotation.to_euler().yaw);
+        let heading_err = normalize_angle(path_heading - state.pose.rotation.to_euler().yaw);
 
         // Optional derivative-of-CTE input: skipped by default, but when
         // enabled it can be fuzzified alongside and used to shape rules.
@@ -260,16 +253,19 @@ impl Controller for FlcFollower {
         let steering_signed = defuzzify(output_activations, flc.max_steering);
 
         // Slow down when steering hard.
-        let steer_ratio =
-            (steering_signed.abs() / flc.max_steering.max(1e-6)).clamp(0.0, 1.0);
+        let steer_ratio = (steering_signed.abs() / flc.max_steering.max(1e-6)).clamp(0.0, 1.0);
         let velocity = (flc.base_velocity * (1.0 - 0.5 * steer_ratio)).max(flc.min_velocity);
 
         let steering_output = if is_diff {
-            steering_signed
-                .clamp(-constraints.max_angular_velocity, constraints.max_angular_velocity)
+            steering_signed.clamp(
+                -constraints.max_angular_velocity,
+                constraints.max_angular_velocity,
+            )
         } else {
-            steering_signed
-                .clamp(-constraints.max_steering_angle, constraints.max_steering_angle)
+            steering_signed.clamp(
+                -constraints.max_steering_angle,
+                constraints.max_steering_angle,
+            )
         };
 
         let angular_velocity = if is_diff {

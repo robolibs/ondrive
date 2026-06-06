@@ -1,3 +1,5 @@
+#![allow(clippy::field_reassign_with_default)]
+
 use datapod::{Euler, Point, Pose, Quaternion};
 use ondrive::{
     ControllerConfig, Goal, OutputUnits, Path, RobotConstraints, RobotState, Tracker, TrackerKind,
@@ -88,7 +90,10 @@ fn pure_pursuit_follows_straight_line() {
     });
 
     let (reached, _, t, max_cte) = simulate(&mut tracker, pose(0.0, 0.0, 0.0), 3000, 0.05);
-    assert!(reached, "pure pursuit did not reach final waypoint (t={t:.2})");
+    assert!(
+        reached,
+        "pure pursuit did not reach final waypoint (t={t:.2})"
+    );
     assert!(max_cte < 0.5, "cross-track error too large: {max_cte:.3}");
 }
 

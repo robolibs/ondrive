@@ -1,9 +1,9 @@
 //! Carrot point-to-point navigation example.
 
+#![allow(clippy::field_reassign_with_default)]
+
 use datapod::{Euler, Point, Pose, Quaternion};
-use ondrive::{
-    ControllerConfig, Goal, RobotConstraints, RobotState, Tracker, TrackerKind,
-};
+use ondrive::{ControllerConfig, Goal, RobotConstraints, RobotState, Tracker, TrackerKind};
 
 fn main() {
     let waypoints = [
