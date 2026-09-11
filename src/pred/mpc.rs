@@ -6,10 +6,12 @@
 use crate::controller::{Controller, ControllerBase};
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
-    CostWeights, Model, Reference, build_reference, command_from_controls, current_speed, prepare,
-    rollout, speed_at_arc_length, update_turn_in_place,
+    CostWeights, Model, Reference, build_reference, build_timed_reference, command_from_controls,
+    current_speed, prepare, rollout, speed_at_arc_length, update_turn_in_place,
 };
-use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
+use crate::types::{
+    Goal, Path, RobotConstraints, RobotState, Trajectory, VelocityCommand, WorldConstraints,
+};
 use datapod::Point;
 
 const MAX_ITERATIONS: usize = 20;
@@ -70,6 +72,8 @@ pub struct MpcFollower {
     is_turning_in_place: bool,
     last_v: f64,
     shift_accum: f64,
+    trajectory: Option<Trajectory>,
+    clock: f64,
 }
 
 impl Default for MpcFollower {
@@ -111,6 +115,8 @@ impl MpcFollower {
             is_turning_in_place: false,
             last_v: 0.0,
             shift_accum: 0.0,
+            trajectory: None,
+            clock: 0.0,
             mpc_config: cfg,
         }
     }
@@ -237,15 +243,18 @@ impl Controller for MpcFollower {
 
         let v_now = current_speed(state, self.last_v);
         let model = Model::new(state, constraints, v_now, cfg.dt, prep.allow_reverse);
-        let reference = build_reference(
-            &self.base.path,
-            &self.cursor.cum,
-            prep.proj.arc_length,
-            n,
-            cfg.dt,
-            cfg.ref_velocity.min(constraints.max_linear_velocity),
-            cfg.approach_taper_distance,
-        );
+        let reference = match &self.trajectory {
+            Some(traj) => build_timed_reference(traj, self.clock, n, cfg.dt),
+            None => build_reference(
+                &self.base.path,
+                &self.cursor.cum,
+                prep.proj.arc_length,
+                n,
+                cfg.dt,
+                cfg.ref_velocity.min(constraints.max_linear_velocity),
+                cfg.approach_taper_distance,
+            ),
+        };
         let w = CostWeights {
             cte: cfg.weight_cte,
             epsi: cfg.weight_epsi,
@@ -299,7 +308,18 @@ impl Controller for MpcFollower {
         cmd
     }
 
+    fn set_trajectory(&mut self, trajectory: Trajectory) {
+        self.set_path(trajectory.to_path());
+        self.trajectory = Some(trajectory);
+        self.clock = 0.0;
+    }
+
+    fn set_time(&mut self, t: f64) {
+        self.clock = t;
+    }
+
     fn set_path(&mut self, path: Path) {
+        self.trajectory = None;
         self.cursor.set_path(&path.waypoints);
         self.base.path = path;
         self.base.path_index = 0;

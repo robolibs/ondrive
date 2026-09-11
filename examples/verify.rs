@@ -55,7 +55,7 @@ fn constraints(st: SteeringType) -> RobotConstraints {
 }
 
 fn main() {
-    let kinds = [TrackerKind::Pid, TrackerKind::Carrot, TrackerKind::PurePursuit, TrackerKind::Stanley, TrackerKind::Lqr, TrackerKind::Mpc, TrackerKind::Mppi, TrackerKind::Mca, TrackerKind::Soc, TrackerKind::Dwa, TrackerKind::Teb, TrackerKind::Flc, TrackerKind::RegulatedPursuit, TrackerKind::Ilqr];
+    let kinds = [TrackerKind::Pid, TrackerKind::Carrot, TrackerKind::PurePursuit, TrackerKind::Stanley, TrackerKind::Lqr, TrackerKind::Mpc, TrackerKind::Mppi, TrackerKind::Mca, TrackerKind::Soc, TrackerKind::Dwa, TrackerKind::Teb, TrackerKind::Flc, TrackerKind::RegulatedPursuit, TrackerKind::Ilqr, TrackerKind::VectorPursuit, TrackerKind::Kanayama];
     let dt: f64 = std::env::var("DT").ok().and_then(|s| s.parse().ok()).unwrap_or(0.05);
     println!("{:<12} {:<12} {:<16} {:>5} {:>7} {:>7} {:>6} {:>6} {:>5} {:>6}", "kind", "steering", "scenario", "ok", "t", "cte", "vmax", "kviol", "nan", "obs");
     let mut failures = 0;
@@ -66,7 +66,7 @@ fn main() {
                 if !want("KIND", format!("{kind:?}")) || !want("STEER", format!("{st:?}")) || !want("SCEN", sc.name.to_string()) { continue; }
                 let obstacle_aware = matches!(kind, TrackerKind::Mca | TrackerKind::Soc | TrackerKind::Dwa | TrackerKind::Teb);
                 if sc.obstacle.is_some() && !obstacle_aware { continue; }
-                if sc.reverse && matches!(kind, TrackerKind::Lqr | TrackerKind::Flc | TrackerKind::Dwa | TrackerKind::Mpc | TrackerKind::Ilqr | TrackerKind::Mppi | TrackerKind::Mca | TrackerKind::Soc | TrackerKind::Teb) { continue; }
+                if sc.reverse && matches!(kind, TrackerKind::Lqr | TrackerKind::Flc | TrackerKind::Dwa | TrackerKind::Mpc | TrackerKind::Ilqr | TrackerKind::Mppi | TrackerKind::Mca | TrackerKind::Soc | TrackerKind::Teb | TrackerKind::Kanayama) { continue; }
                 let c = constraints(st);
                 let kmax = c.max_steering_angle.tan() / c.wheelbase;
                 let mut t = Tracker::new(kind);

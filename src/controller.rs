@@ -1,8 +1,8 @@
 use crate::core::kinematics::{can_turn_in_place, finalize, stop};
 use crate::core::math::{distance_2d, normalize_angle, yaw_of};
 use crate::types::{
-    ControllerConfig, ControllerStatus, Goal, Path, RobotConstraints, RobotState, VelocityCommand,
-    WorldConstraints,
+    ControllerConfig, ControllerStatus, Goal, Path, RobotConstraints, RobotState, Trajectory,
+    VelocityCommand, WorldConstraints,
 };
 use datapod::{Point, Pose};
 use std::f64::consts::PI;
@@ -23,6 +23,15 @@ pub trait Controller {
         base.path_index = 0;
         base.status = ControllerStatus::default();
     }
+
+    /// Install a timed trajectory. Controllers that track time keep it;
+    /// the default follows its poses as a path.
+    fn set_trajectory(&mut self, trajectory: Trajectory) {
+        self.set_path(trajectory.to_path());
+    }
+
+    /// Current time on the installed trajectory, seconds from its start.
+    fn set_time(&mut self, _t: f64) {}
 
     fn reset(&mut self) {
         let base = self.base_mut();

@@ -226,3 +226,118 @@ pub struct ControllerStatus {
     pub heading_error: f64,
     pub mode: String,
 }
+
+/// Time-stamped trajectory: a pose, time and speed per sample. Times are
+/// seconds from the trajectory start and must be increasing.
+#[derive(Clone, Debug, Default)]
+pub struct Trajectory {
+    pub poses: Vec<Pose>,
+    pub times: Vec<f64>,
+    pub speeds: Vec<f64>,
+}
+
+/// Reference state interpolated on a trajectory at one instant.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TrajectorySample {
+    pub pose: Pose,
+    pub speed: f64,
+    pub yaw_rate: f64,
+    /// True when `t` lies past the last sample.
+    pub finished: bool,
+}
+
+impl Trajectory {
+    /// Build a trajectory from a path driven at constant `speed`.
+    pub fn from_path(path: &Path, speed: f64) -> Self {
+        let speed = speed.abs().max(1e-6);
+        let mut times = Vec::with_capacity(path.waypoints.len());
+        let mut t = 0.0;
+        for (i, w) in path.waypoints.iter().enumerate() {
+            if i > 0 {
+                t += path.waypoints[i - 1].point.distance_to_2d(w.point) / speed;
+            }
+            times.push(t);
+        }
+        Self {
+            poses: path.waypoints.clone(),
+            times,
+            speeds: vec![speed; path.waypoints.len()],
+        }
+    }
+
+    /// Spatial view of the trajectory for geometric followers.
+    pub fn to_path(&self) -> Path {
+        Path {
+            waypoints: self.poses.clone(),
+            speeds: self.speeds.clone(),
+            is_closed: false,
+        }
+    }
+
+    pub fn duration(&self) -> f64 {
+        self.times.last().copied().unwrap_or(0.0)
+    }
+
+    /// Interpolated reference at time `t` (clamped to the trajectory span).
+    pub fn sample(&self, t: f64) -> TrajectorySample {
+        let n = self.poses.len();
+        if n == 0 {
+            return TrajectorySample::default();
+        }
+        let yaw = |p: &Pose| p.rotation.to_euler().yaw;
+        if n == 1 || t <= self.times[0] {
+            return TrajectorySample {
+                pose: self.poses[0],
+                speed: self.speeds.first().copied().unwrap_or(0.0),
+                yaw_rate: 0.0,
+                finished: n == 1,
+            };
+        }
+        let last = n - 1;
+        if t >= self.times[last] {
+            return TrajectorySample {
+                pose: self.poses[last],
+                speed: 0.0,
+                yaw_rate: 0.0,
+                finished: true,
+            };
+        }
+        let i = match self.times.binary_search_by(|x| x.partial_cmp(&t).unwrap_or(std::cmp::Ordering::Equal)) {
+            Ok(i) => i.min(last - 1),
+            Err(i) => i.saturating_sub(1).min(last - 1),
+        };
+        let (t0, t1) = (self.times[i], self.times[i + 1]);
+        let span = (t1 - t0).max(1e-9);
+        let a = ((t - t0) / span).clamp(0.0, 1.0);
+        let (p0, p1) = (&self.poses[i], &self.poses[i + 1]);
+        let y0 = yaw(p0);
+        let dyaw = {
+            let mut d = yaw(p1) - y0;
+            while d > std::f64::consts::PI {
+                d -= 2.0 * std::f64::consts::PI;
+            }
+            while d < -std::f64::consts::PI {
+                d += 2.0 * std::f64::consts::PI;
+            }
+            d
+        };
+        let pose = Pose {
+            point: Point::new(
+                p0.point.x + a * (p1.point.x - p0.point.x),
+                p0.point.y + a * (p1.point.y - p0.point.y),
+                p0.point.z + a * (p1.point.z - p0.point.z),
+            ),
+            rotation: datapod::Quaternion::from_euler(datapod::Euler::new(0.0, 0.0, y0 + a * dyaw)),
+        };
+        let speed = match (self.speeds.get(i), self.speeds.get(i + 1)) {
+            (Some(s0), Some(s1)) => s0 + a * (s1 - s0),
+            _ => p0.point.distance_to_2d(p1.point) / span,
+        };
+        TrajectorySample {
+            pose,
+            speed,
+            yaw_rate: dyaw / span,
+            finished: false,
+        }
+    }
+}

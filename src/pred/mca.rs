@@ -298,6 +298,14 @@ impl Controller for McaFollower {
         self.mppi.set_path(path);
     }
 
+    fn set_trajectory(&mut self, trajectory: crate::types::Trajectory) {
+        self.mppi.set_trajectory(trajectory);
+    }
+
+    fn set_time(&mut self, t: f64) {
+        self.mppi.set_time(t);
+    }
+
     fn reset(&mut self) {
         self.mppi.reset();
     }

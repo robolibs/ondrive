@@ -8,10 +8,12 @@ use crate::core::kinematics::wheelbase;
 use crate::core::math::normalize_angle;
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
-    Model, Reference, build_reference, command_from_controls, current_speed, prepare,
-    speed_at_arc_length, update_turn_in_place,
+    Model, Reference, build_reference, build_timed_reference, command_from_controls,
+    current_speed, prepare, speed_at_arc_length, update_turn_in_place,
 };
-use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
+use crate::types::{
+    Goal, Path, RobotConstraints, RobotState, Trajectory, VelocityCommand, WorldConstraints,
+};
 use datapod::Point;
 use nalgebra::{Matrix2, Matrix2x4, Matrix4, Matrix4x2, Vector2, Vector4};
 
@@ -70,6 +72,8 @@ pub struct IlqrFollower {
     shift_accum: f64,
     last_iterations: usize,
     last_cost: f64,
+    trajectory: Option<Trajectory>,
+    clock: f64,
 }
 
 impl Default for IlqrFollower {
@@ -222,7 +226,7 @@ impl Problem<'_> {
                 let lxx = st.lxx * self.model.dt;
                 let luu = st.luu * self.model.dt;
                 // Value derivatives propagate through the state after the step.
-                let qx = if i + 1 == n { lx + a.transpose() * vx } else { lx + a.transpose() * vx };
+                let qx = lx + a.transpose() * vx;
                 let qu = lu + b.transpose() * vx;
                 let qxx = lxx + a.transpose() * vxx * a;
                 let quu = luu + b.transpose() * vxx * b + Matrix2::identity() * mu;
@@ -304,6 +308,8 @@ impl IlqrFollower {
             shift_accum: 0.0,
             last_iterations: 0,
             last_cost: 0.0,
+            trajectory: None,
+            clock: 0.0,
             ilqr_config: cfg,
         }
     }
@@ -365,15 +371,18 @@ impl Controller for IlqrFollower {
         }
         let v_now = current_speed(state, self.last_v);
         let model = Model::new(state, constraints, v_now, cfg.dt, prep.allow_reverse);
-        let reference = build_reference(
-            &self.base.path,
-            &self.cursor.cum,
-            prep.proj.arc_length,
-            n,
-            cfg.dt,
-            cfg.ref_velocity.min(constraints.max_linear_velocity),
-            cfg.approach_taper_distance,
-        );
+        let reference = match &self.trajectory {
+            Some(traj) => build_timed_reference(traj, self.clock, n, cfg.dt),
+            None => build_reference(
+                &self.base.path,
+                &self.cursor.cum,
+                prep.proj.arc_length,
+                n,
+                cfg.dt,
+                cfg.ref_velocity.min(constraints.max_linear_velocity),
+                cfg.approach_taper_distance,
+            ),
+        };
         let problem = Problem { model: &model, reference: &reference, cfg: &cfg };
         let x0 = State::new(model.x0, model.y0, model.yaw0, model.v0);
         let us: Vec<Control> = (0..n).map(|i| Control::new(self.steer[i], self.accel[i])).collect();
@@ -392,9 +401,9 @@ impl Controller for IlqrFollower {
             })
             .collect();
 
-        for i in 0..n {
-            self.steer[i] = us[i][0];
-            self.accel[i] = us[i][1];
+        for (i, u) in us.iter().enumerate() {
+            self.steer[i] = u[0];
+            self.accel[i] = u[1];
         }
         let steer0 = self.steer[0];
         let accel0 = self.accel[0];
@@ -429,7 +438,18 @@ impl Controller for IlqrFollower {
         cmd
     }
 
+    fn set_trajectory(&mut self, trajectory: Trajectory) {
+        self.set_path(trajectory.to_path());
+        self.trajectory = Some(trajectory);
+        self.clock = 0.0;
+    }
+
+    fn set_time(&mut self, t: f64) {
+        self.clock = t;
+    }
+
     fn set_path(&mut self, path: Path) {
+        self.trajectory = None;
         self.cursor.set_path(&path.waypoints);
         self.base.path = path;
         self.base.path_index = 0;

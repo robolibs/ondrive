@@ -2,14 +2,17 @@ use crate::controller::{Controller, check_goal};
 use crate::core::kinematics::stop;
 use crate::core::path::{PathCursor, end_heading, segment_heading};
 use crate::fuzzy::FlcFollower;
-use crate::path::{LqrFollower, PurePursuitFollower, RegulatedPursuitFollower, StanleyFollower};
-use crate::point::{CarrotFollower, PidFollower, PoseReachFollower};
+use crate::path::{
+    KanayamaFollower, LqrFollower, PurePursuitFollower, RegulatedPursuitFollower,
+    StanleyFollower, VectorPursuitFollower,
+};
+use crate::point::{CarrotFollower, PidFollower, PoseReachFollower, PoseRegulatorFollower};
 use crate::pred::{
     DwaFollower, IlqrFollower, McaFollower, MpcFollower, MppiFollower, SocFollower, TebFollower,
 };
 use crate::types::{
-    ControllerConfig, ControllerStatus, Goal, Path, RobotConstraints, RobotState, VelocityCommand,
-    WorldConstraints,
+    ControllerConfig, ControllerStatus, Goal, Path, RobotConstraints, RobotState, Trajectory,
+    VelocityCommand, WorldConstraints,
 };
 use datapod::{Euler, Point, Pose, Quaternion};
 
@@ -30,13 +33,16 @@ pub enum TrackerKind {
     RegulatedPursuit,
     PoseReach,
     Ilqr,
+    PoseRegulator,
+    VectorPursuit,
+    Kanayama,
 }
 
 impl TrackerKind {
     /// Point-to-point controllers are driven through a path waypoint by
     /// waypoint by the tracker; path followers consume the whole path.
     pub fn is_point_controller(self) -> bool {
-        matches!(self, TrackerKind::Pid | TrackerKind::Carrot | TrackerKind::Dwa | TrackerKind::PoseReach)
+        matches!(self, TrackerKind::Pid | TrackerKind::Carrot | TrackerKind::Dwa | TrackerKind::PoseReach | TrackerKind::PoseRegulator)
     }
 }
 
@@ -50,6 +56,9 @@ pub struct Tracker {
     waypoint_index: usize,
     projection_segment: usize,
     path_completed: bool,
+    trajectory: Option<Trajectory>,
+    clock: f64,
+    clock_origin: Option<f64>,
 }
 
 impl Tracker {
@@ -65,6 +74,9 @@ impl Tracker {
             waypoint_index: 0,
             projection_segment: 0,
             path_completed: false,
+            trajectory: None,
+            clock: 0.0,
+            clock_origin: None,
         }
     }
 
@@ -99,6 +111,9 @@ impl Tracker {
     }
 
     pub fn set_path(&mut self, path: Path) {
+        self.trajectory = None;
+        self.clock = 0.0;
+        self.clock_origin = None;
         self.cursor.set_path(&path.waypoints);
         self.path = Some(path.clone());
         self.waypoint_index = 0;
@@ -111,8 +126,35 @@ impl Tracker {
         self.path.as_ref()
     }
 
+    /// Install a timed trajectory. Its poses become the path; the tracker
+    /// clock restarts and advances by `dt` every tick (or follows
+    /// `RobotState::timestamp` when that is provided and increasing).
+    pub fn set_trajectory(&mut self, trajectory: Trajectory) {
+        self.cursor.set_path(&trajectory.poses);
+        self.path = Some(trajectory.to_path());
+        self.waypoint_index = 0;
+        self.projection_segment = 0;
+        self.path_completed = false;
+        self.clock = 0.0;
+        self.clock_origin = None;
+        self.controller.set_trajectory(trajectory.clone());
+        self.trajectory = Some(trajectory);
+    }
+
+    pub fn trajectory(&self) -> Option<&Trajectory> {
+        self.trajectory.as_ref()
+    }
+
+    /// Seconds elapsed on the installed trajectory.
+    pub fn trajectory_time(&self) -> f64 {
+        self.clock
+    }
+
     pub fn clear_path(&mut self) {
         self.path = None;
+        self.trajectory = None;
+        self.clock = 0.0;
+        self.clock_origin = None;
         self.waypoint_index = 0;
         self.projection_segment = 0;
         self.path_completed = false;
@@ -163,6 +205,15 @@ impl Tracker {
         }
         if !state.allow_move {
             return stop("Movement disabled");
+        }
+        if self.trajectory.is_some() {
+            if state.timestamp > 0.0 {
+                let origin = *self.clock_origin.get_or_insert(state.timestamp);
+                self.clock = (state.timestamp - origin).max(self.clock);
+            } else {
+                self.clock += dt;
+            }
+            self.controller.set_time(self.clock);
         }
 
         let goal = match self.resolve_goal(state, world) {
@@ -432,6 +483,9 @@ fn make_controller(kind: TrackerKind) -> Box<dyn Controller> {
         TrackerKind::RegulatedPursuit => Box::new(RegulatedPursuitFollower::new()),
         TrackerKind::PoseReach => Box::new(PoseReachFollower::new()),
         TrackerKind::Ilqr => Box::new(IlqrFollower::new()),
+        TrackerKind::PoseRegulator => Box::new(PoseRegulatorFollower::new()),
+        TrackerKind::VectorPursuit => Box::new(VectorPursuitFollower::new()),
+        TrackerKind::Kanayama => Box::new(KanayamaFollower::new()),
     }
 }
 

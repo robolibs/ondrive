@@ -13,7 +13,8 @@ use crate::core::kinematics::{
 use crate::core::math::normalize_angle;
 use crate::core::path::{PathCursor, PathProjection, sample};
 use crate::types::{
-    ControllerConfig, Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints,
+    ControllerConfig, Goal, Path, RobotConstraints, RobotState, Trajectory, VelocityCommand,
+    WorldConstraints,
 };
 use datapod::Point;
 use rand::{SeedableRng, rngs::StdRng};
@@ -112,6 +113,19 @@ pub(crate) fn build_reference(
         r.yaw.push(h);
         r.v.push(v);
         s += v.max(0.0) * dt;
+    }
+    r
+}
+
+/// Reference states sampled by time on a trajectory, from `t0` every `dt`.
+pub(crate) fn build_timed_reference(traj: &Trajectory, t0: f64, horizon: usize, dt: f64) -> Reference {
+    let mut r = Reference::default();
+    for i in 0..=horizon {
+        let s = traj.sample(t0 + i as f64 * dt);
+        r.x.push(s.pose.point.x);
+        r.y.push(s.pose.point.y);
+        r.yaw.push(s.pose.rotation.to_euler().yaw);
+        r.v.push(if s.finished { 0.0 } else { s.speed });
     }
     r
 }
@@ -427,6 +441,8 @@ pub struct MppiFollower {
     is_turning_in_place: bool,
     last_v: f64,
     shift_accum: f64,
+    trajectory: Option<Trajectory>,
+    clock: f64,
     rng: StdRng,
 }
 
@@ -459,6 +475,8 @@ impl MppiFollower {
             is_turning_in_place: false,
             last_v: 0.0,
             shift_accum: 0.0,
+            trajectory: None,
+            clock: 0.0,
             rng,
             cursor: PathCursor::default(),
             mppi_config: cfg,
@@ -530,15 +548,18 @@ impl MppiFollower {
 
         let v_now = current_speed(state, self.last_v);
         let model = Model::new(state, constraints, v_now, working.dt, prep.allow_reverse);
-        let reference = build_reference(
-            &self.base.path,
-            &self.cursor.cum,
-            prep.proj.arc_length,
-            n,
-            working.dt,
-            working.ref_velocity.min(constraints.max_linear_velocity),
-            working.decel_distance,
-        );
+        let reference = match &self.trajectory {
+            Some(traj) => build_timed_reference(traj, self.clock, n, working.dt),
+            None => build_reference(
+                &self.base.path,
+                &self.cursor.cum,
+                prep.proj.arc_length,
+                n,
+                working.dt,
+                working.ref_velocity.min(constraints.max_linear_velocity),
+                working.decel_distance,
+            ),
+        };
         let w = self.weights(&working);
         model.clamp_controls(&mut self.mean_steering, &mut self.mean_acceleration);
 
@@ -654,7 +675,18 @@ impl Controller for MppiFollower {
         )
     }
 
+    fn set_trajectory(&mut self, trajectory: Trajectory) {
+        self.set_path(trajectory.to_path());
+        self.trajectory = Some(trajectory);
+        self.clock = 0.0;
+    }
+
+    fn set_time(&mut self, t: f64) {
+        self.clock = t;
+    }
+
     fn set_path(&mut self, path: Path) {
+        self.trajectory = None;
         self.cursor.set_path(&path.waypoints);
         self.base.path = path;
         self.base.path_index = 0;

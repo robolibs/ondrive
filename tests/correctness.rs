@@ -11,7 +11,8 @@ use ondrive::{
     McaConfig, McaFollower, MpcConfig, MpcFollower, MppiConfig, MppiFollower, OutputUnits, Path,
     PidFollower, PurePursuitFollower, RobotConstraints, RobotState, SocConfig, SocFollower,
     StanleyFollower, SteeringType, TebConfig, TebFollower, Tracker, TrackerKind, CarrotFollower,
-    IlqrConfig, IlqrFollower, PoseReachFollower, RegulatedPursuitFollower,
+    IlqrConfig, IlqrFollower, KanayamaFollower, PoseReachFollower, PoseRegulatorFollower,
+    RegulatedPursuitFollower, VectorPursuitFollower,
 };
 use std::f64::consts::{FRAC_PI_2, PI};
 
@@ -72,7 +73,9 @@ fn config(units: OutputUnits) -> ControllerConfig {
     cfg
 }
 
-const PATH_KINDS: [TrackerKind; 12] = [
+const PATH_KINDS: [TrackerKind; 14] = [
+    TrackerKind::Kanayama,
+    TrackerKind::VectorPursuit,
     TrackerKind::RegulatedPursuit,
     TrackerKind::Ilqr,
     TrackerKind::PurePursuit,
@@ -87,7 +90,10 @@ const PATH_KINDS: [TrackerKind; 12] = [
     TrackerKind::Dwa,
 ];
 
-const ALL_KINDS: [TrackerKind; 15] = [
+const ALL_KINDS: [TrackerKind; 18] = [
+    TrackerKind::Kanayama,
+    TrackerKind::VectorPursuit,
+    TrackerKind::PoseRegulator,
     TrackerKind::RegulatedPursuit,
     TrackerKind::Ilqr,
     TrackerKind::PoseReach,
@@ -116,6 +122,9 @@ fn make(kind: TrackerKind) -> Box<dyn Controller> {
         TrackerKind::Flc => Box::new(FlcFollower::new()),
         TrackerKind::RegulatedPursuit => Box::new(RegulatedPursuitFollower::new()),
         TrackerKind::PoseReach => Box::new(PoseReachFollower::new()),
+        TrackerKind::PoseRegulator => Box::new(PoseRegulatorFollower::new()),
+        TrackerKind::VectorPursuit => Box::new(VectorPursuitFollower::new()),
+        TrackerKind::Kanayama => Box::new(KanayamaFollower::new()),
         TrackerKind::Ilqr => {
             let mut c = IlqrConfig::default();
             c.horizon_steps = 12;
@@ -401,6 +410,8 @@ fn geometric_followers_steer_toward_the_path() {
             TrackerKind::Mpc,
             TrackerKind::Ilqr,
             TrackerKind::RegulatedPursuit,
+            TrackerKind::VectorPursuit,
+            TrackerKind::Kanayama,
         ] {
             let left = first_yaw_rate(kind, steering, pose(2.0, 0.6, 0.0));
             let right = first_yaw_rate(kind, steering, pose(2.0, -0.6, 0.0));
