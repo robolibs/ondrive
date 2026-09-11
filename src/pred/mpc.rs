@@ -90,7 +90,7 @@ fn total_cost(
     steer: &[f64],
     accel: &[f64],
 ) -> f64 {
-    let (mut c, _) = rollout(model, steer, accel, reference, w, &|_, _, _| 0.0, false);
+    let (mut c, _) = rollout(model, steer, accel, reference, w, &|_, _, _, _| 0.0, false);
     for i in 1..steer.len() {
         let ds = steer[i] - steer[i - 1];
         let da = accel[i] - accel[i - 1];
@@ -269,7 +269,7 @@ impl Controller for MpcFollower {
             return VelocityCommand::invalid("MPC optimizer failed");
         }
 
-        let (_, traj) = rollout(&model, &steer, &accel, &reference, &w, &|_, _, _| 0.0, true);
+        let (_, traj) = rollout(&model, &steer, &accel, &reference, &w, &|_, _, _, _| 0.0, true);
         self.predicted_trajectory = traj;
 
         let steer0 = steer[0];

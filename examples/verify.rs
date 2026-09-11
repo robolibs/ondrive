@@ -55,7 +55,7 @@ fn constraints(st: SteeringType) -> RobotConstraints {
 }
 
 fn main() {
-    let kinds = [TrackerKind::Pid, TrackerKind::Carrot, TrackerKind::PurePursuit, TrackerKind::Stanley, TrackerKind::Lqr, TrackerKind::Mpc, TrackerKind::Mppi, TrackerKind::Mca, TrackerKind::Soc, TrackerKind::Dwa, TrackerKind::Teb, TrackerKind::Flc, TrackerKind::RegulatedPursuit, TrackerKind::Ilqr, TrackerKind::VectorPursuit, TrackerKind::Kanayama];
+    let kinds = [TrackerKind::Pid, TrackerKind::Carrot, TrackerKind::PurePursuit, TrackerKind::Stanley, TrackerKind::Lqr, TrackerKind::Mpc, TrackerKind::Mppi, TrackerKind::Mca, TrackerKind::Soc, TrackerKind::Dwa, TrackerKind::Teb, TrackerKind::Flc, TrackerKind::RegulatedPursuit, TrackerKind::Ilqr, TrackerKind::VectorPursuit, TrackerKind::Kanayama, TrackerKind::Ilc];
     let dt: f64 = std::env::var("DT").ok().and_then(|s| s.parse().ok()).unwrap_or(0.05);
     println!("{:<12} {:<12} {:<16} {:>5} {:>7} {:>7} {:>6} {:>6} {:>5} {:>6}", "kind", "steering", "scenario", "ok", "t", "cte", "vmax", "kviol", "nan", "obs");
     let mut failures = 0;
@@ -101,5 +101,119 @@ fn main() {
             }
         }
     }
+    let failures = failures + extra_scenarios();
     println!("failures: {failures}");
+}
+
+/// Pose-goal and timed-trajectory checks appended to the path matrix.
+#[allow(dead_code)]
+fn extra_scenarios() -> usize {
+    let mut failures = 0;
+    let filter = |var: &str, actual: &str| std::env::var(var).map(|w| w == actual).unwrap_or(true);
+    println!("{:<12} {:<12} {:<16} {:>5} {:>7} {:>7}", "kind", "steering", "scenario", "ok", "t", "err");
+
+    // Pose goals: (name, goal pose, reverse allowed).
+    let pose_goals = [
+        ("park-beside", (1.0, -1.2, 0.0), true),
+        ("90deg-1m", (1.0, 1.0, PI / 2.0), true),
+        ("behind-fwd", (-3.0, 0.0, 0.0), false),
+        ("ahead-turned", (4.0, 1.0, PI / 2.0), false),
+    ];
+    for (kind, st) in [
+        (TrackerKind::PoseReach, SteeringType::Ackermann),
+        (TrackerKind::PoseReach, SteeringType::Differential),
+        (TrackerKind::PoseRegulator, SteeringType::Differential),
+        (TrackerKind::Pid, SteeringType::Differential),
+    ] {
+        if !filter("KIND", &format!("{kind:?}")) || !filter("STEER", &format!("{st:?}")) {
+            continue;
+        }
+        for (name, (gx, gy, gyaw), reverse) in pose_goals {
+            if !filter("SCEN", name) {
+                continue;
+            }
+            let mut c = constraints(st);
+            c.max_linear_velocity = 0.6;
+            let mut t = Tracker::new(kind);
+            let mut cfg = ControllerConfig::default();
+            cfg.goal_tolerance = 0.15;
+            cfg.angular_tolerance = 0.15;
+            cfg.allow_reverse = reverse;
+            cfg.kp_linear = 1.5;
+            cfg.kp_angular = 2.5;
+            t.set_config(cfg);
+            t.init(c);
+            t.set_goal(Goal { target_pose: pose(gx, gy, gyaw), tolerance_position: 0.15, tolerance_orientation: 0.15, ..Default::default() });
+            let mut state = RobotState { pose: pose(0.0, 0.0, 0.0), allow_move: true, ..Default::default() };
+            let dt = 0.05;
+            let (mut reached, mut sim_t) = (false, 0.0);
+            for i in 0..3000 {
+                let cmd = t.tick(&state, dt, None);
+                if !cmd.valid { break; }
+                let yaw = state.pose.rotation.to_euler().yaw;
+                state.pose.point.x += cmd.linear_velocity * yaw.cos() * dt;
+                state.pose.point.y += cmd.linear_velocity * yaw.sin() * dt;
+                state.pose.rotation = Quaternion::from_euler(Euler::new(0.0, 0.0, yaw + cmd.angular_velocity * dt));
+                state.velocity.linear = cmd.linear_velocity;
+                sim_t = (i + 1) as f64 * dt;
+                if t.is_goal_reached() { reached = true; break; }
+            }
+            let d = state.pose.point.distance_to_2d(Point::new(gx, gy, 0.0));
+            let a = ((state.pose.rotation.to_euler().yaw - gyaw + PI).rem_euclid(2.0 * PI) - PI).abs();
+            // Ackermann PID cannot fix orientation; PID reports arrival on position.
+            let strict = kind != TrackerKind::Pid;
+            let ok = reached && d < 0.25 && (!strict || a < 0.25);
+            if !ok { failures += 1; }
+            println!("{:<12} {:<12} {:<16} {:>5} {:>7.1} {:>7.2}", format!("{kind:?}"), format!("{st:?}"), name, if ok { "ok" } else { "FAIL" }, sim_t, d.max(a));
+        }
+    }
+
+    // Timed trajectories: a circle at constant speed, schedule must be kept.
+    for kind in [TrackerKind::Kanayama, TrackerKind::Mpc, TrackerKind::Ilqr, TrackerKind::Mppi, TrackerKind::Mca, TrackerKind::Soc] {
+        for st in [SteeringType::Differential, SteeringType::Ackermann] {
+            if !filter("KIND", &format!("{kind:?}")) || !filter("STEER", &format!("{st:?}")) || !filter("SCEN", "timed-circle") {
+                continue;
+            }
+            let (r, speed, duration) = (3.0, 0.6, 25.0);
+            let mut traj = Trajectory::default();
+            let n = (duration / 0.1) as usize;
+            for i in 0..=n {
+                let time = i as f64 * 0.1;
+                let a = speed / r * time;
+                traj.poses.push(pose(r * a.sin(), r * (1.0 - a.cos()), a));
+                traj.times.push(time);
+                traj.speeds.push(speed);
+            }
+            let mut t = Tracker::new(kind);
+            let mut cfg = ControllerConfig::default();
+            cfg.goal_tolerance = 0.3;
+            cfg.angular_tolerance = PI;
+            t.set_config(cfg);
+            t.init(constraints(st));
+            t.set_trajectory(traj.clone());
+            let mut state = RobotState { pose: pose(0.0, 0.1, 0.0), allow_move: true, ..Default::default() };
+            let dt = 0.1;
+            let (mut max_err, mut reached, mut sim_t) = (0.0_f64, false, 0.0);
+            for i in 0..400 {
+                let cmd = t.tick(&state, dt, None);
+                if !cmd.valid { break; }
+                let yaw = state.pose.rotation.to_euler().yaw;
+                state.pose.point.x += cmd.linear_velocity * yaw.cos() * dt;
+                state.pose.point.y += cmd.linear_velocity * yaw.sin() * dt;
+                state.pose.rotation = Quaternion::from_euler(Euler::new(0.0, 0.0, yaw + cmd.angular_velocity * dt));
+                state.velocity.linear = cmd.linear_velocity;
+                state.velocity.angular = cmd.angular_velocity;
+                sim_t = (i + 1) as f64 * dt;
+                if sim_t > 4.0 && sim_t < 24.0 {
+                    let rs = traj.sample(t.trajectory_time());
+                    max_err = max_err.max(state.pose.point.distance_to_2d(rs.pose.point));
+                }
+                if t.is_goal_reached() { reached = true; break; }
+            }
+            let ok = reached && max_err < 0.5 && sim_t > 22.0 && sim_t < 30.0;
+            if !ok { failures += 1; }
+            println!("{:<12} {:<12} {:<16} {:>5} {:>7.1} {:>7.2}", format!("{kind:?}"), format!("{st:?}"), "timed-circle", if ok { "ok" } else { "FAIL" }, sim_t, max_err);
+        }
+    }
+    failures
 }

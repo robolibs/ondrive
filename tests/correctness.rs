@@ -12,7 +12,7 @@ use ondrive::{
     PidFollower, PurePursuitFollower, RobotConstraints, RobotState, SocConfig, SocFollower,
     StanleyFollower, SteeringType, TebConfig, TebFollower, Tracker, TrackerKind, CarrotFollower,
     IlqrConfig, IlqrFollower, KanayamaFollower, PoseReachFollower, PoseRegulatorFollower,
-    RegulatedPursuitFollower, VectorPursuitFollower,
+    RegulatedPursuitFollower, VectorPursuitFollower, ApfFollower, IlcFollower,
 };
 use std::f64::consts::{FRAC_PI_2, PI};
 
@@ -73,7 +73,8 @@ fn config(units: OutputUnits) -> ControllerConfig {
     cfg
 }
 
-const PATH_KINDS: [TrackerKind; 14] = [
+const PATH_KINDS: [TrackerKind; 15] = [
+    TrackerKind::Ilc,
     TrackerKind::Kanayama,
     TrackerKind::VectorPursuit,
     TrackerKind::RegulatedPursuit,
@@ -90,7 +91,9 @@ const PATH_KINDS: [TrackerKind; 14] = [
     TrackerKind::Dwa,
 ];
 
-const ALL_KINDS: [TrackerKind; 18] = [
+const ALL_KINDS: [TrackerKind; 20] = [
+    TrackerKind::Ilc,
+    TrackerKind::Apf,
     TrackerKind::Kanayama,
     TrackerKind::VectorPursuit,
     TrackerKind::PoseRegulator,
@@ -125,6 +128,8 @@ fn make(kind: TrackerKind) -> Box<dyn Controller> {
         TrackerKind::PoseRegulator => Box::new(PoseRegulatorFollower::new()),
         TrackerKind::VectorPursuit => Box::new(VectorPursuitFollower::new()),
         TrackerKind::Kanayama => Box::new(KanayamaFollower::new()),
+        TrackerKind::Apf => Box::new(ApfFollower::new()),
+        TrackerKind::Ilc => Box::new(IlcFollower::default()),
         TrackerKind::Ilqr => {
             let mut c = IlqrConfig::default();
             c.horizon_steps = 12;

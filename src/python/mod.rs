@@ -47,6 +47,8 @@ fn kind_from_str(s: &str) -> PyResult<TrackerKind> {
         "pose_regulator" => TrackerKind::PoseRegulator,
         "vector_pursuit" => TrackerKind::VectorPursuit,
         "kanayama" => TrackerKind::Kanayama,
+        "apf" => TrackerKind::Apf,
+        "ilc" => TrackerKind::Ilc,
         other => {
             return Err(PyValueError::new_err(format!(
                 "unknown tracker kind: {other}"
@@ -75,6 +77,8 @@ fn kind_to_str(k: TrackerKind) -> &'static str {
         TrackerKind::PoseRegulator => "pose_regulator",
         TrackerKind::VectorPursuit => "vector_pursuit",
         TrackerKind::Kanayama => "kanayama",
+        TrackerKind::Apf => "apf",
+        TrackerKind::Ilc => "ilc",
     }
 }
 
@@ -164,7 +168,7 @@ impl PyControllerConfig {
         output_units = "physical",
         kp_linear = 1.0, ki_linear = 0.0, kd_linear = 0.0,
         kp_angular = 1.0, ki_angular = 0.0, kd_angular = 0.0,
-        lookahead_distance = 1.0,
+        lookahead_distance = 1.0, lookahead_time = 0.3,
         k_cross_track = 1.0, k_heading = 1.0,
         allow_reverse = false,
         goal_tolerance = 0.1, angular_tolerance = 0.1,
@@ -178,6 +182,7 @@ impl PyControllerConfig {
         ki_angular: f64,
         kd_angular: f64,
         lookahead_distance: f64,
+        lookahead_time: f64,
         k_cross_track: f64,
         k_heading: f64,
         allow_reverse: bool,
@@ -194,6 +199,7 @@ impl PyControllerConfig {
                 ki_angular,
                 kd_angular,
                 lookahead_distance,
+                lookahead_time,
                 k_cross_track,
                 k_heading,
                 allow_reverse,
@@ -277,6 +283,14 @@ impl PyControllerConfig {
     #[setter]
     fn set_lookahead_distance(&mut self, v: f64) {
         self.inner.lookahead_distance = v;
+    }
+    #[getter]
+    fn lookahead_time(&self) -> f64 {
+        self.inner.lookahead_time
+    }
+    #[setter]
+    fn set_lookahead_time(&mut self, v: f64) {
+        self.inner.lookahead_time = v;
     }
     #[getter]
     fn k_cross_track(&self) -> f64 {
@@ -372,6 +386,7 @@ impl PyRobotConstraints {
     ) -> PyResult<Self> {
         Ok(Self {
             inner: RsConstraints {
+                footprint: Default::default(),
                 steering_type: steering_from_str(steering_type)?,
                 wheelbase,
                 track_width,
@@ -871,6 +886,10 @@ impl PyPath {
 // World / obstacles.
 // ---------------------------------------------------------------------------
 
+fn ondrive_traj(poses: Vec<datapod::Pose>, times: Vec<f64>, speeds: Vec<f64>) -> crate::types::Trajectory {
+    crate::types::Trajectory { poses, times, speeds }
+}
+
 #[pyclass(name = "World")]
 #[derive(Clone)]
 pub struct PyWorld {
@@ -915,6 +934,20 @@ impl PyWorld {
                 std_y: vec![std_y; h],
             }],
         });
+    }
+
+    /// Install an occupancy grid: row-major `width * height` booleans whose
+    /// cell (0, 0) starts at `(origin_x, origin_y)`.
+    fn set_grid(&mut self, origin_x: f64, origin_y: f64, resolution: f64, width: usize, height: usize, occupied: Vec<bool>) -> PyResult<()> {
+        if resolution <= 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("resolution must be positive"));
+        }
+        self.inner.grid = Some(crate::types::OccupancyGrid::new(origin_x, origin_y, resolution, width, height, occupied));
+        Ok(())
+    }
+
+    fn clear_grid(&mut self) {
+        self.inner.grid = None;
     }
 
     #[pyo3(signature = (id, radius, mean_x, mean_y, std_x = 0.1, std_y = 0.1))]
@@ -1006,6 +1039,22 @@ impl PyTracker {
         self.inner.set_path(path.inner);
     }
 
+    /// Install a timed trajectory from a path and one time per waypoint.
+    fn set_trajectory(&mut self, path: PyPath, times: Vec<f64>) -> PyResult<()> {
+        let n = path.inner.waypoints.len();
+        if times.len() != n {
+            return Err(pyo3::exceptions::PyValueError::new_err("times must have one entry per waypoint"));
+        }
+        let mut speeds = path.inner.speeds.clone();
+        speeds.resize(n, 0.0);
+        self.inner.set_trajectory(ondrive_traj(path.inner.waypoints, times, speeds));
+        Ok(())
+    }
+
+    fn trajectory_time(&self) -> f64 {
+        self.inner.trajectory_time()
+    }
+
     fn clear_path(&mut self) {
         self.inner.clear_path();
     }
@@ -1090,6 +1139,8 @@ fn available_tracker_kinds() -> Vec<&'static str> {
         "pose_regulator",
         "vector_pursuit",
         "kanayama",
+        "apf",
+        "ilc",
     ]
 }
 

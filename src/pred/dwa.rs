@@ -8,9 +8,8 @@ use crate::core::kinematics::{
     can_turn_in_place, finalize, max_curvature, reverse_allowed, speed_bounds,
 };
 use crate::core::math::{heading_error, normalize_angle};
-use crate::types::{
-    Goal, Obstacle, RobotConstraints, RobotState, VelocityCommand, WorldConstraints,
-};
+use crate::core::obstacles::CollisionChecker;
+use crate::types::{Goal, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use std::f64::consts::PI;
 
 #[derive(Clone, Debug)]
@@ -65,31 +64,6 @@ struct Sample {
     clearance: f64,
 }
 
-fn robot_radius(constraints: &RobotConstraints) -> f64 {
-    let r = 0.5 * constraints.robot_width.hypot(constraints.robot_length);
-    if r < 0.05 { 0.3 } else { r }
-}
-
-/// Smallest clearance between the robot disc and any obstacle mode at `step`.
-fn clearance_at(obstacles: &[Obstacle], step: usize, x: f64, y: f64, radius: f64) -> f64 {
-    let mut best = f64::INFINITY;
-    for obs in obstacles {
-        for (ox, oy, r) in obstacle_at(obs, step) {
-            best = best.min((x - ox).hypot(y - oy) - r - radius);
-        }
-    }
-    best
-}
-
-fn obstacle_at(obs: &Obstacle, step: usize) -> impl Iterator<Item = (f64, f64, f64)> + '_ {
-    obs.modes.iter().filter_map(move |md| {
-        if md.weight <= 0.0 || md.mean_x.is_empty() || md.mean_y.is_empty() {
-            return None;
-        }
-        let ti = step.min(md.mean_x.len() - 1).min(md.mean_y.len() - 1);
-        Some((md.mean_x[ti], md.mean_y[ti], obs.radius))
-    })
-}
 
 impl DwaFollower {
     pub fn new() -> Self {
@@ -175,9 +149,7 @@ impl Controller for DwaFollower {
         let sim_dt = dwa.dt.max(1e-3);
         let steps = (dwa.predict_time / sim_dt).ceil().max(1.0) as usize;
         let kappa_max = max_curvature(constraints);
-        let radius = robot_radius(constraints);
-        let empty: Vec<Obstacle> = Vec::new();
-        let obstacles = world.map(|w| &w.obstacles).unwrap_or(&empty);
+        let checker = CollisionChecker::new(world, constraints, 0.0);
         let goal_p = goal.target_pose.point;
         let target_v = dwa
             .target_velocity
@@ -200,7 +172,7 @@ impl Controller for DwaFollower {
                 let step_len = v.abs() * sim_dt;
                 let mut travelled = 0.0;
                 let mut horizon = 0.0;
-                let mut prev_clearance = clearance_at(obstacles, 0, x, y, radius);
+                let mut prev_clearance = checker.clearance(0, x, y, yaw);
                 let start_clearance = prev_clearance;
                 let mut min_clearance = prev_clearance;
                 let mut free_distance: Option<f64> = None;
@@ -208,7 +180,7 @@ impl Controller for DwaFollower {
                     x += v * yaw.cos() * sim_dt;
                     y += v * yaw.sin() * sim_dt;
                     yaw = normalize_angle(yaw + w * sim_dt);
-                    let c = clearance_at(obstacles, step, x, y, radius);
+                    let c = checker.clearance(step, x, y, yaw);
                     min_clearance = min_clearance.min(c);
                     let entering = c < dwa.obstacle_margin
                         && c < prev_clearance - 1e-9
@@ -286,7 +258,7 @@ impl Controller for DwaFollower {
         let mut mode = "dwa";
         if v.abs() < 1e-9
             && dist_to_goal > cfg.goal_tolerance
-            && let Some(turn) = recovery_turn(obstacles, x0, y0, yaw0, radius, dwa.obstacle_margin)
+            && let Some(turn) = recovery_turn(&checker, x0, y0, yaw0, dwa.obstacle_margin)
         {
             v = 0.0;
             w = turn * (w_now.abs() + a_ang * dt).min(w_lim).max(0.2 * w_lim);
@@ -324,21 +296,20 @@ impl Controller for DwaFollower {
 /// Free straight-line distance from `(x, y)` along `heading` before contact
 /// or a drop below the current clearance inside the margin.
 fn probe_free_distance(
-    obstacles: &[Obstacle],
+    checker: &CollisionChecker,
     x: f64,
     y: f64,
     heading: f64,
-    radius: f64,
     margin: f64,
     length: f64,
 ) -> f64 {
     let step = 0.05;
-    let start = clearance_at(obstacles, 0, x, y, radius);
+    let start = checker.clearance(0, x, y, heading);
     let (s, c) = heading.sin_cos();
     let mut travelled = 0.0;
     while travelled < length {
         travelled += step;
-        let cl = clearance_at(obstacles, 0, x + travelled * c, y + travelled * s, radius);
+        let cl = checker.clearance(0, x + travelled * c, y + travelled * s, heading);
         if cl < 0.0 || (cl < margin && cl < start) {
             return travelled - step;
         }
@@ -350,20 +321,19 @@ fn probe_free_distance(
 /// free space when no forward sample is admissible, or `None` when no other
 /// heading is better than the current one.
 fn recovery_turn(
-    obstacles: &[Obstacle],
+    checker: &CollisionChecker,
     x: f64,
     y: f64,
     yaw: f64,
-    radius: f64,
     margin: f64,
 ) -> Option<f64> {
     const PROBE: f64 = 1.5;
-    let current = probe_free_distance(obstacles, x, y, yaw, radius, margin, PROBE);
+    let current = probe_free_distance(checker, x, y, yaw, margin, PROBE);
     let mut best: Option<(f64, f64)> = None;
     for k in 1..=6 {
         for sign in [1.0, -1.0] {
             let angle = sign * k as f64 * PI / 6.0;
-            let free = probe_free_distance(obstacles, x, y, yaw + angle, radius, margin, PROBE);
+            let free = probe_free_distance(checker, x, y, yaw + angle, margin, PROBE);
             let score = free - 0.05 * k as f64;
             if free > current + 0.1 && best.is_none_or(|b| score > b.0) {
                 best = Some((score, sign));

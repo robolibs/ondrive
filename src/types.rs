@@ -65,6 +65,8 @@ pub struct RobotConstraints {
 
     pub robot_width: f64,
     pub robot_length: f64,
+
+    pub footprint: Footprint,
 }
 
 impl Default for RobotConstraints {
@@ -86,6 +88,7 @@ impl Default for RobotConstraints {
             max_rear_steering_angle: 0.0,
             robot_width: 0.0,
             robot_length: 0.0,
+            footprint: Footprint::default(),
         }
     }
 }
@@ -116,6 +119,7 @@ pub struct Obstacle {
 pub struct WorldConstraints {
     pub zones: Vec<Zone>,
     pub obstacles: Vec<Obstacle>,
+    pub grid: Option<OccupancyGrid>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -190,6 +194,8 @@ pub struct ControllerConfig {
     pub kd_angular: f64,
 
     pub lookahead_distance: f64,
+    /// Extra lookahead per unit of speed (seconds); 0 keeps it fixed.
+    pub lookahead_time: f64,
     pub k_cross_track: f64,
     pub k_heading: f64,
 
@@ -209,6 +215,7 @@ impl Default for ControllerConfig {
             ki_angular: 0.0,
             kd_angular: 0.0,
             lookahead_distance: 1.0,
+            lookahead_time: 0.3,
             k_cross_track: 1.0,
             k_heading: 1.0,
             allow_reverse: false,
@@ -339,5 +346,148 @@ impl Trajectory {
             yaw_rate: dyaw / span,
             finished: false,
         }
+    }
+}
+
+/// Robot footprint in the body frame (x forward, y left).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Footprint {
+    /// Disc of `radius`; 0 derives the radius from `robot_width` and
+    /// `robot_length` (0.3 m when those are unset).
+    Disc { radius: f64 },
+    /// Convex or concave polygon given by its vertices in order.
+    Polygon { points: Vec<(f64, f64)> },
+}
+
+impl Default for Footprint {
+    fn default() -> Self {
+        Footprint::Disc { radius: 0.0 }
+    }
+}
+
+/// Occupancy grid with a precomputed distance-to-occupied field (metres).
+/// Cell `(ix, iy)` covers `[origin + i * resolution, origin + (i + 1) *
+/// resolution)`; `occupied` is row-major with `iy * width + ix`.
+#[derive(Clone, Debug, Default)]
+pub struct OccupancyGrid {
+    pub origin_x: f64,
+    pub origin_y: f64,
+    pub resolution: f64,
+    pub width: usize,
+    pub height: usize,
+    pub occupied: Vec<bool>,
+    distance: Vec<f32>,
+}
+
+impl OccupancyGrid {
+    /// Build a grid and its distance field. `occupied.len()` must equal
+    /// `width * height`; extra or missing cells are treated as free.
+    pub fn new(origin_x: f64, origin_y: f64, resolution: f64, width: usize, height: usize, occupied: Vec<bool>) -> Self {
+        let mut occ = occupied;
+        occ.resize(width * height, false);
+        let mut g = Self {
+            origin_x,
+            origin_y,
+            resolution: resolution.max(1e-6),
+            width,
+            height,
+            occupied: occ,
+            distance: Vec::new(),
+        };
+        g.rebuild_distance_field();
+        g
+    }
+
+    /// Recompute the distance field after editing `occupied`.
+    pub fn rebuild_distance_field(&mut self) {
+        let (w, h) = (self.width, self.height);
+        let inf = f32::INFINITY;
+        let mut d = vec![inf; w * h];
+        for (i, occ) in self.occupied.iter().enumerate() {
+            if *occ {
+                d[i] = 0.0;
+            }
+        }
+        // Two-pass chamfer (3-4 mask) distance transform in cell units.
+        let idx = |x: usize, y: usize| y * w + x;
+        for y in 0..h {
+            for x in 0..w {
+                let mut best = d[idx(x, y)];
+                if x > 0 {
+                    best = best.min(d[idx(x - 1, y)] + 3.0);
+                }
+                if y > 0 {
+                    best = best.min(d[idx(x, y - 1)] + 3.0);
+                    if x > 0 {
+                        best = best.min(d[idx(x - 1, y - 1)] + 4.0);
+                    }
+                    if x + 1 < w {
+                        best = best.min(d[idx(x + 1, y - 1)] + 4.0);
+                    }
+                }
+                d[idx(x, y)] = best;
+            }
+        }
+        for y in (0..h).rev() {
+            for x in (0..w).rev() {
+                let mut best = d[idx(x, y)];
+                if x + 1 < w {
+                    best = best.min(d[idx(x + 1, y)] + 3.0);
+                }
+                if y + 1 < h {
+                    best = best.min(d[idx(x, y + 1)] + 3.0);
+                    if x + 1 < w {
+                        best = best.min(d[idx(x + 1, y + 1)] + 4.0);
+                    }
+                    if x > 0 {
+                        best = best.min(d[idx(x - 1, y + 1)] + 4.0);
+                    }
+                }
+                d[idx(x, y)] = best;
+            }
+        }
+        let scale = self.resolution as f32 / 3.0;
+        self.distance = d.into_iter().map(|v| v * scale).collect();
+    }
+
+    fn cell(&self, x: f64, y: f64) -> Option<(usize, usize)> {
+        let ix = ((x - self.origin_x) / self.resolution).floor();
+        let iy = ((y - self.origin_y) / self.resolution).floor();
+        if ix < 0.0 || iy < 0.0 || ix >= self.width as f64 || iy >= self.height as f64 {
+            return None;
+        }
+        Some((ix as usize, iy as usize))
+    }
+
+    pub fn is_occupied(&self, x: f64, y: f64) -> bool {
+        self.cell(x, y).is_some_and(|(ix, iy)| self.occupied[iy * self.width + ix])
+    }
+
+    /// Distance from `(x, y)` to the nearest occupied cell centre,
+    /// bilinearly interpolated between cell centres so it is continuous;
+    /// infinity outside the grid or when the grid is empty.
+    pub fn distance_to_occupied(&self, x: f64, y: f64) -> f64 {
+        if self.distance.is_empty() || self.cell(x, y).is_none() {
+            return f64::INFINITY;
+        }
+        let fx = (x - self.origin_x) / self.resolution - 0.5;
+        let fy = (y - self.origin_y) / self.resolution - 0.5;
+        let (w, h) = (self.width as i64, self.height as i64);
+        let x0 = fx.floor() as i64;
+        let y0 = fy.floor() as i64;
+        let tx = (fx - x0 as f64).clamp(0.0, 1.0);
+        let ty = (fy - y0 as f64).clamp(0.0, 1.0);
+        let at = |cx: i64, cy: i64| -> f64 {
+            let cx = cx.clamp(0, w - 1) as usize;
+            let cy = cy.clamp(0, h - 1) as usize;
+            self.distance[cy * self.width + cx] as f64
+        };
+        let d00 = at(x0, y0);
+        let d10 = at(x0 + 1, y0);
+        let d01 = at(x0, y0 + 1);
+        let d11 = at(x0 + 1, y0 + 1);
+        let top = d00 + tx * (d10 - d00);
+        let bottom = d01 + tx * (d11 - d01);
+        top + ty * (bottom - top)
     }
 }

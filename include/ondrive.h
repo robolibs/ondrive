@@ -33,6 +33,22 @@
 
 #define ONDRIVE_KIND_FLC 11
 
+#define ONDRIVE_KIND_REGULATED_PURSUIT 12
+
+#define ONDRIVE_KIND_POSE_REACH 13
+
+#define ONDRIVE_KIND_ILQR 14
+
+#define ONDRIVE_KIND_POSE_REGULATOR 15
+
+#define ONDRIVE_KIND_VECTOR_PURSUIT 16
+
+#define ONDRIVE_KIND_KANAYAMA 17
+
+#define ONDRIVE_KIND_APF 18
+
+#define ONDRIVE_KIND_ILC 19
+
 #define ONDRIVE_STEERING_DIFFERENTIAL 0
 
 #define ONDRIVE_STEERING_ACKERMANN 1
@@ -60,6 +76,7 @@ typedef struct {
   double ki_angular;
   double kd_angular;
   double lookahead_distance;
+  double lookahead_time;
   double k_cross_track;
   double k_heading;
   bool allow_reverse;
@@ -264,6 +281,34 @@ uint32_t ondrive_tracker_kind(const OndriveTracker *h);
 bool ondrive_tracker_constraints(const OndriveTracker *h, OndriveRobotConstraints *out);
 
 const char *ondrive_version(void);
+
+/**
+ * Install a timed trajectory: the path's waypoints and speeds with one
+ * time (seconds from start) per waypoint. `times` must have
+ * `ondrive_path_len(path)` entries.
+ */
+bool ondrive_tracker_set_trajectory(OndriveTracker *h,
+                                    const OndrivePath *path,
+                                    const double *times);
+
+/**
+ * Seconds elapsed on the installed trajectory.
+ */
+double ondrive_tracker_trajectory_time(const OndriveTracker *h);
+
+/**
+ * Install an occupancy grid (row-major, `width * height` cells, non-zero =
+ * occupied) whose cell `(0, 0)` starts at `(origin_x, origin_y)`.
+ */
+bool ondrive_world_set_grid(OndriveWorld *h,
+                            double origin_x,
+                            double origin_y,
+                            double resolution,
+                            uintptr_t width,
+                            uintptr_t height,
+                            const uint8_t *occupied);
+
+bool ondrive_world_clear_grid(OndriveWorld *h);
 
 #ifdef __cplusplus
 }  // extern "C"

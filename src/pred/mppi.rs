@@ -250,7 +250,7 @@ pub(crate) fn rollout(
     accel: &[f64],
     reference: &Reference,
     w: &CostWeights,
-    extra: &dyn Fn(usize, f64, f64) -> f64,
+    extra: &dyn Fn(usize, f64, f64, f64) -> f64,
     collect: bool,
 ) -> (f64, Vec<Point>) {
     let n = steer.len().min(accel.len());
@@ -269,6 +269,7 @@ pub(crate) fn rollout(
         let a = accel[i].clamp(-ab, ab);
         model.step(&mut x, &mut y, &mut yaw, &mut v, s, a);
         let (x, y) = model.origin(x, y, yaw);
+        let yaw_here = yaw;
         if collect {
             traj.push(Point::new(x, y, 0.0));
         }
@@ -289,7 +290,7 @@ pub(crate) fn rollout(
             + w.vel * ve * ve
             + w.steering * s * s
             + w.accel * a * a;
-        stage += extra(i, x, y);
+        stage += extra(i, x, y, yaw_here);
         cost += stage * model.dt;
     }
     (cost, traj)
@@ -512,7 +513,7 @@ impl MppiFollower {
         goal: &Goal,
         constraints: &RobotConstraints,
         dt: f64,
-        extra: &dyn Fn(usize, f64, f64) -> f64,
+        extra: &dyn Fn(usize, f64, f64, f64) -> f64,
         ref_scale: f64,
         message: &str,
         mode: &str,
@@ -668,7 +669,7 @@ impl Controller for MppiFollower {
             goal,
             constraints,
             dt,
-            &|_, _, _| 0.0,
+            &|_, _, _, _| 0.0,
             1.0,
             "MPPI tracking",
             "mppi_tracking",

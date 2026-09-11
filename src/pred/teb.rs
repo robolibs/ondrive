@@ -15,11 +15,10 @@
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::{finalize, is_ackermann, max_curvature, speed_bounds};
 use crate::core::math::{normalize_angle, yaw_of};
+use crate::core::obstacles::CollisionChecker;
 use crate::core::path::{PathCursor, project, sample};
 use crate::pred::mppi::{current_speed, prepare};
-use crate::types::{
-    Goal, Obstacle, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints,
-};
+use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::{Point, Pose};
 
 #[derive(Clone, Debug)]
@@ -91,51 +90,28 @@ struct Problem<'a> {
     constraints: &'a RobotConstraints,
     waypoints: &'a [Pose],
     cum: &'a [f64],
-    obstacles: &'a [Obstacle],
+    checker: &'a CollisionChecker<'a>,
     target: (Point, f64),
     kappa_max: f64,
     v_lo: f64,
     v_hi: f64,
     v_start: f64,
-    robot_radius: f64,
     ackermann: bool,
 }
 
-/// Smallest clearance between a disc at `(x, y)` and every obstacle mode at
-/// horizon index `step`.
-fn clearance_at(obstacles: &[Obstacle], step: usize, x: f64, y: f64, radius: f64) -> f64 {
-    let mut best = f64::INFINITY;
-    for obs in obstacles {
-        for md in &obs.modes {
-            if md.weight <= 0.0 || md.mean_x.is_empty() || md.mean_y.is_empty() {
-                continue;
-            }
-            let ti = step.min(md.mean_x.len() - 1).min(md.mean_y.len() - 1);
-            let d = (x - md.mean_x[ti]).hypot(y - md.mean_y[ti]) - obs.radius - radius;
-            best = best.min(d);
-        }
-    }
-    best
-}
-
 impl Problem<'_> {
-    fn obstacle_cost(&self, step: usize, x: f64, y: f64) -> f64 {
+    fn obstacle_cost(&self, step: usize, x: f64, y: f64, yaw: f64) -> f64 {
         let c = self.cfg;
-        let mut cost = 0.0;
-        for obs in self.obstacles {
-            for md in &obs.modes {
-                if md.weight <= 0.0 || md.mean_x.is_empty() || md.mean_y.is_empty() {
-                    continue;
-                }
-                let ti = step.min(md.mean_x.len() - 1).min(md.mean_y.len() - 1);
-                let d = (x - md.mean_x[ti]).hypot(y - md.mean_y[ti]) - obs.radius - self.robot_radius;
-                if d < c.obstacle_margin {
-                    let s = c.obstacle_margin - d;
-                    cost += c.weight_obstacle * md.weight * s * s;
-                }
-            }
+        if !self.checker.has_obstacles() {
+            return 0.0;
         }
-        cost
+        let d = self.checker.clearance(step, x, y, yaw);
+        if d < c.obstacle_margin {
+            let s = c.obstacle_margin - d;
+            c.weight_obstacle * s * s
+        } else {
+            0.0
+        }
     }
 
     fn cost(&self, b: &Band) -> f64 {
@@ -180,7 +156,7 @@ impl Problem<'_> {
                 cost += c.weight_kinematic * r * r;
             }
 
-            cost += self.obstacle_cost(i, 0.5 * (b.x[i] + b.x[i + 1]), 0.5 * (b.y[i] + b.y[i + 1]));
+            cost += self.obstacle_cost(i, 0.5 * (b.x[i] + b.x[i + 1]), 0.5 * (b.y[i] + b.y[i + 1]), b.yaw[i]);
         }
         if let Some((_, pdt)) = prev_v {
             let a_goal = last_v / pdt.max(1e-4);
@@ -206,7 +182,7 @@ impl Problem<'_> {
         }
 
         for i in 0..n {
-            cost += self.obstacle_cost(i, b.x[i], b.y[i]);
+            cost += self.obstacle_cost(i, b.x[i], b.y[i], b.yaw[i]);
         }
 
         let (tp, th) = self.target;
@@ -218,22 +194,19 @@ impl Problem<'_> {
     }
 }
 
-fn robot_radius(constraints: &RobotConstraints) -> f64 {
-    let r = 0.5 * constraints.robot_width.hypot(constraints.robot_length);
-    if r < 0.05 { 0.3 } else { r }
-}
-
 /// Move a sampled band pose sideways off any obstacle it would sit on, so
 /// the optimiser sees a lateral gradient instead of a symmetric saddle.
 fn push_off_obstacles(
     p: Point,
     heading: f64,
     step: usize,
-    obstacles: &[Obstacle],
-    radius: f64,
+    checker: &CollisionChecker,
     margin: f64,
 ) -> Point {
-    let c = clearance_at(obstacles, step, p.x, p.y, radius);
+    if !checker.has_obstacles() {
+        return p;
+    }
+    let c = checker.clearance(step, p.x, p.y, heading);
     if c >= margin {
         return p;
     }
@@ -241,8 +214,8 @@ fn push_off_obstacles(
     let shift = margin - c;
     let left = Point::new(p.x - shift * s, p.y + shift * co, 0.0);
     let right = Point::new(p.x + shift * s, p.y - shift * co, 0.0);
-    let cl = clearance_at(obstacles, step, left.x, left.y, radius);
-    let cr = clearance_at(obstacles, step, right.x, right.y, radius);
+    let cl = checker.clearance(step, left.x, left.y, heading);
+    let cr = checker.clearance(step, right.x, right.y, heading);
     if cr > cl { right } else { left }
 }
 
@@ -276,15 +249,9 @@ impl TebFollower {
         (constraints.max_linear_velocity.abs() * self.teb_config.dt_nominal).max(0.05)
     }
 
-    fn sample_band_pose(
-        &self,
-        s: f64,
-        step: usize,
-        obstacles: &[Obstacle],
-        radius: f64,
-    ) -> (Point, f64) {
+    fn sample_band_pose(&self, s: f64, step: usize, checker: &CollisionChecker) -> (Point, f64) {
         let (p, h) = sample(&self.base.path.waypoints, &self.cursor.cum, s);
-        let p = push_off_obstacles(p, h, step, obstacles, radius, self.teb_config.obstacle_margin);
+        let p = push_off_obstacles(p, h, step, checker, self.teb_config.obstacle_margin);
         (p, h)
     }
 
@@ -293,11 +260,10 @@ impl TebFollower {
         state: &RobotState,
         s0: f64,
         constraints: &RobotConstraints,
-        obstacles: &[Obstacle],
+        checker: &CollisionChecker,
     ) {
         let n = self.teb_config.n_poses.max(3);
         let step = self.nominal_step(constraints);
-        let radius = robot_radius(constraints);
         let mut b = Band {
             x: vec![0.0; n],
             y: vec![0.0; n],
@@ -310,7 +276,7 @@ impl TebFollower {
         b.yaw[0] = state.pose.rotation.to_euler().yaw;
         for i in 1..n {
             let s = s0 + i as f64 * step;
-            let (p, h) = self.sample_band_pose(s, i, obstacles, radius);
+            let (p, h) = self.sample_band_pose(s, i, checker);
             b.x[i] = p.x;
             b.y[i] = p.y;
             b.yaw[i] = h;
@@ -326,12 +292,11 @@ impl TebFollower {
         &mut self,
         state: &RobotState,
         constraints: &RobotConstraints,
-        obstacles: &[Obstacle],
+        checker: &CollisionChecker,
         v_now: f64,
     ) {
         let n = self.band.x.len();
         let step = self.nominal_step(constraints);
-        let radius = robot_radius(constraints);
         let px = state.pose.point.x;
         let py = state.pose.point.y;
         for _ in 0..n {
@@ -348,7 +313,7 @@ impl TebFollower {
             self.band.yaw.remove(1);
             self.band.dt.remove(0);
             self.band.tail_s += step;
-            let (p, h) = self.sample_band_pose(self.band.tail_s, n - 1, obstacles, radius);
+            let (p, h) = self.sample_band_pose(self.band.tail_s, n - 1, checker);
             self.band.x.push(p.x);
             self.band.y.push(p.y);
             self.band.yaw.push(h);
@@ -482,14 +447,13 @@ impl Controller for TebFollower {
                 return cmd;
             }
         };
-        let empty: Vec<Obstacle> = Vec::new();
-        let obstacles = world.map(|w| &w.obstacles).unwrap_or(&empty);
+        let checker = CollisionChecker::new(world, constraints, 0.0);
         let v_now = current_speed(state, self.last_v);
         let n = self.teb_config.n_poses.max(3);
         if !self.band_initialised || self.band.x.len() != n {
-            self.initialise_band(state, prep.proj.arc_length, constraints, obstacles);
+            self.initialise_band(state, prep.proj.arc_length, constraints, &checker);
         } else {
-            self.advance_band(state, constraints, obstacles, v_now);
+            self.advance_band(state, constraints, &checker, v_now);
         }
 
         let (v_lo, v_hi) = speed_bounds(constraints, prep.allow_reverse);
@@ -503,13 +467,12 @@ impl Controller for TebFollower {
             constraints,
             waypoints: &waypoints,
             cum: &cum,
-            obstacles,
+            checker: &checker,
             target,
             kappa_max: max_curvature(constraints),
             v_lo,
             v_hi,
             v_start: v_now,
-            robot_radius: robot_radius(constraints),
             ackermann: is_ackermann(constraints.steering_type),
         };
         self.optimise(&problem);

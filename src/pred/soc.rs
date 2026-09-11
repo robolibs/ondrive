@@ -10,6 +10,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::controller::{Controller, ControllerBase};
+use crate::core::obstacles::CollisionChecker;
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
     CostWeights, Model, Reference, build_reference, build_timed_reference, command_from_controls,
@@ -17,8 +18,7 @@ use crate::pred::mppi::{
     update_turn_in_place,
 };
 use crate::types::{
-    Goal, Obstacle, Path, RobotConstraints, RobotState, Trajectory, VelocityCommand,
-    WorldConstraints,
+    Goal, Path, RobotConstraints, RobotState, Trajectory, VelocityCommand, WorldConstraints,
 };
 use datapod::Point;
 use rand::{SeedableRng, rngs::StdRng};
@@ -127,7 +127,7 @@ fn cost_gradient(
     model: &Model,
     reference: &Reference,
     w: &CostWeights,
-    extra: &dyn Fn(usize, f64, f64) -> f64,
+    extra: &dyn Fn(usize, f64, f64, f64) -> f64,
     steer: &mut [f64],
     accel: &mut [f64],
 ) -> Vec<f64> {
@@ -201,7 +201,7 @@ impl SocFollower {
         model: &Model,
         reference: &Reference,
         w: &CostWeights,
-        extra: &dyn Fn(usize, f64, f64) -> f64,
+        extra: &dyn Fn(usize, f64, f64, f64) -> f64,
         guides_s: &mut [Vec<f64>],
         guides_a: &mut [Vec<f64>],
     ) {
@@ -277,33 +277,23 @@ impl SocFollower {
     }
 }
 
-fn obstacle_penalty(
-    obstacles: &[Obstacle],
-    robot_radius: f64,
+fn obstacle_penalty<'a>(
+    checker: &'a CollisionChecker<'a>,
     weight: f64,
-) -> impl Fn(usize, f64, f64) -> f64 + '_ {
-    move |step: usize, x: f64, y: f64| -> f64 {
-        let t = step + 1;
-        let mut cost = 0.0;
-        for obs in obstacles {
-            for md in &obs.modes {
-                if md.weight <= 0.0 || md.mean_x.is_empty() || md.mean_y.is_empty() {
-                    continue;
-                }
-                let ti = t.min(md.mean_x.len() - 1).min(md.mean_y.len() - 1);
-                let clearance = (x - md.mean_x[ti]).hypot(y - md.mean_y[ti])
-                    - obs.radius
-                    - robot_radius
-                    - OBSTACLE_SAFETY_MARGIN;
-                if clearance < 0.0 {
-                    cost += weight * md.weight * (100.0 + 10.0 * clearance.abs());
-                } else if clearance < OBSTACLE_INFLUENCE {
-                    let r = (OBSTACLE_INFLUENCE - clearance) / OBSTACLE_INFLUENCE;
-                    cost += weight * md.weight * r * r;
-                }
-            }
+) -> impl Fn(usize, f64, f64, f64) -> f64 + 'a {
+    move |step: usize, x: f64, y: f64, yaw: f64| -> f64 {
+        if !checker.has_obstacles() {
+            return 0.0;
         }
-        cost
+        let clearance = checker.clearance(step + 1, x, y, yaw);
+        if clearance < 0.0 {
+            weight * (100.0 + 10.0 * clearance.abs())
+        } else if clearance < OBSTACLE_INFLUENCE {
+            let r = (OBSTACLE_INFLUENCE - clearance) / OBSTACLE_INFLUENCE;
+            weight * r * r
+        } else {
+            0.0
+        }
     }
 }
 
@@ -360,13 +350,8 @@ impl Controller for SocFollower {
             steering: cfg.weight_steering,
             accel: cfg.weight_acceleration,
         };
-        let robot_r = {
-            let r = 0.5 * constraints.robot_width.hypot(constraints.robot_length);
-            if r < 0.05 { 0.3 } else { r }
-        };
-        let empty: Vec<Obstacle> = Vec::new();
-        let obstacles = world.map(|w| &w.obstacles).unwrap_or(&empty);
-        let extra = obstacle_penalty(obstacles, robot_r, cfg.weight_obstacle);
+        let checker = CollisionChecker::new(world, constraints, OBSTACLE_SAFETY_MARGIN);
+        let extra = obstacle_penalty(&checker, cfg.weight_obstacle);
         model.clamp_controls(&mut self.mean_steering, &mut self.mean_acceleration);
 
         let k_guide = cfg.guide_samples.max(1);

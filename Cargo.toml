@@ -40,5 +40,10 @@ serde_json = "1.0"
 thiserror = "2.0"
 
 [dev-dependencies]
+criterion = { version = "0.5", default-features = false }
 rerun = { version = "0.31.2", default-features = false, features = ["sdk", "server"] }
 approx = "0.5"
+
+[[bench]]
+name = "tick"
+harness = false

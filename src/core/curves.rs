@@ -400,6 +400,12 @@ fn shortest(words: Vec<Word>) -> Option<Word> {
         .min_by(|a, b| a.length().partial_cmp(&b.length()).unwrap_or(std::cmp::Ordering::Equal))
 }
 
+fn sorted(mut words: Vec<Word>) -> Vec<Word> {
+    words.retain(|w| w.lengths.iter().all(|l| l.is_finite()));
+    words.sort_by(|a, b| a.length().partial_cmp(&b.length()).unwrap_or(std::cmp::Ordering::Equal));
+    words
+}
+
 /// Shortest forward-only curve (Dubins) from `start` to `goal`.
 pub fn dubins(start: &Pose, goal: &Pose, radius: f64, spacing: f64) -> Option<CurvePath> {
     let radius = radius.max(1e-3);
@@ -414,6 +420,20 @@ pub fn reeds_shepp(start: &Pose, goal: &Pose, radius: f64, spacing: f64) -> Opti
     let (x, y, phi) = relative(start, goal, radius);
     let word = shortest(reeds_shepp_words(x, y, phi))?;
     Some(sample_word(&word, start, radius, spacing))
+}
+
+/// Every Dubins curve from `start` to `goal`, shortest first.
+pub fn dubins_all(start: &Pose, goal: &Pose, radius: f64, spacing: f64) -> Vec<CurvePath> {
+    let radius = radius.max(1e-3);
+    let (x, y, phi) = relative(start, goal, radius);
+    sorted(dubins_words(x, y, phi)).iter().map(|w| sample_word(w, start, radius, spacing)).collect()
+}
+
+/// Every Reeds-Shepp curve from `start` to `goal`, shortest first.
+pub fn reeds_shepp_all(start: &Pose, goal: &Pose, radius: f64, spacing: f64) -> Vec<CurvePath> {
+    let radius = radius.max(1e-3);
+    let (x, y, phi) = relative(start, goal, radius);
+    sorted(reeds_shepp_words(x, y, phi)).iter().map(|w| sample_word(w, start, radius, spacing)).collect()
 }
 
 #[cfg(test)]

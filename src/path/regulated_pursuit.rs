@@ -10,7 +10,7 @@ use crate::core::kinematics::{
     reverse_allowed,
 };
 use crate::core::math::{heading_error, normalize_angle};
-use crate::core::obstacles::{robot_radius, world_clearance};
+use crate::core::obstacles::CollisionChecker;
 use crate::core::path::{PathCursor, sample, speed_cap};
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
@@ -83,18 +83,14 @@ impl RegulatedPursuitFollower {
     /// True when the arc of curvature `kappa` from `rear` collides within
     /// `length` metres.
     fn arc_collides(
-        world: Option<&WorldConstraints>,
+        checker: &CollisionChecker,
         rear: Point,
         yaw: f64,
         kappa: f64,
         direction: f64,
         length: f64,
-        radius: f64,
     ) -> bool {
-        let Some(w) = world else {
-            return false;
-        };
-        if w.obstacles.is_empty() {
+        if !checker.has_obstacles() {
             return false;
         }
         let step = 0.05;
@@ -104,7 +100,7 @@ impl RegulatedPursuitFollower {
             x += direction * step * th.cos();
             y += direction * step * th.sin();
             th = normalize_angle(th + direction * step * kappa);
-            if world_clearance(Some(w), i / 2, x, y, radius) < 0.0 {
+            if checker.collides(i / 2, x, y, th) {
                 return true;
             }
         }
@@ -211,13 +207,13 @@ impl Controller for RegulatedPursuitFollower {
         let mut v = path_speed(nominal, 0.0, self.base.status.distance_to_goal, pos_tol, cfg.kp_linear, constraints)
             * heading_speed_scale(alpha_eff, constraints);
 
-        let radius = robot_radius(constraints);
+        let checker = CollisionChecker::new(world, constraints, 0.0);
         let mut scale: f64 = 1.0;
         if kappa.abs() > 1e-9 && rpp.regulated_min_radius > 0.0 {
             scale = scale.min((1.0 / kappa.abs()) / rpp.regulated_min_radius);
         }
         if rpp.proximity_distance > 0.0 {
-            let c = world_clearance(world, 0, state.pose.point.x, state.pose.point.y, radius);
+            let c = checker.clearance(0, state.pose.point.x, state.pose.point.y, yaw);
             if c < rpp.proximity_distance {
                 scale = scale.min(c.max(0.0) / rpp.proximity_distance);
             }
@@ -229,7 +225,7 @@ impl Controller for RegulatedPursuitFollower {
         if rpp.use_collision_check {
             let stopping = v * v / (2.0 * constraints.max_linear_acceleration.abs().max(1e-6));
             let check_len = (stopping + lookahead).max(0.3);
-            if Self::arc_collides(world, rear, yaw, kappa_cmd, direction, check_len, radius) {
+            if Self::arc_collides(&checker, rear, yaw, kappa_cmd, direction, check_len) {
                 self.base.status.mode = "rpp_blocked".into();
                 return VelocityCommand::invalid("collision ahead on the commanded arc");
             }

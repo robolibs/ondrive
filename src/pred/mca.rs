@@ -9,6 +9,7 @@
 //! Without obstacles this is exactly MPPI.
 
 use crate::controller::{Controller, ControllerBase};
+use crate::core::obstacles::CollisionChecker;
 use crate::pred::mppi::{MppiConfig, MppiFollower};
 use crate::types::{
     ControllerConfig, ControllerStatus, Goal, Obstacle, Path, RobotConstraints, RobotState,
@@ -226,13 +227,14 @@ impl Controller for McaFollower {
                     .collect()
             })
             .unwrap_or_default();
-        if obstacles.is_empty() {
+        let has_grid = world.is_some_and(|w| w.grid.is_some());
+        if obstacles.is_empty() && !has_grid {
             return self.mppi.step_with(
                 state,
                 goal,
                 constraints,
                 dt,
-                &|_, _, _| 0.0,
+                &|_, _, _, _| 0.0,
                 1.0,
                 "MCA tracking",
                 "mca_tracking",
@@ -265,8 +267,13 @@ impl Controller for McaFollower {
             }
             1.0 - survive
         };
-        let extra = |step: usize, x: f64, y: f64| -> f64 {
-            let p = collision_probability(step, x, y);
+        let checker = CollisionChecker::new(world, constraints, self.mca_config.robot_radius_margin);
+        let has_grid = world.is_some_and(|w| w.grid.is_some());
+        let extra = |step: usize, x: f64, y: f64, yaw: f64| -> f64 {
+            let mut p = collision_probability(step, x, y);
+            if has_grid && checker.clearance(step + 1, x, y, yaw) < 0.0 {
+                p = 1.0;
+            }
             soft * p + if p > threshold { hard } else { 0.0 }
         };
 

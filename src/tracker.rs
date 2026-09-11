@@ -1,12 +1,15 @@
 use crate::controller::{Controller, check_goal};
 use crate::core::kinematics::stop;
+use crate::core::obstacles::CollisionChecker;
 use crate::core::path::{PathCursor, end_heading, segment_heading};
 use crate::fuzzy::FlcFollower;
 use crate::path::{
-    KanayamaFollower, LqrFollower, PurePursuitFollower, RegulatedPursuitFollower,
+    IlcFollower, KanayamaFollower, LqrFollower, PurePursuitFollower, RegulatedPursuitFollower,
     StanleyFollower, VectorPursuitFollower,
 };
-use crate::point::{CarrotFollower, PidFollower, PoseReachFollower, PoseRegulatorFollower};
+use crate::point::{
+    ApfFollower, CarrotFollower, PidFollower, PoseReachFollower, PoseRegulatorFollower,
+};
 use crate::pred::{
     DwaFollower, IlqrFollower, McaFollower, MpcFollower, MppiFollower, SocFollower, TebFollower,
 };
@@ -36,13 +39,15 @@ pub enum TrackerKind {
     PoseRegulator,
     VectorPursuit,
     Kanayama,
+    Apf,
+    Ilc,
 }
 
 impl TrackerKind {
     /// Point-to-point controllers are driven through a path waypoint by
     /// waypoint by the tracker; path followers consume the whole path.
     pub fn is_point_controller(self) -> bool {
-        matches!(self, TrackerKind::Pid | TrackerKind::Carrot | TrackerKind::Dwa | TrackerKind::PoseReach | TrackerKind::PoseRegulator)
+        matches!(self, TrackerKind::Pid | TrackerKind::Carrot | TrackerKind::Dwa | TrackerKind::PoseReach | TrackerKind::PoseRegulator | TrackerKind::Apf)
     }
 }
 
@@ -269,10 +274,9 @@ impl Tracker {
                 .unwrap_or(n - 1)
                 .max(proj.segment + 1)
                 .min(n - 1);
-            if let Some(w) = world {
-                let robot_r = 0.5 * self.constraints.robot_width.hypot(self.constraints.robot_length);
-                let robot_r = if robot_r < 0.05 { 0.3 } else { robot_r };
-                while idx + 1 < n && blocked(&path.waypoints[idx].point, w, robot_r) {
+            if world.is_some() {
+                let checker = CollisionChecker::new(world, &self.constraints, WAYPOINT_MARGIN);
+                while idx + 1 < n && blocked(&path.waypoints, idx, &checker) {
                     idx += 1;
                 }
             }
@@ -486,19 +490,17 @@ fn make_controller(kind: TrackerKind) -> Box<dyn Controller> {
         TrackerKind::PoseRegulator => Box::new(PoseRegulatorFollower::new()),
         TrackerKind::VectorPursuit => Box::new(VectorPursuitFollower::new()),
         TrackerKind::Kanayama => Box::new(KanayamaFollower::new()),
+        TrackerKind::Apf => Box::new(ApfFollower::new()),
+        TrackerKind::Ilc => Box::new(IlcFollower::default()),
     }
 }
 
-/// True when `p` lies inside any obstacle's current footprint inflated by
-/// the robot radius and a safety margin.
-fn blocked(p: &Point, world: &WorldConstraints, robot_radius: f64) -> bool {
-    const MARGIN: f64 = 0.3;
-    world.obstacles.iter().any(|o| {
-        o.modes.iter().any(|m| {
-            m.weight > 0.0
-                && !m.mean_x.is_empty()
-                && !m.mean_y.is_empty()
-                && (p.x - m.mean_x[0]).hypot(p.y - m.mean_y[0]) < o.radius + robot_radius + MARGIN
-        })
-    })
+/// Safety margin around obstacles when choosing a waypoint target.
+const WAYPOINT_MARGIN: f64 = 0.3;
+
+/// True when the robot footprint placed at waypoint `idx` collides now.
+fn blocked(waypoints: &[Pose], idx: usize, checker: &CollisionChecker) -> bool {
+    let p = waypoints[idx].point;
+    let heading = segment_heading(waypoints, idx.min(waypoints.len().saturating_sub(2)));
+    checker.collides(0, p.x, p.y, heading)
 }

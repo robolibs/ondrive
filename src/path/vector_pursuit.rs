@@ -9,12 +9,14 @@ use crate::core::kinematics::{
     can_turn_in_place, finalize, heading_speed_scale, is_ackermann, path_speed, reverse_allowed,
 };
 use crate::core::math::{heading_error, normalize_angle};
-use crate::core::path::{PathCursor, cusp_after, sample, speed_cap};
+use crate::core::path::{PathCursor, curvature_at_projection, cusp_after, sample, speed_cap};
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
 use std::f64::consts::PI;
 
-const LOOKAHEAD_VELOCITY_GAIN: f64 = 0.3;
+/// Lookahead shrink per unit of path curvature (metres of lookahead per
+/// unit curvature), keeping tight bends from being cut.
+const CURVATURE_LOOKAHEAD_GAIN: f64 = 0.5;
 
 #[derive(Clone, Debug)]
 pub struct VectorPursuitConfig {
@@ -100,8 +102,11 @@ impl Controller for VectorPursuitFollower {
             return cmd;
         }
 
-        let lookahead = (cfg.lookahead_distance + LOOKAHEAD_VELOCITY_GAIN * state.velocity.linear.abs())
-            .clamp(cfg.lookahead_distance.max(1e-3), 3.0 * cfg.lookahead_distance.max(1e-3));
+        let base_lookahead = cfg.lookahead_distance.max(1e-3);
+        let kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &proj).abs();
+        let lookahead = ((base_lookahead + cfg.lookahead_time.max(0.0) * state.velocity.linear.abs())
+            / (1.0 + CURVATURE_LOOKAHEAD_GAIN * kappa_path * base_lookahead))
+            .clamp(0.5 * base_lookahead, 3.0 * base_lookahead);
         let mut s_target = proj.arc_length + lookahead;
         let mut stop_distance = self.base.status.distance_to_goal;
         if let Some(cusp) = cusp_after(&self.base.path.speeds, &self.cursor.cum, proj.arc_length) {

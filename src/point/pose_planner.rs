@@ -6,8 +6,11 @@
 //! curve or the goal changes.
 
 use crate::controller::{Controller, ControllerBase, check_goal};
-use crate::core::curves::{CurvePath, dubins, reeds_shepp};
-use crate::core::kinematics::{finalize, is_ackermann, max_curvature, reverse_allowed, stop};
+use crate::core::curves::{CurvePath, dubins_all, reeds_shepp_all};
+use crate::core::obstacles::CollisionChecker;
+use crate::core::kinematics::{
+    can_turn_in_place, finalize, is_ackermann, max_curvature, reverse_allowed, stop,
+};
 use crate::core::math::{normalize_angle, yaw_of};
 use crate::path::PurePursuitFollower;
 use crate::types::{
@@ -212,13 +215,28 @@ impl PoseReachFollower {
         self.follower.set_path(path);
     }
 
-    fn replan(&mut self, state: &RobotState, goal: &Goal, constraints: &RobotConstraints, reverse: bool) -> bool {
+    fn replan(
+        &mut self,
+        state: &RobotState,
+        goal: &Goal,
+        constraints: &RobotConstraints,
+        reverse: bool,
+        world: Option<&WorldConstraints>,
+    ) -> bool {
         let radius = self.radius(constraints);
         let spacing = self.pose_config.sample_spacing.max(0.02);
-        let curve = if reverse {
-            reeds_shepp(&state.pose, &goal.target_pose, radius, spacing)
+        let candidates = if reverse {
+            reeds_shepp_all(&state.pose, &goal.target_pose, radius, spacing)
         } else {
-            dubins(&state.pose, &goal.target_pose, radius, spacing)
+            dubins_all(&state.pose, &goal.target_pose, radius, spacing)
+        };
+        let checker = CollisionChecker::new(world, constraints, 0.0);
+        let curve = if checker.has_obstacles() {
+            candidates.into_iter().find(|c| {
+                c.poses.iter().all(|p| !checker.collides(0, p.point.x, p.point.y, yaw_of(p)))
+            })
+        } else {
+            candidates.into_iter().next()
         };
         let Some(curve) = curve else {
             return false;
@@ -286,7 +304,7 @@ impl Controller for PoseReachFollower {
             || (self.since_replan >= REPLAN_MIN_INTERVAL
                 && (lateral > self.pose_config.replan_lateral || heading > self.pose_config.replan_heading));
         if needs {
-            if !self.replan(state, goal, constraints, reverse) {
+            if !self.replan(state, goal, constraints, reverse, world) {
                 return VelocityCommand::invalid("no feasible curve to the goal pose");
             }
             self.planned_for = Some(key);
@@ -325,6 +343,11 @@ impl Controller for PoseReachFollower {
         if passed_goal {
             let aligned = !check.orientation_required || check.orientation_ok;
             let close = check.distance < 1.5 * check.position_tolerance;
+            if close && !aligned && can_turn_in_place(constraints.steering_type) {
+                self.base.status.mode = "pose_reach/aligning".into();
+                let omega = self.base.config.kp_angular.max(0.1) * check.yaw_error;
+                return finalize(0.0, omega, constraints, &self.base.config, reverse, "Aligning to goal orientation");
+            }
             if (aligned && close) || self.refinements >= MAX_REFINEMENTS {
                 self.base.status.goal_reached = true;
                 self.base.status.mode = "stopped".into();

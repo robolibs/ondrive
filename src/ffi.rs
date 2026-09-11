@@ -72,6 +72,8 @@ pub const ONDRIVE_KIND_ILQR: u32 = 14;
 pub const ONDRIVE_KIND_POSE_REGULATOR: u32 = 15;
 pub const ONDRIVE_KIND_VECTOR_PURSUIT: u32 = 16;
 pub const ONDRIVE_KIND_KANAYAMA: u32 = 17;
+pub const ONDRIVE_KIND_APF: u32 = 18;
+pub const ONDRIVE_KIND_ILC: u32 = 19;
 
 pub const ONDRIVE_STEERING_DIFFERENTIAL: u32 = 0;
 pub const ONDRIVE_STEERING_ACKERMANN: u32 = 1;
@@ -101,6 +103,8 @@ fn kind_from_u32(v: u32) -> Option<TrackerKind> {
         ONDRIVE_KIND_POSE_REGULATOR => TrackerKind::PoseRegulator,
         ONDRIVE_KIND_VECTOR_PURSUIT => TrackerKind::VectorPursuit,
         ONDRIVE_KIND_KANAYAMA => TrackerKind::Kanayama,
+        ONDRIVE_KIND_APF => TrackerKind::Apf,
+        ONDRIVE_KIND_ILC => TrackerKind::Ilc,
         _ => return None,
     })
 }
@@ -230,6 +234,7 @@ pub struct OndriveControllerConfig {
     pub ki_angular: f64,
     pub kd_angular: f64,
     pub lookahead_distance: f64,
+    pub lookahead_time: f64,
     pub k_cross_track: f64,
     pub k_heading: f64,
     pub allow_reverse: bool,
@@ -349,6 +354,7 @@ fn constraints_to_rs(c: OndriveRobotConstraints) -> Option<RobotConstraints> {
     let steering = steering_from_u32(c.steering_type)?;
     Some(RobotConstraints {
         steering_type: steering,
+        footprint: ondrive_footprint_placeholder(),
         wheelbase: c.wheelbase,
         track_width: c.track_width,
         wheel_radius: c.wheel_radius,
@@ -365,6 +371,10 @@ fn constraints_to_rs(c: OndriveRobotConstraints) -> Option<RobotConstraints> {
         robot_width: c.robot_width,
         robot_length: c.robot_length,
     })
+}
+
+fn ondrive_footprint_placeholder() -> crate::types::Footprint {
+    crate::types::Footprint::default()
 }
 
 fn constraints_to_ffi(c: &RobotConstraints) -> OndriveRobotConstraints {
@@ -399,6 +409,7 @@ fn config_to_rs(c: OndriveControllerConfig) -> Option<ControllerConfig> {
         ki_angular: c.ki_angular,
         kd_angular: c.kd_angular,
         lookahead_distance: c.lookahead_distance,
+        lookahead_time: c.lookahead_time,
         k_cross_track: c.k_cross_track,
         k_heading: c.k_heading,
         allow_reverse: c.allow_reverse,
@@ -417,6 +428,7 @@ fn config_to_ffi(c: &ControllerConfig) -> OndriveControllerConfig {
         ki_angular: c.ki_angular,
         kd_angular: c.kd_angular,
         lookahead_distance: c.lookahead_distance,
+        lookahead_time: c.lookahead_time,
         k_cross_track: c.k_cross_track,
         k_heading: c.k_heading,
         allow_reverse: c.allow_reverse,
@@ -969,6 +981,8 @@ pub extern "C" fn ondrive_tracker_kind(h: *const OndriveTracker) -> u32 {
         TrackerKind::PoseRegulator => ONDRIVE_KIND_POSE_REGULATOR,
         TrackerKind::VectorPursuit => ONDRIVE_KIND_VECTOR_PURSUIT,
         TrackerKind::Kanayama => ONDRIVE_KIND_KANAYAMA,
+        TrackerKind::Apf => ONDRIVE_KIND_APF,
+        TrackerKind::Ilc => ONDRIVE_KIND_ILC,
     }
 }
 
@@ -1000,4 +1014,81 @@ pub extern "C" fn ondrive_version() -> *const c_char {
 // macro expansion in the future (retain for forwards compatibility).
 fn _keep_cstr_used(_p: *const c_char) {
     let _ = unsafe { CStr::from_ptr(_p) };
+}
+
+/// Install a timed trajectory: the path's waypoints and speeds with one
+/// time (seconds from start) per waypoint. `times` must have
+/// `ondrive_path_len(path)` entries.
+#[unsafe(no_mangle)]
+pub extern "C" fn ondrive_tracker_set_trajectory(
+    h: *mut OndriveTracker,
+    path: *const OndrivePath,
+    times: *const f64,
+) -> bool {
+    if h.is_null() || path.is_null() || times.is_null() {
+        set_last_error("null pointer");
+        return false;
+    }
+    let p = unsafe { &(*path).path };
+    let n = p.waypoints.len();
+    let times = unsafe { std::slice::from_raw_parts(times, n) };
+    let mut speeds = p.speeds.clone();
+    speeds.resize(n, 0.0);
+    let traj = crate::types::Trajectory {
+        poses: p.waypoints.clone(),
+        times: times.to_vec(),
+        speeds,
+    };
+    unsafe { (*h).tracker.set_trajectory(traj) };
+    true
+}
+
+/// Seconds elapsed on the installed trajectory.
+#[unsafe(no_mangle)]
+pub extern "C" fn ondrive_tracker_trajectory_time(h: *const OndriveTracker) -> f64 {
+    if h.is_null() {
+        set_last_error("null tracker handle");
+        return 0.0;
+    }
+    unsafe { (*h).tracker.trajectory_time() }
+}
+
+/// Install an occupancy grid (row-major, `width * height` cells, non-zero =
+/// occupied) whose cell `(0, 0)` starts at `(origin_x, origin_y)`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ondrive_world_set_grid(
+    h: *mut OndriveWorld,
+    origin_x: f64,
+    origin_y: f64,
+    resolution: f64,
+    width: usize,
+    height: usize,
+    occupied: *const u8,
+) -> bool {
+    if h.is_null() || (occupied.is_null() && width * height > 0) {
+        set_last_error("null pointer");
+        return false;
+    }
+    if resolution <= 0.0 || !resolution.is_finite() {
+        set_last_error("grid resolution must be positive");
+        return false;
+    }
+    let cells = unsafe { std::slice::from_raw_parts(occupied, width * height) };
+    let occ: Vec<bool> = cells.iter().map(|c| *c != 0).collect();
+    unsafe {
+        (*h).world.grid = Some(crate::types::OccupancyGrid::new(
+            origin_x, origin_y, resolution, width, height, occ,
+        ));
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ondrive_world_clear_grid(h: *mut OndriveWorld) -> bool {
+    if h.is_null() {
+        set_last_error("null world handle");
+        return false;
+    }
+    unsafe { (*h).world.grid = None };
+    true
 }
