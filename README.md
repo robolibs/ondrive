@@ -265,7 +265,7 @@ Tests:
 - **FFI** (`tests/ffi_smoke.rs`): null-pointer rejection, unknown kinds,
   full lifecycle, obstacle round-tripping, create/free stress.
 
-See [`PLAN.md`](PLAN.md) for the original C++ → Rust translation notes.
+See [`PLAN.md`](PLAN.md) for the controller roadmap.
 
 ## Status
 
