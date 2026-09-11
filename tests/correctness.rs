@@ -11,6 +11,7 @@ use ondrive::{
     McaConfig, McaFollower, MpcConfig, MpcFollower, MppiConfig, MppiFollower, OutputUnits, Path,
     PidFollower, PurePursuitFollower, RobotConstraints, RobotState, SocConfig, SocFollower,
     StanleyFollower, SteeringType, TebConfig, TebFollower, Tracker, TrackerKind, CarrotFollower,
+    IlqrConfig, IlqrFollower, PoseReachFollower, RegulatedPursuitFollower,
 };
 use std::f64::consts::{FRAC_PI_2, PI};
 
@@ -71,7 +72,9 @@ fn config(units: OutputUnits) -> ControllerConfig {
     cfg
 }
 
-const PATH_KINDS: [TrackerKind; 10] = [
+const PATH_KINDS: [TrackerKind; 12] = [
+    TrackerKind::RegulatedPursuit,
+    TrackerKind::Ilqr,
     TrackerKind::PurePursuit,
     TrackerKind::Stanley,
     TrackerKind::Lqr,
@@ -84,7 +87,10 @@ const PATH_KINDS: [TrackerKind; 10] = [
     TrackerKind::Dwa,
 ];
 
-const ALL_KINDS: [TrackerKind; 12] = [
+const ALL_KINDS: [TrackerKind; 15] = [
+    TrackerKind::RegulatedPursuit,
+    TrackerKind::Ilqr,
+    TrackerKind::PoseReach,
     TrackerKind::Pid,
     TrackerKind::Carrot,
     TrackerKind::PurePursuit,
@@ -108,6 +114,13 @@ fn make(kind: TrackerKind) -> Box<dyn Controller> {
         TrackerKind::Stanley => Box::new(StanleyFollower::new()),
         TrackerKind::Lqr => Box::new(LqrFollower::new()),
         TrackerKind::Flc => Box::new(FlcFollower::new()),
+        TrackerKind::RegulatedPursuit => Box::new(RegulatedPursuitFollower::new()),
+        TrackerKind::PoseReach => Box::new(PoseReachFollower::new()),
+        TrackerKind::Ilqr => {
+            let mut c = IlqrConfig::default();
+            c.horizon_steps = 12;
+            Box::new(IlqrFollower::with_ilqr_config(c))
+        }
         TrackerKind::Mpc => {
             let mut c = MpcConfig::default();
             c.horizon_steps = 8;
@@ -386,6 +399,8 @@ fn geometric_followers_steer_toward_the_path() {
             TrackerKind::Lqr,
             TrackerKind::Flc,
             TrackerKind::Mpc,
+            TrackerKind::Ilqr,
+            TrackerKind::RegulatedPursuit,
         ] {
             let left = first_yaw_rate(kind, steering, pose(2.0, 0.6, 0.0));
             let right = first_yaw_rate(kind, steering, pose(2.0, -0.6, 0.0));

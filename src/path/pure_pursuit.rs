@@ -7,7 +7,7 @@ use crate::core::kinematics::{
     can_turn_in_place, finalize, heading_speed_scale, is_ackermann, path_speed, reverse_allowed,
 };
 use crate::core::math::{heading_error, normalize_angle};
-use crate::core::path::{cumulative_lengths, project, sample, speed_cap};
+use crate::core::path::{cumulative_lengths, cusp_after, project, sample, speed_cap};
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
 use std::f64::consts::PI;
@@ -131,11 +131,13 @@ impl Controller for PurePursuitFollower {
         let lookahead = (cfg.lookahead_distance
             + LOOKAHEAD_VELOCITY_GAIN * state.velocity.linear.abs())
         .clamp(cfg.lookahead_distance.max(1e-3), 3.0 * cfg.lookahead_distance.max(1e-3));
-        let (target, _) = sample(
-            &self.base.path.waypoints,
-            &self.cum,
-            proj.arc_length + lookahead,
-        );
+        let mut s_target = proj.arc_length + lookahead;
+        let mut stop_distance = self.base.status.distance_to_goal;
+        if let Some(cusp) = cusp_after(&self.base.path.speeds, &self.cum, proj.arc_length) {
+            s_target = s_target.min(cusp);
+            stop_distance = stop_distance.min((cusp - proj.arc_length).max(0.0));
+        }
+        let (target, _) = sample(&self.base.path.waypoints, &self.cum, s_target);
         self.lookahead_point = Some(target);
 
         let dx = target.x - rear.x;
@@ -174,14 +176,7 @@ impl Controller for PurePursuitFollower {
             });
         let scale = heading_speed_scale(alpha_eff, constraints);
         let v = direction
-            * path_speed(
-                nominal,
-                kappa,
-                self.base.status.distance_to_goal,
-                pos_tol,
-                cfg.kp_linear,
-                constraints,
-            )
+            * path_speed(nominal, kappa, stop_distance, pos_tol, cfg.kp_linear, constraints)
             * scale;
 
         let mut omega = v * kappa;

@@ -227,7 +227,34 @@ pub fn speed_cap(speeds: &[f64], proj: &PathProjection) -> Option<f64> {
     } else {
         proj.segment + 1
     };
-    speeds.get(i).copied().filter(|v| *v > 0.0)
+    speeds.get(i).copied().filter(|v| v.abs() > 0.0).map(f64::abs)
+}
+
+/// Driving direction (+1 / -1) requested by the path at the projection,
+/// from the sign of `Path::speeds`; `None` without speeds.
+pub fn direction_at(speeds: &[f64], proj: &PathProjection) -> Option<i8> {
+    if speeds.is_empty() {
+        return None;
+    }
+    let i = if proj.t < 0.5 { proj.segment } else { proj.segment + 1 };
+    speeds.get(i).map(|v| if *v < 0.0 { -1 } else { 1 })
+}
+
+/// Arc length of the first waypoint after `s` where the sign of
+/// `Path::speeds` flips (a cusp), if any.
+pub fn cusp_after(speeds: &[f64], cum: &[f64], s: f64) -> Option<f64> {
+    if speeds.len() != cum.len() || speeds.len() < 2 {
+        return None;
+    }
+    let start = cum.iter().position(|c| *c > s + 1e-9).unwrap_or(cum.len());
+    let mut i = start.saturating_sub(1);
+    while i + 1 < speeds.len() {
+        if (speeds[i] < 0.0) != (speeds[i + 1] < 0.0) {
+            return Some(cum[i + 1]);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Per-controller projection state: cumulative lengths plus a flag that

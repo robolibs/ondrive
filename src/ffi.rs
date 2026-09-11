@@ -66,6 +66,9 @@ pub const ONDRIVE_KIND_SOC: u32 = 8;
 pub const ONDRIVE_KIND_DWA: u32 = 9;
 pub const ONDRIVE_KIND_TEB: u32 = 10;
 pub const ONDRIVE_KIND_FLC: u32 = 11;
+pub const ONDRIVE_KIND_REGULATED_PURSUIT: u32 = 12;
+pub const ONDRIVE_KIND_POSE_REACH: u32 = 13;
+pub const ONDRIVE_KIND_ILQR: u32 = 14;
 
 pub const ONDRIVE_STEERING_DIFFERENTIAL: u32 = 0;
 pub const ONDRIVE_STEERING_ACKERMANN: u32 = 1;
@@ -89,6 +92,9 @@ fn kind_from_u32(v: u32) -> Option<TrackerKind> {
         ONDRIVE_KIND_DWA => TrackerKind::Dwa,
         ONDRIVE_KIND_TEB => TrackerKind::Teb,
         ONDRIVE_KIND_FLC => TrackerKind::Flc,
+        ONDRIVE_KIND_REGULATED_PURSUIT => TrackerKind::RegulatedPursuit,
+        ONDRIVE_KIND_POSE_REACH => TrackerKind::PoseReach,
+        ONDRIVE_KIND_ILQR => TrackerKind::Ilqr,
         _ => return None,
     })
 }
@@ -951,6 +957,9 @@ pub extern "C" fn ondrive_tracker_kind(h: *const OndriveTracker) -> u32 {
         TrackerKind::Dwa => ONDRIVE_KIND_DWA,
         TrackerKind::Teb => ONDRIVE_KIND_TEB,
         TrackerKind::Flc => ONDRIVE_KIND_FLC,
+        TrackerKind::RegulatedPursuit => ONDRIVE_KIND_REGULATED_PURSUIT,
+        TrackerKind::PoseReach => ONDRIVE_KIND_POSE_REACH,
+        TrackerKind::Ilqr => ONDRIVE_KIND_ILQR,
     }
 }
 

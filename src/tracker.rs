@@ -2,9 +2,11 @@ use crate::controller::{Controller, check_goal};
 use crate::core::kinematics::stop;
 use crate::core::path::{PathCursor, end_heading, segment_heading};
 use crate::fuzzy::FlcFollower;
-use crate::path::{LqrFollower, PurePursuitFollower, StanleyFollower};
-use crate::point::{CarrotFollower, PidFollower};
-use crate::pred::{DwaFollower, McaFollower, MpcFollower, MppiFollower, SocFollower, TebFollower};
+use crate::path::{LqrFollower, PurePursuitFollower, RegulatedPursuitFollower, StanleyFollower};
+use crate::point::{CarrotFollower, PidFollower, PoseReachFollower};
+use crate::pred::{
+    DwaFollower, IlqrFollower, McaFollower, MpcFollower, MppiFollower, SocFollower, TebFollower,
+};
 use crate::types::{
     ControllerConfig, ControllerStatus, Goal, Path, RobotConstraints, RobotState, VelocityCommand,
     WorldConstraints,
@@ -25,13 +27,16 @@ pub enum TrackerKind {
     Dwa,
     Teb,
     Flc,
+    RegulatedPursuit,
+    PoseReach,
+    Ilqr,
 }
 
 impl TrackerKind {
     /// Point-to-point controllers are driven through a path waypoint by
     /// waypoint by the tracker; path followers consume the whole path.
     pub fn is_point_controller(self) -> bool {
-        matches!(self, TrackerKind::Pid | TrackerKind::Carrot | TrackerKind::Dwa)
+        matches!(self, TrackerKind::Pid | TrackerKind::Carrot | TrackerKind::Dwa | TrackerKind::PoseReach)
     }
 }
 
@@ -424,6 +429,9 @@ fn make_controller(kind: TrackerKind) -> Box<dyn Controller> {
         TrackerKind::Dwa => Box::new(DwaFollower::new()),
         TrackerKind::Teb => Box::new(TebFollower::new()),
         TrackerKind::Flc => Box::new(FlcFollower::new()),
+        TrackerKind::RegulatedPursuit => Box::new(RegulatedPursuitFollower::new()),
+        TrackerKind::PoseReach => Box::new(PoseReachFollower::new()),
+        TrackerKind::Ilqr => Box::new(IlqrFollower::new()),
     }
 }
 

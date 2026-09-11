@@ -41,6 +41,9 @@ fn kind_from_str(s: &str) -> PyResult<TrackerKind> {
         "dwa" => TrackerKind::Dwa,
         "teb" => TrackerKind::Teb,
         "flc" => TrackerKind::Flc,
+        "regulated_pursuit" | "rpp" => TrackerKind::RegulatedPursuit,
+        "pose_reach" => TrackerKind::PoseReach,
+        "ilqr" => TrackerKind::Ilqr,
         other => {
             return Err(PyValueError::new_err(format!(
                 "unknown tracker kind: {other}"
@@ -63,6 +66,9 @@ fn kind_to_str(k: TrackerKind) -> &'static str {
         TrackerKind::Dwa => "dwa",
         TrackerKind::Teb => "teb",
         TrackerKind::Flc => "flc",
+        TrackerKind::RegulatedPursuit => "regulated_pursuit",
+        TrackerKind::PoseReach => "pose_reach",
+        TrackerKind::Ilqr => "ilqr",
     }
 }
 
@@ -1072,6 +1078,9 @@ fn available_tracker_kinds() -> Vec<&'static str> {
         "dwa",
         "teb",
         "flc",
+        "regulated_pursuit",
+        "pose_reach",
+        "ilqr",
     ]
 }
 

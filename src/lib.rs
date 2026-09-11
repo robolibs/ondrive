@@ -30,9 +30,12 @@ pub use crate::types::{
 };
 
 pub use crate::fuzzy::{FlcConfig, FlcFollower, Term};
-pub use crate::path::{LqrFollower, PurePursuitFollower, StanleyFollower};
-pub use crate::point::{CarrotFollower, PidFollower};
+pub use crate::path::{
+    LqrFollower, PurePursuitFollower, RegulatedPursuitConfig, RegulatedPursuitFollower,
+    StanleyFollower,
+};
+pub use crate::point::{CarrotFollower, PidFollower, PoseReachConfig, PoseReachFollower};
 pub use crate::pred::{
-    DwaConfig, DwaFollower, McaConfig, McaFollower, MpcConfig, MpcFollower, MppiConfig,
-    MppiFollower, SocConfig, SocFollower, TebConfig, TebFollower,
+    DwaConfig, DwaFollower, IlqrConfig, IlqrFollower, McaConfig, McaFollower, MpcConfig,
+    MpcFollower, MppiConfig, MppiFollower, SocConfig, SocFollower, TebConfig, TebFollower,
 };
