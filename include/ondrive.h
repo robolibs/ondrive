@@ -9,8 +9,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define TAU (2.0 * PI)
-
 #define ONDRIVE_KIND_PID 0
 
 #define ONDRIVE_KIND_CARROT 1
@@ -136,6 +134,10 @@ typedef struct {
   double linear_velocity;
   double angular_velocity;
   double lateral_velocity;
+  /**
+   * Ackermann steering angle (rad) consistent with `angular_velocity`.
+   */
+  double steering_angle;
   uint32_t output_type;
 } OndriveVelocityCommand;
 
@@ -249,6 +251,11 @@ const char *ondrive_tracker_status_mode(void);
 const char *ondrive_tracker_last_command_message(void);
 
 bool ondrive_tracker_is_goal_reached(const OndriveTracker *h);
+
+/**
+ * True once a path driven without an explicit goal has been consumed.
+ */
+bool ondrive_tracker_is_path_completed(const OndriveTracker *h);
 
 bool ondrive_tracker_current_target(const OndriveTracker *h, OndriveVec3 *out);
 

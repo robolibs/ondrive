@@ -214,6 +214,7 @@ fn full_tracker_lifecycle_runs_to_goal() {
             linear_velocity: 0.0,
             angular_velocity: 0.0,
             lateral_velocity: 0.0,
+            steering_angle: 0.0,
             output_type: 0,
         };
         assert!(ondrive_tracker_tick(t, state, dt, ptr::null(), &mut cmd));
@@ -262,6 +263,7 @@ fn full_tracker_lifecycle_runs_to_goal() {
         linear_velocity: 99.0,
         angular_velocity: 99.0,
         lateral_velocity: 99.0,
+        steering_angle: 99.0,
         output_type: 0,
     };
     assert!(ondrive_tracker_emergency_stop(t, &mut stop));

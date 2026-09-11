@@ -1,0 +1,195 @@
+//! Steering-model helpers and the single place where a physical
+//! `(v, omega)` pair becomes a `VelocityCommand`: curvature feasibility for
+//! Ackermann, reverse policy, saturation and output-unit conversion.
+
+use crate::types::{
+    ControllerConfig, OutputUnits, RobotConstraints, RobotState, SteeringType, VelocityCommand,
+};
+
+pub fn can_turn_in_place(steering: SteeringType) -> bool {
+    !matches!(steering, SteeringType::Ackermann)
+}
+
+pub fn is_ackermann(steering: SteeringType) -> bool {
+    matches!(steering, SteeringType::Ackermann)
+}
+
+pub fn reverse_allowed(cfg: &ControllerConfig, state: &RobotState) -> bool {
+    cfg.allow_reverse || state.allow_reverse
+}
+
+pub fn wheelbase(constraints: &RobotConstraints) -> f64 {
+    if constraints.wheelbase > 1e-6 {
+        constraints.wheelbase
+    } else {
+        1.0
+    }
+}
+
+/// Largest path curvature the platform can follow. Unbounded for platforms
+/// that can turn in place.
+pub fn max_curvature(constraints: &RobotConstraints) -> f64 {
+    if !is_ackermann(constraints.steering_type) {
+        return f64::INFINITY;
+    }
+    let mut k = f64::INFINITY;
+    if constraints.max_steering_angle > 0.0 {
+        k = k.min(constraints.max_steering_angle.tan().abs() / wheelbase(constraints));
+    }
+    if constraints.min_turning_radius > 0.0 {
+        k = k.min(1.0 / constraints.min_turning_radius);
+    }
+    k
+}
+
+pub fn steering_to_curvature(delta: f64, constraints: &RobotConstraints) -> f64 {
+    delta.tan() / wheelbase(constraints)
+}
+
+pub fn curvature_to_steering(kappa: f64, constraints: &RobotConstraints) -> f64 {
+    (kappa * wheelbase(constraints)).atan()
+}
+
+/// Longitudinal speed limits for this tick.
+pub fn speed_bounds(constraints: &RobotConstraints, allow_reverse: bool) -> (f64, f64) {
+    let hi = constraints.max_linear_velocity.max(0.0);
+    let lo = if allow_reverse {
+        constraints.min_linear_velocity.min(0.0)
+    } else {
+        0.0
+    };
+    (lo, hi)
+}
+
+/// Scale factor in `[floor, 1]` that slows the platform as the heading error
+/// grows: `cos(err)` for platforms that can turn in place, with a floor for
+/// Ackermann so it keeps rolling while it steers around.
+pub fn heading_speed_scale(heading_error: f64, constraints: &RobotConstraints) -> f64 {
+    let c = heading_error.cos();
+    if is_ackermann(constraints.steering_type) {
+        c.max(0.3)
+    } else {
+        c.max(0.0)
+    }
+}
+
+/// Speed profile for path following: nominal speed reduced for path
+/// curvature and tapered toward the goal so the platform stops inside the
+/// tolerance instead of overshooting.
+pub fn path_speed(
+    nominal: f64,
+    kappa: f64,
+    dist_to_goal: f64,
+    goal_tolerance: f64,
+    kp_linear: f64,
+    constraints: &RobotConstraints,
+) -> f64 {
+    let curvature_scale = 1.0 / (1.0 + 2.0 * kappa.abs() * wheelbase(constraints));
+    let taper = (kp_linear.max(0.1) * (dist_to_goal - 0.5 * goal_tolerance).max(0.0))
+        .max(0.15 * constraints.max_linear_velocity.max(0.0));
+    (nominal * curvature_scale.max(0.25)).min(taper).max(0.0)
+}
+
+/// Build the final command from a physical `(v, omega)` pair.
+pub fn finalize(
+    v: f64,
+    omega: f64,
+    constraints: &RobotConstraints,
+    cfg: &ControllerConfig,
+    allow_reverse: bool,
+    message: &str,
+) -> VelocityCommand {
+    if !v.is_finite() || !omega.is_finite() {
+        return VelocityCommand::invalid("non-finite command");
+    }
+    let (lo, hi) = speed_bounds(constraints, allow_reverse);
+    let v = v.clamp(lo.min(hi), hi);
+
+    let mut omega = omega;
+    let mut steering_angle = 0.0;
+    if is_ackermann(constraints.steering_type) {
+        let kmax = max_curvature(constraints);
+        let omega_max = if kmax.is_finite() {
+            v.abs() * kmax
+        } else {
+            f64::INFINITY
+        };
+        omega = omega.clamp(-omega_max, omega_max);
+        if v.abs() > 1e-6 {
+            steering_angle = curvature_to_steering(omega / v, constraints);
+        } else {
+            omega = 0.0;
+        }
+    }
+    let w_max = constraints.max_angular_velocity.max(0.0);
+    omega = omega.clamp(-w_max, w_max);
+    if is_ackermann(constraints.steering_type) && v.abs() > 1e-6 {
+        steering_angle = curvature_to_steering(omega / v, constraints);
+    }
+
+    let (linear, angular) = match cfg.output_units {
+        OutputUnits::Physical => (v, omega),
+        OutputUnits::Normalized => (
+            if hi > 0.0 { v / hi } else { 0.0 },
+            if w_max > 0.0 { omega / w_max } else { 0.0 },
+        ),
+    };
+
+    VelocityCommand {
+        valid: true,
+        status_message: message.into(),
+        linear_velocity: linear,
+        angular_velocity: angular,
+        lateral_velocity: 0.0,
+        steering_angle,
+        ..VelocityCommand::default()
+    }
+}
+
+pub fn stop(message: &str) -> VelocityCommand {
+    VelocityCommand {
+        valid: true,
+        status_message: message.into(),
+        ..VelocityCommand::default()
+    }
+}
+
+/// Steering-angle bound consistent with `max_curvature`: the configured
+/// steering limit when set, otherwise the angle equivalent of the curvature
+/// limit (or just under 90 degrees when unlimited).
+pub fn steering_limit(constraints: &RobotConstraints) -> f64 {
+    if constraints.max_steering_angle > 0.0 {
+        return constraints.max_steering_angle.abs();
+    }
+    let k = max_curvature(constraints);
+    if k.is_finite() {
+        curvature_to_steering(k, constraints).abs()
+    } else {
+        std::f64::consts::FRAC_PI_2 - 1e-6
+    }
+}
+
+/// Speed floor for Ackermann platforms whose point goal cannot be reached
+/// on any feasible arc from the current pose (the goal lies inside the
+/// minimum turning circle). Slowing down cannot help there, so the platform
+/// keeps rolling to complete a loop; `None` when the goal is reachable or
+/// the platform can turn in place.
+pub fn unreachable_arc_speed_floor(
+    bearing_error: f64,
+    distance: f64,
+    constraints: &RobotConstraints,
+) -> Option<f64> {
+    if !is_ackermann(constraints.steering_type) || distance < 1e-6 {
+        return None;
+    }
+    let kmax = max_curvature(constraints);
+    if !kmax.is_finite() {
+        return None;
+    }
+    let required = 2.0 * bearing_error.sin().abs() / distance;
+    if required > kmax {
+        Some(0.3 * constraints.max_linear_velocity.max(0.0))
+    } else {
+        None
+    }
+}

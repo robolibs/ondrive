@@ -145,7 +145,7 @@ pub enum OutputUnits {
 
 impl Default for OutputUnits {
     fn default() -> Self {
-        OutputUnits::Normalized
+        OutputUnits::Physical
     }
 }
 
@@ -158,6 +158,9 @@ pub struct VelocityCommand {
     pub linear_velocity: f64,
     pub angular_velocity: f64,
     pub lateral_velocity: f64,
+    /// Ackermann front-wheel steering angle (rad) consistent with
+    /// `angular_velocity`; zero for other steering types.
+    pub steering_angle: f64,
 }
 
 impl VelocityCommand {
@@ -198,7 +201,7 @@ pub struct ControllerConfig {
 impl Default for ControllerConfig {
     fn default() -> Self {
         Self {
-            output_units: OutputUnits::Normalized,
+            output_units: OutputUnits::Physical,
             kp_linear: 1.0,
             ki_linear: 0.0,
             kd_linear: 0.0,

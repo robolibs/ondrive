@@ -1,97 +1,23 @@
-//! MPC path-following example.
+//! MPC demo: an Ackermann car on a sine path, with the planned horizon
+//! drawn in magenta.
 
-#![allow(clippy::field_reassign_with_default)]
+#[path = "common/viz.rs"]
+mod viz;
+#[path = "common/demo.rs"]
+mod demo;
 
-use datapod::{Euler, Point, Pose, Quaternion};
-use ondrive::{
-    ControllerConfig, Goal, OutputUnits, Path, RobotConstraints, RobotState, Tracker, TrackerKind,
-};
-
-fn pose_at(x: f64, y: f64) -> Pose {
-    Pose {
-        point: Point::new(x, y, 0.0),
-        rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, 0.0)),
-    }
-}
+use ondrive::{SteeringType, TrackerKind};
 
 fn main() {
-    let mut path = Path::default();
-    path.waypoints = (0..40)
-        .map(|i| {
-            let x = i as f64 * 0.4;
-            let y = (x * 0.4).sin() * 0.8;
-            pose_at(x, y)
-        })
-        .collect();
-
-    let final_wp = *path.waypoints.last().unwrap();
-
-    let mut tracker = Tracker::new(TrackerKind::Mpc);
-    let mut cfg = ControllerConfig::default();
-    cfg.goal_tolerance = 0.3;
-    cfg.angular_tolerance = 1.0;
-    cfg.output_units = OutputUnits::Physical;
-    tracker.set_config(cfg);
-
-    let mut c = RobotConstraints::default();
-    c.max_linear_velocity = 1.0;
-    c.max_angular_velocity = 2.0;
-    c.max_linear_acceleration = 2.0;
-    c.max_steering_angle = 0.6;
-    c.wheelbase = 0.5;
-    tracker.init(c);
-
-    tracker.set_path(path);
-    tracker.set_goal(Goal {
-        target_pose: final_wp,
-        tolerance_position: 0.3,
-        tolerance_orientation: 1.0,
-        ..Default::default()
+    demo::run(demo::Demo {
+        name: "mpc",
+        kind: TrackerKind::Mpc,
+        path: demo::sine(16.0, 0.8, 0.4),
+        constraints: demo::constraints(SteeringType::Ackermann, 1.0),
+        config: demo::config(),
+        start: demo::pose(0.0, 0.3, 0.0),
+        world: None,
+        dt: 0.1,
+        max_time: 120.0,
     });
-
-    let mut state = RobotState {
-        pose: pose_at(0.0, 0.2),
-        allow_move: true,
-        ..Default::default()
-    };
-
-    let dt = 0.1;
-    let mut t = 0.0;
-    let mut last_print = -1.0;
-
-    for _ in 0..2000 {
-        let cmd = tracker.tick(&state, dt, None);
-        if !cmd.valid {
-            println!("invalid: {}", cmd.status_message);
-            break;
-        }
-        let yaw = state.pose.rotation.to_euler().yaw;
-        state.pose.point.x += cmd.linear_velocity * yaw.cos() * dt;
-        state.pose.point.y += cmd.linear_velocity * yaw.sin() * dt;
-        let new_yaw = yaw + cmd.angular_velocity * dt;
-        state.pose.rotation = Quaternion::from_euler(Euler::new(0.0, 0.0, new_yaw));
-        state.velocity.linear = cmd.linear_velocity;
-        state.velocity.angular = cmd.angular_velocity;
-        t += dt;
-
-        if t - last_print >= 0.5 {
-            let s = tracker.get_status();
-            println!(
-                "t={:5.2} pos=({:5.2},{:5.2}) v={:.2} w={:.2} cte={:.3} hdg={:.3}",
-                t,
-                state.pose.point.x,
-                state.pose.point.y,
-                cmd.linear_velocity,
-                cmd.angular_velocity,
-                s.cross_track_error,
-                s.heading_error
-            );
-            last_print = t;
-        }
-        if tracker.get_status().goal_reached {
-            println!("goal reached at t={:.2}", t);
-            return;
-        }
-    }
-    println!("budget exhausted at t={:.2}", t);
 }

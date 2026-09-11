@@ -149,7 +149,7 @@ pub struct PyControllerConfig {
 impl PyControllerConfig {
     #[new]
     #[pyo3(signature = (
-        output_units = "normalized",
+        output_units = "physical",
         kp_linear = 1.0, ki_linear = 0.0, kd_linear = 0.0,
         kp_angular = 1.0, ki_angular = 0.0, kd_angular = 0.0,
         lookahead_distance = 1.0,
@@ -646,8 +646,8 @@ impl PyGoal {
     #[pyo3(signature = (
         target_pose,
         target_velocity = None,
-        tolerance_position = 0.1,
-        tolerance_orientation = 0.1,
+        tolerance_position = 0.0,
+        tolerance_orientation = 0.0,
     ))]
     fn new(
         target_pose: PoseTuple,
@@ -718,6 +718,10 @@ impl PyVelocityCommand {
     #[getter]
     fn lateral_velocity(&self) -> f64 {
         self.inner.lateral_velocity
+    }
+    #[getter]
+    fn steering_angle(&self) -> f64 {
+        self.inner.steering_angle
     }
     #[getter]
     fn status_message(&self) -> String {
@@ -1023,6 +1027,10 @@ impl PyTracker {
 
     fn is_goal_reached(&self) -> bool {
         self.inner.is_goal_reached()
+    }
+
+    fn is_path_completed(&self) -> bool {
+        self.inner.is_path_completed()
     }
 
     fn current_target(&self) -> Option<(f64, f64, f64)> {

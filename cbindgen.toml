@@ -14,3 +14,4 @@ rename_variants = "QualifiedScreamingSnakeCase"
 prefix_with_name = true
 
 [export]
+exclude = ["TAU", "PathCursor_WINDOW"]

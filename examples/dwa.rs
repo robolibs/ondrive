@@ -1,5 +1,5 @@
-//! MCA demo: an Ackermann car on a straight path with two obstacles on and
-//! beside it. Obstacles are red discs, the plan is magenta.
+//! DWA demo: a differential robot walked through waypoints with an obstacle
+//! sitting between two of them.
 
 #[path = "common/viz.rs"]
 mod viz;
@@ -24,14 +24,14 @@ fn static_obstacle(x: f64, y: f64, radius: f64) -> ondrive::Obstacle {
 
 fn main() {
     let world = ondrive::WorldConstraints {
-        obstacles: vec![static_obstacle(6.0, 0.3, 0.3), static_obstacle(11.0, -0.4, 0.3)],
+        obstacles: vec![static_obstacle(6.0, 1.5, 0.3)],
         ..Default::default()
     };
     demo::run(demo::Demo {
-        name: "mca",
-        kind: TrackerKind::Mca,
-        path: demo::curve(|s| (s, 0.0), 16.0, 0.25),
-        constraints: demo::constraints(SteeringType::Ackermann, 1.0),
+        name: "dwa",
+        kind: TrackerKind::Dwa,
+        path: demo::path_through(&[(0.0, 0.0), (4.0, 0.0), (8.0, 3.0), (12.0, 3.0)]),
+        constraints: demo::constraints(SteeringType::Differential, 1.0),
         config: demo::config(),
         start: demo::pose(0.0, 0.0, 0.0),
         world: Some(world),

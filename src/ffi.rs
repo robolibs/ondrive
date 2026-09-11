@@ -241,6 +241,8 @@ pub struct OndriveVelocityCommand {
     pub linear_velocity: f64,
     pub angular_velocity: f64,
     pub lateral_velocity: f64,
+    /// Ackermann steering angle (rad) consistent with `angular_velocity`.
+    pub steering_angle: f64,
     pub output_type: u32, // always VelocityCommand for now
 }
 
@@ -426,6 +428,7 @@ fn cmd_to_ffi(c: &VelocityCommand) -> OndriveVelocityCommand {
         linear_velocity: c.linear_velocity,
         angular_velocity: c.angular_velocity,
         lateral_velocity: c.lateral_velocity,
+        steering_angle: c.steering_angle,
         output_type: 0, // VelocityCommand
     }
 }
@@ -902,6 +905,16 @@ pub extern "C" fn ondrive_tracker_is_goal_reached(h: *const OndriveTracker) -> b
         return false;
     }
     unsafe { (*h).tracker.is_goal_reached() }
+}
+
+/// True once a path driven without an explicit goal has been consumed.
+#[unsafe(no_mangle)]
+pub extern "C" fn ondrive_tracker_is_path_completed(h: *const OndriveTracker) -> bool {
+    if h.is_null() {
+        set_last_error("null tracker handle");
+        return false;
+    }
+    unsafe { (*h).tracker.is_path_completed() }
 }
 
 #[unsafe(no_mangle)]

@@ -1,5 +1,5 @@
-//! MCA demo: an Ackermann car on a straight path with two obstacles on and
-//! beside it. Obstacles are red discs, the plan is magenta.
+//! TEB demo: an Ackermann car on a sine path with an obstacle directly on
+//! the path. The elastic band is drawn in magenta.
 
 #[path = "common/viz.rs"]
 mod viz;
@@ -23,14 +23,15 @@ fn static_obstacle(x: f64, y: f64, radius: f64) -> ondrive::Obstacle {
 }
 
 fn main() {
+    let y = (7.0_f64 * 0.35).sin() * 1.0;
     let world = ondrive::WorldConstraints {
-        obstacles: vec![static_obstacle(6.0, 0.3, 0.3), static_obstacle(11.0, -0.4, 0.3)],
+        obstacles: vec![static_obstacle(7.0, y, 0.3)],
         ..Default::default()
     };
     demo::run(demo::Demo {
-        name: "mca",
-        kind: TrackerKind::Mca,
-        path: demo::curve(|s| (s, 0.0), 16.0, 0.25),
+        name: "teb",
+        kind: TrackerKind::Teb,
+        path: demo::sine(18.0, 1.0, 0.35),
         constraints: demo::constraints(SteeringType::Ackermann, 1.0),
         config: demo::config(),
         start: demo::pose(0.0, 0.0, 0.0),

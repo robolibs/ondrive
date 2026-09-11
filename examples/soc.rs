@@ -1,89 +1,42 @@
-//! SOC (SVG-MPPI) example — same sine-curve path as the MPPI demo.
+//! SOC demo: a differential robot on a sine path with an obstacle beside
+//! the path. Obstacle in red, plan in magenta.
 
-#![allow(clippy::field_reassign_with_default)]
+#[path = "common/viz.rs"]
+mod viz;
+#[path = "common/demo.rs"]
+mod demo;
 
-use datapod::{Euler, Point, Pose, Quaternion};
-use ondrive::{
-    ControllerConfig, Goal, OutputUnits, Path, RobotConstraints, RobotState, Tracker, TrackerKind,
-};
+use ondrive::{SteeringType, TrackerKind};
 
-fn pose_at(x: f64, y: f64) -> Pose {
-    Pose {
-        point: Point::new(x, y, 0.0),
-        rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, 0.0)),
+fn static_obstacle(x: f64, y: f64, radius: f64) -> ondrive::Obstacle {
+    ondrive::Obstacle {
+        id: 0,
+        radius,
+        modes: vec![ondrive::GaussianMode {
+            weight: 1.0,
+            mean_x: vec![x; 40],
+            mean_y: vec![y; 40],
+            std_x: vec![0.05; 40],
+            std_y: vec![0.05; 40],
+        }],
     }
 }
 
 fn main() {
-    let mut path = Path::default();
-    path.waypoints = (0..40)
-        .map(|i| {
-            let x = i as f64 * 0.4;
-            let y = (x * 0.4).sin() * 0.8;
-            pose_at(x, y)
-        })
-        .collect();
-    let final_wp = *path.waypoints.last().unwrap();
-
-    let mut tracker = Tracker::new(TrackerKind::Soc);
-    let mut cfg = ControllerConfig::default();
-    cfg.goal_tolerance = 0.4;
-    cfg.angular_tolerance = 1.0;
-    cfg.output_units = OutputUnits::Physical;
-    tracker.set_config(cfg);
-
-    let mut c = RobotConstraints::default();
-    c.max_linear_velocity = 1.0;
-    c.max_angular_velocity = 2.0;
-    c.max_linear_acceleration = 2.0;
-    c.max_steering_angle = 0.6;
-    c.wheelbase = 0.5;
-    tracker.init(c);
-
-    tracker.set_path(path);
-    tracker.set_goal(Goal {
-        target_pose: final_wp,
-        tolerance_position: 0.4,
-        tolerance_orientation: 1.0,
-        ..Default::default()
-    });
-
-    let mut state = RobotState {
-        pose: pose_at(0.0, 0.2),
-        allow_move: true,
+    let y = (8.0_f64 * 0.35).sin() * 1.2 + 0.4;
+    let world = ondrive::WorldConstraints {
+        obstacles: vec![static_obstacle(8.0, y, 0.3)],
         ..Default::default()
     };
-
-    let dt = 0.1;
-    let mut t = 0.0;
-    let mut last_print = -1.0;
-    for _ in 0..500 {
-        let cmd = tracker.tick(&state, dt, None);
-        if !cmd.valid {
-            break;
-        }
-        let yaw = state.pose.rotation.to_euler().yaw;
-        state.pose.point.x += cmd.linear_velocity * yaw.cos() * dt;
-        state.pose.point.y += cmd.linear_velocity * yaw.sin() * dt;
-        let new_yaw = yaw + cmd.angular_velocity * dt;
-        state.pose.rotation = Quaternion::from_euler(Euler::new(0.0, 0.0, new_yaw));
-        state.velocity.linear = cmd.linear_velocity;
-        t += dt;
-        if t - last_print >= 0.5 {
-            println!(
-                "t={:5.2} pos=({:5.2},{:5.2}) v={:.2} w={:.2}",
-                t,
-                state.pose.point.x,
-                state.pose.point.y,
-                cmd.linear_velocity,
-                cmd.angular_velocity
-            );
-            last_print = t;
-        }
-        if tracker.get_status().goal_reached {
-            println!("goal reached at t={:.2}", t);
-            return;
-        }
-    }
-    println!("budget exhausted at t={:.2}", t);
+    demo::run(demo::Demo {
+        name: "soc",
+        kind: TrackerKind::Soc,
+        path: demo::sine(20.0, 1.2, 0.35),
+        constraints: demo::constraints(SteeringType::Differential, 1.0),
+        config: demo::config(),
+        start: demo::pose(0.0, 0.0, 0.0),
+        world: Some(world),
+        dt: 0.1,
+        max_time: 120.0,
+    });
 }
