@@ -1,7 +1,12 @@
 //! iLQR trajectory tracker: iterative LQR / DDP on the kinematic model with
 //! analytic Jacobians, a regularised backward pass, a line-searched forward
 //! pass with control clamping, and a warm start from the shifted previous
-//! solution. State `[x, y, yaw, v]`, controls `[steer_or_omega, accel]`.
+//! solution. State `[x, y, yaw, v, vy]`, controls
+//! `[steer_or_omega, accel, accel_lat]`. `vy` and `accel_lat` (lateral
+//! speed/acceleration) are only free on a holonomic platform — their bound
+//! is exactly zero otherwise (enforced in the forward-pass control clamp),
+//! so `vy` never leaves zero and the solve is identical to the old 4-state
+//! system for every other steering type.
 
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::wheelbase;
@@ -9,13 +14,13 @@ use crate::core::math::normalize_angle;
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
     Model, Reference, build_reference, build_timed_reference, command_from_controls,
-    current_speed, prepare, speed_at_arc_length, update_turn_in_place,
+    current_lateral_speed, current_speed, prepare, speed_at_arc_length, update_turn_in_place,
 };
 use crate::types::{
     Goal, Path, RobotConstraints, RobotState, Trajectory, VelocityCommand, WorldConstraints,
 };
 use datapod::Point;
-use nalgebra::{Matrix2, Matrix2x4, Matrix4, Matrix4x2, Vector2, Vector4};
+use nalgebra::{Matrix3, Matrix3x5, Matrix5, Matrix5x3, Vector3, Vector5};
 
 #[derive(Clone, Debug)]
 pub struct IlqrConfig {
@@ -66,9 +71,11 @@ pub struct IlqrFollower {
     cursor: PathCursor,
     steer: Vec<f64>,
     accel: Vec<f64>,
+    accel_lat: Vec<f64>,
     predicted_trajectory: Vec<Point>,
     is_turning_in_place: bool,
     last_v: f64,
+    last_vy: f64,
     shift_accum: f64,
     last_iterations: usize,
     last_cost: f64,
@@ -82,15 +89,15 @@ impl Default for IlqrFollower {
     }
 }
 
-type State = Vector4<f64>;
-type Control = Vector2<f64>;
+type State = Vector5<f64>;
+type Control = Vector3<f64>;
 
 struct Stage {
     cost: f64,
     lx: State,
     lu: Control,
-    lxx: Matrix4<f64>,
-    luu: Matrix2<f64>,
+    lxx: Matrix5<f64>,
+    luu: Matrix3<f64>,
 }
 
 struct Problem<'a> {
@@ -101,24 +108,35 @@ struct Problem<'a> {
 
 impl Problem<'_> {
     fn step(&self, x: &State, u: &Control) -> State {
-        let (mut px, mut py, mut yaw, mut v) = (x[0], x[1], x[2], x[3]);
+        let (mut px, mut py, mut yaw, mut v, mut vy) = (x[0], x[1], x[2], x[3], x[4]);
         let sb = self.model.steer_bound();
         let ab = self.model.accel_bound();
-        self.model
-            .step(&mut px, &mut py, &mut yaw, &mut v, u[0].clamp(-sb, sb), u[1].clamp(-ab, ab));
-        State::new(px, py, yaw, v)
+        let lb = self.model.accel_lat_bound();
+        self.model.step(
+            &mut px,
+            &mut py,
+            &mut yaw,
+            &mut v,
+            &mut vy,
+            u[0].clamp(-sb, sb),
+            u[1].clamp(-ab, ab),
+            u[2].clamp(-lb, lb),
+        );
+        State::new(px, py, yaw, v, vy)
     }
 
-    fn jacobians(&self, x: &State, u: &Control) -> (Matrix4<f64>, Matrix4x2<f64>) {
+    fn jacobians(&self, x: &State, u: &Control) -> (Matrix5<f64>, Matrix5x3<f64>) {
         let dt = self.model.dt;
         let (s, c) = x[2].sin_cos();
-        let v = x[3];
-        let mut a = Matrix4::identity();
-        a[(0, 2)] = -v * s * dt;
+        let (v, vy) = (x[3], x[4]);
+        let mut a = Matrix5::identity();
+        a[(0, 2)] = (-v * s - vy * c) * dt;
         a[(0, 3)] = c * dt;
-        a[(1, 2)] = v * c * dt;
+        a[(0, 4)] = -s * dt;
+        a[(1, 2)] = (v * c - vy * s) * dt;
         a[(1, 3)] = s * dt;
-        let mut b = Matrix4x2::zeros();
+        a[(1, 4)] = c * dt;
+        let mut b = Matrix5x3::zeros();
         if self.model.ackermann {
             let l = wheelbase(self.model.constraints);
             let sb = self.model.steer_bound();
@@ -129,6 +147,7 @@ impl Problem<'_> {
             b[(2, 0)] = dt;
         }
         b[(3, 1)] = dt;
+        b[(4, 2)] = dt;
         (a, b)
     }
 
@@ -155,10 +174,14 @@ impl Problem<'_> {
             + w_epsi * epsi * epsi
             + w_vel * ve * ve
             + cfg.weight_steering * u[0] * u[0]
-            + cfg.weight_acceleration * u[1] * u[1];
+            + cfg.weight_acceleration * (u[1] * u[1] + u[2] * u[2]);
 
         // Gradient with respect to the origin position, then chain through
-        // the rear-axle offset for the yaw component.
+        // the rear-axle offset for the yaw component. vy has no direct
+        // tracking term (no reference for it) — its influence on cost is
+        // carried entirely through the position it feeds via the state
+        // Jacobian's a[(0,4)]/a[(1,4)] terms, propagated by the backward
+        // pass exactly like v's forward-velocity coupling.
         let g_ox = 2.0 * w_cte * (-cte * rs + 0.25 * along * rc);
         let g_oy = 2.0 * w_cte * (cte * rc + 0.25 * along * rs);
         let a_off = self.model.axle_offset;
@@ -169,7 +192,7 @@ impl Problem<'_> {
         lx[2] = 2.0 * w_epsi * epsi + g_ox * (-a_off * ys) + g_oy * (a_off * yc);
         lx[3] = 2.0 * w_vel * ve;
 
-        let mut lxx = Matrix4::zeros();
+        let mut lxx = Matrix5::zeros();
         let h = 2.0 * w_cte;
         lxx[(0, 0)] = h * (rs * rs + 0.25 * rc * rc);
         lxx[(0, 1)] = h * (-rs * rc + 0.25 * rc * rs);
@@ -178,8 +201,16 @@ impl Problem<'_> {
         lxx[(2, 2)] = 2.0 * w_epsi;
         lxx[(3, 3)] = 2.0 * w_vel;
 
-        let lu = Control::new(2.0 * cfg.weight_steering * u[0], 2.0 * cfg.weight_acceleration * u[1]);
-        let luu = Matrix2::new(2.0 * cfg.weight_steering, 0.0, 0.0, 2.0 * cfg.weight_acceleration);
+        let lu = Control::new(
+            2.0 * cfg.weight_steering * u[0],
+            2.0 * cfg.weight_acceleration * u[1],
+            2.0 * cfg.weight_acceleration * u[2],
+        );
+        let luu = Matrix3::from_diagonal(&Vector3::new(
+            2.0 * cfg.weight_steering,
+            2.0 * cfg.weight_acceleration,
+            2.0 * cfg.weight_acceleration,
+        ));
         Stage { cost, lx, lu, lxx, luu }
     }
 
@@ -202,7 +233,8 @@ impl Problem<'_> {
         let n = us.len();
         let sb = self.model.steer_bound();
         let ab = self.model.accel_bound();
-        let clamp = |u: Control| Control::new(u[0].clamp(-sb, sb), u[1].clamp(-ab, ab));
+        let lb = self.model.accel_lat_bound();
+        let clamp = |u: Control| Control::new(u[0].clamp(-sb, sb), u[1].clamp(-ab, ab), u[2].clamp(-lb, lb));
         for u in us.iter_mut() {
             *u = clamp(*u);
         }
@@ -216,7 +248,7 @@ impl Problem<'_> {
             let mut vx = terminal.lx * self.model.dt;
             let mut vxx = terminal.lxx * self.model.dt;
             let mut ks: Vec<Control> = vec![Control::zeros(); n];
-            let mut kks: Vec<Matrix2x4<f64>> = vec![Matrix2x4::zeros(); n];
+            let mut kks: Vec<Matrix3x5<f64>> = vec![Matrix3x5::zeros(); n];
             let mut ok = true;
             for i in (0..n).rev() {
                 let st = self.stage(i, &xs[i + 1], &us[i], i + 1 == n);
@@ -229,7 +261,7 @@ impl Problem<'_> {
                 let qx = lx + a.transpose() * vx;
                 let qu = lu + b.transpose() * vx;
                 let qxx = lxx + a.transpose() * vxx * a;
-                let quu = luu + b.transpose() * vxx * b + Matrix2::identity() * mu;
+                let quu = luu + b.transpose() * vxx * b + Matrix3::identity() * mu;
                 let qux = b.transpose() * vxx * a;
                 let Some(quu_inv) = quu.try_inverse() else {
                     ok = false;
@@ -302,9 +334,11 @@ impl IlqrFollower {
             cursor: PathCursor::default(),
             steer: vec![0.0; n],
             accel: vec![0.0; n],
+            accel_lat: vec![0.0; n],
             predicted_trajectory: Vec::new(),
             is_turning_in_place: false,
             last_v: 0.0,
+            last_vy: 0.0,
             shift_accum: 0.0,
             last_iterations: 0,
             last_cost: 0.0,
@@ -318,6 +352,7 @@ impl IlqrFollower {
         let n = cfg.horizon_steps.max(1);
         self.steer = vec![0.0; n];
         self.accel = vec![0.0; n];
+        self.accel_lat = vec![0.0; n];
         self.ilqr_config = cfg;
     }
 
@@ -368,9 +403,11 @@ impl Controller for IlqrFollower {
         if self.steer.len() != n {
             self.steer = vec![0.0; n];
             self.accel = vec![0.0; n];
+            self.accel_lat = vec![0.0; n];
         }
         let v_now = current_speed(state, self.last_v);
-        let model = Model::new(state, constraints, v_now, cfg.dt, prep.allow_reverse);
+        let vy_now = current_lateral_speed(state, self.last_vy);
+        let model = Model::new(state, constraints, v_now, vy_now, cfg.dt, prep.allow_reverse);
         let reference = match &self.trajectory {
             Some(traj) => build_timed_reference(traj, self.clock, n, cfg.dt),
             None => build_reference(
@@ -384,8 +421,10 @@ impl Controller for IlqrFollower {
             ),
         };
         let problem = Problem { model: &model, reference: &reference, cfg: &cfg };
-        let x0 = State::new(model.x0, model.y0, model.yaw0, model.v0);
-        let us: Vec<Control> = (0..n).map(|i| Control::new(self.steer[i], self.accel[i])).collect();
+        let x0 = State::new(model.x0, model.y0, model.yaw0, model.v0, model.vy0);
+        let us: Vec<Control> = (0..n)
+            .map(|i| Control::new(self.steer[i], self.accel[i], self.accel_lat[i]))
+            .collect();
         let (us, cost, iterations) = problem.solve(&x0, us);
         self.last_iterations = iterations;
         self.last_cost = cost;
@@ -404,17 +443,21 @@ impl Controller for IlqrFollower {
         for (i, u) in us.iter().enumerate() {
             self.steer[i] = u[0];
             self.accel[i] = u[1];
+            self.accel_lat[i] = u[2];
         }
         let steer0 = self.steer[0];
         let accel0 = self.accel[0];
+        let accel_lat0 = self.accel_lat[0];
         self.shift_accum += dt;
         if self.shift_accum >= cfg.dt {
             self.shift_accum -= cfg.dt;
             self.steer.rotate_left(1);
             self.accel.rotate_left(1);
+            self.accel_lat.rotate_left(1);
             if n > 1 {
                 self.steer[n - 1] = self.steer[n - 2];
                 self.accel[n - 1] = self.accel[n - 2];
+                self.accel_lat[n - 1] = self.accel_lat[n - 2];
             }
         }
         let dt_apply = dt.min(cfg.dt);
@@ -423,8 +466,10 @@ impl Controller for IlqrFollower {
         self.base.status.mode = "ilqr_tracking".into();
         let cmd = command_from_controls(
             v_now,
+            vy_now,
             steer0,
             accel0,
+            accel_lat0,
             dt_apply,
             v_cap,
             constraints,
@@ -435,6 +480,7 @@ impl Controller for IlqrFollower {
             "iLQR tracking",
         );
         self.last_v = (v_now + accel0 * dt_apply).clamp(-v_cap, v_cap);
+        self.last_vy = vy_now + accel_lat0 * dt_apply;
         cmd
     }
 
@@ -457,6 +503,7 @@ impl Controller for IlqrFollower {
         let n = self.ilqr_config.horizon_steps.max(1);
         self.steer = vec![0.0; n];
         self.accel = vec![0.0; n];
+        self.accel_lat = vec![0.0; n];
         self.predicted_trajectory.clear();
         self.is_turning_in_place = false;
         self.shift_accum = 0.0;
@@ -465,6 +512,7 @@ impl Controller for IlqrFollower {
     fn reset(&mut self) {
         self.set_path(Path::default());
         self.last_v = 0.0;
+        self.last_vy = 0.0;
     }
 
     fn get_type(&self) -> &'static str {

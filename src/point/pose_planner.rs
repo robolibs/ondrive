@@ -9,7 +9,8 @@ use crate::controller::{Controller, ControllerBase, check_goal};
 use crate::core::curves::{CurvePath, dubins_all, reeds_shepp_all};
 use crate::core::obstacles::CollisionChecker;
 use crate::core::kinematics::{
-    can_turn_in_place, finalize, is_ackermann, max_curvature, reverse_allowed, stop,
+    can_turn_in_place, finalize, holonomic_point_command, is_ackermann, is_holonomic,
+    max_curvature, reverse_allowed, stop,
 };
 use crate::core::math::{normalize_angle, yaw_of};
 use crate::path::PurePursuitFollower;
@@ -289,6 +290,23 @@ impl Controller for PoseReachFollower {
             self.base.status.goal_reached = true;
             self.base.status.mode = "stopped".into();
             return stop("Goal reached");
+        }
+        if is_holonomic(constraints.steering_type) {
+            // A holonomic platform needs no curve: it translates and
+            // rotates independently, so the Reeds-Shepp/Dubins planner
+            // below (built for a minimum turning radius) does not apply.
+            self.base.status.mode = "pose_reach_holonomic".into();
+            let yaw = yaw_of(&state.pose);
+            return holonomic_point_command(
+                state.pose.point,
+                yaw,
+                goal.target_pose.point,
+                yaw_of(&goal.target_pose),
+                check.distance,
+                &self.base.config,
+                constraints,
+                "Moving to goal",
+            );
         }
         let reverse = reverse_allowed(&self.base.config, state);
         let key = (

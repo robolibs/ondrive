@@ -1,14 +1,19 @@
 //! MPPI (Williams et al. 2017) plus the rollout, reference-trajectory and
 //! output helpers shared by the whole predictive family.
 //!
-//! Controls are `(steer, accel)` per horizon step: `steer` is a front-wheel
-//! steering angle for Ackermann platforms and a yaw rate otherwise.
+//! Controls are `(steer, accel, accel_lat)` per horizon step: `steer` is a
+//! front-wheel steering angle for Ackermann platforms and a yaw rate
+//! otherwise; `accel_lat` (lateral acceleration) is only free for a
+//! holonomic platform — its bound is exactly zero otherwise, so `vy` never
+//! leaves zero and every formula below reduces to the non-holonomic one
+//! bit-for-bit.
 
 #![allow(clippy::too_many_arguments)]
 
 use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
-    can_turn_in_place, finalize, is_ackermann, reverse_allowed, steering_limit, wheelbase,
+    can_turn_in_place, finalize, finalize_holonomic, is_ackermann, is_holonomic, reverse_allowed,
+    steering_limit, wheelbase,
 };
 use crate::core::math::normalize_angle;
 use crate::core::path::{PathCursor, PathProjection, sample};
@@ -152,7 +157,9 @@ pub(crate) struct CostWeights {
     pub accel: f64,
 }
 
-/// Kinematic model shared by every rollout in one tick.
+/// Kinematic model shared by every rollout in one tick. State is
+/// `(x, y, yaw, v, vy)`; `vy` (lateral speed) and its control `accel_lat`
+/// only move away from zero on a holonomic platform.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Model<'a> {
     pub constraints: &'a RobotConstraints,
@@ -160,8 +167,10 @@ pub(crate) struct Model<'a> {
     pub y0: f64,
     pub yaw0: f64,
     pub v0: f64,
+    pub vy0: f64,
     pub dt: f64,
     pub ackermann: bool,
+    pub holonomic: bool,
     pub v_min: f64,
     pub v_max: f64,
     /// Distance from the rear axle forward to the pose origin.
@@ -173,11 +182,13 @@ impl<'a> Model<'a> {
         state: &RobotState,
         constraints: &'a RobotConstraints,
         v0: f64,
+        vy0: f64,
         dt: f64,
         allow_reverse: bool,
     ) -> Self {
         let (v_min, v_max) = crate::core::kinematics::speed_bounds(constraints, allow_reverse);
         let ackermann = is_ackermann(constraints.steering_type);
+        let holonomic = is_holonomic(constraints.steering_type);
         let axle_offset = if ackermann {
             constraints.rear_wheelbase.max(0.0)
         } else {
@@ -190,8 +201,10 @@ impl<'a> Model<'a> {
             y0: state.pose.point.y - axle_offset * yaw0.sin(),
             yaw0,
             v0,
+            vy0: if holonomic { vy0 } else { 0.0 },
             dt,
             ackermann,
+            holonomic,
             v_min,
             v_max,
             axle_offset,
@@ -210,14 +223,38 @@ impl<'a> Model<'a> {
         self.constraints.max_linear_acceleration.abs().max(1e-6)
     }
 
-    pub fn clamp_controls(&self, steer: &mut [f64], accel: &mut [f64]) {
+    /// Lateral acceleration bound: zero except on a holonomic platform, so
+    /// `vy` can never leave zero anywhere else.
+    pub fn accel_lat_bound(&self) -> f64 {
+        if self.holonomic {
+            self.constraints.max_linear_acceleration.abs().max(1e-6)
+        } else {
+            0.0
+        }
+    }
+
+    /// Largest lateral speed magnitude: zero except on a holonomic
+    /// platform.
+    pub fn vy_bound(&self) -> f64 {
+        if self.holonomic {
+            self.constraints.max_linear_velocity.abs()
+        } else {
+            0.0
+        }
+    }
+
+    pub fn clamp_controls(&self, steer: &mut [f64], accel: &mut [f64], accel_lat: &mut [f64]) {
         let sb = self.steer_bound();
         let ab = self.accel_bound();
+        let lb = self.accel_lat_bound();
         for s in steer.iter_mut() {
             *s = s.clamp(-sb, sb);
         }
         for a in accel.iter_mut() {
             *a = a.clamp(-ab, ab);
+        }
+        for a in accel_lat.iter_mut() {
+            *a = a.clamp(-lb, lb);
         }
     }
 
@@ -226,9 +263,23 @@ impl<'a> Model<'a> {
         (x + self.axle_offset * yaw.cos(), y + self.axle_offset * yaw.sin())
     }
 
-    pub fn step(&self, x: &mut f64, y: &mut f64, yaw: &mut f64, v: &mut f64, steer: f64, accel: f64) {
-        *x += *v * yaw.cos() * self.dt;
-        *y += *v * yaw.sin() * self.dt;
+    pub fn step(
+        &self,
+        x: &mut f64,
+        y: &mut f64,
+        yaw: &mut f64,
+        v: &mut f64,
+        vy: &mut f64,
+        steer: f64,
+        accel: f64,
+        accel_lat: f64,
+    ) {
+        // vy is exactly 0.0 here unless holonomic (accel_lat is clamped to
+        // a zero bound otherwise), so this reduces to the plain unicycle
+        // position update for every other steering type.
+        let (s, c) = yaw.sin_cos();
+        *x += (*v * c - *vy * s) * self.dt;
+        *y += (*v * s + *vy * c) * self.dt;
         let w_max = self.constraints.max_angular_velocity.abs();
         if self.ackermann {
             let w = (*v * steer.tan() / wheelbase(self.constraints)).clamp(-w_max, w_max);
@@ -238,25 +289,29 @@ impl<'a> Model<'a> {
         }
         *yaw = normalize_angle(*yaw);
         *v = (*v + accel * self.dt).clamp(self.v_min, self.v_max);
+        let vyb = self.vy_bound();
+        *vy = (*vy + accel_lat * self.dt).clamp(-vyb, vyb);
     }
 }
 
 /// Roll out one control sequence and return `(cost, trajectory)`. `extra`
-/// receives `(step index, x, y)` after every integration step and returns an
-/// additional stage cost (obstacles, risk, ...).
+/// receives `(step index, x, y, yaw)` after every integration step and
+/// returns an additional stage cost (obstacles, risk, ...).
 pub(crate) fn rollout(
     model: &Model,
     steer: &[f64],
     accel: &[f64],
+    accel_lat: &[f64],
     reference: &Reference,
     w: &CostWeights,
     extra: &dyn Fn(usize, f64, f64, f64) -> f64,
     collect: bool,
 ) -> (f64, Vec<Point>) {
-    let n = steer.len().min(accel.len());
+    let n = steer.len().min(accel.len()).min(accel_lat.len());
     let sb = model.steer_bound();
     let ab = model.accel_bound();
-    let (mut x, mut y, mut yaw, mut v) = (model.x0, model.y0, model.yaw0, model.v0);
+    let lb = model.accel_lat_bound();
+    let (mut x, mut y, mut yaw, mut v, mut vy) = (model.x0, model.y0, model.yaw0, model.v0, model.vy0);
     let mut traj = Vec::new();
     if collect {
         traj.reserve(n + 1);
@@ -267,7 +322,8 @@ pub(crate) fn rollout(
     for i in 0..n {
         let s = steer[i].clamp(-sb, sb);
         let a = accel[i].clamp(-ab, ab);
-        model.step(&mut x, &mut y, &mut yaw, &mut v, s, a);
+        let al = accel_lat[i].clamp(-lb, lb);
+        model.step(&mut x, &mut y, &mut yaw, &mut v, &mut vy, s, a, al);
         let (x, y) = model.origin(x, y, yaw);
         let yaw_here = yaw;
         if collect {
@@ -289,7 +345,7 @@ pub(crate) fn rollout(
             + w.epsi * epsi * epsi
             + w.vel * ve * ve
             + w.steering * s * s
-            + w.accel * a * a;
+            + w.accel * (a * a + al * al);
         stage += extra(i, x, y, yaw_here);
         cost += stage * model.dt;
     }
@@ -356,6 +412,16 @@ pub(crate) fn current_speed(state: &RobotState, last_commanded: f64) -> f64 {
     }
 }
 
+/// Lateral-speed feedback, analogous to `current_speed`. Only meaningful on
+/// a holonomic platform; callers pass 0.0 as the fallback otherwise.
+pub(crate) fn current_lateral_speed(state: &RobotState, last_commanded: f64) -> f64 {
+    if state.velocity.lateral.abs() > 1e-9 {
+        state.velocity.lateral
+    } else {
+        last_commanded
+    }
+}
+
 /// Turn-in-place hysteresis shared by the predictive controllers.
 pub(crate) fn update_turn_in_place(
     flag: &mut bool,
@@ -381,11 +447,17 @@ pub(crate) fn update_turn_in_place(
     *flag
 }
 
-/// Convert the first `(steer, accel)` of a solution into a command.
+/// Convert the first `(steer, accel, accel_lat)` of a solution into a
+/// command. On a holonomic platform `steer` is the yaw rate (holonomic is
+/// never Ackermann) and `vy_now`/`accel_lat` drive the lateral axis
+/// independently; otherwise `accel_lat` is always 0 and this is identical
+/// to the old two-control conversion.
 pub(crate) fn command_from_controls(
     v_now: f64,
+    vy_now: f64,
     steer: f64,
     accel: f64,
+    accel_lat: f64,
     dt: f64,
     v_cap: f64,
     constraints: &RobotConstraints,
@@ -401,6 +473,10 @@ pub(crate) fn command_from_controls(
     }
     let cap = if v_cap > 0.0 { v_cap } else { f64::INFINITY };
     let v = (v_now + accel * dt).clamp(-cap, cap);
+    if is_holonomic(constraints.steering_type) {
+        let vy = vy_now + accel_lat * dt;
+        return finalize_holonomic(v, vy, steer, constraints, cfg, message);
+    }
     let omega = if is_ackermann(constraints.steering_type) {
         v * steer.tan() / wheelbase(constraints)
     } else {
@@ -438,9 +514,11 @@ pub struct MppiFollower {
     cursor: PathCursor,
     mean_steering: Vec<f64>,
     mean_acceleration: Vec<f64>,
+    mean_accel_lateral: Vec<f64>,
     predicted_trajectory: Vec<Point>,
     is_turning_in_place: bool,
     last_v: f64,
+    last_vy: f64,
     shift_accum: f64,
     trajectory: Option<Trajectory>,
     clock: f64,
@@ -472,9 +550,11 @@ impl MppiFollower {
             base: ControllerBase::default(),
             mean_steering: vec![0.0; n],
             mean_acceleration: vec![0.0; n],
+            mean_accel_lateral: vec![0.0; n],
             predicted_trajectory: Vec::new(),
             is_turning_in_place: false,
             last_v: 0.0,
+            last_vy: 0.0,
             shift_accum: 0.0,
             trajectory: None,
             clock: 0.0,
@@ -488,6 +568,7 @@ impl MppiFollower {
         let n = cfg.horizon_steps;
         self.mean_steering = vec![0.0; n];
         self.mean_acceleration = vec![0.0; n];
+        self.mean_accel_lateral = vec![0.0; n];
         self.mppi_config = cfg;
     }
 
@@ -505,8 +586,8 @@ impl MppiFollower {
         }
     }
 
-    /// Full MPPI tick with an additional stage cost `extra(step, x, y)` and
-    /// a scale on the executed speed (risk slowdown).
+    /// Full MPPI tick with an additional stage cost `extra(step, x, y, yaw)`
+    /// and a scale on the executed speed (risk slowdown).
     pub(crate) fn step_with(
         &mut self,
         state: &RobotState,
@@ -545,10 +626,12 @@ impl MppiFollower {
         if self.mean_steering.len() != n {
             self.mean_steering = vec![0.0; n];
             self.mean_acceleration = vec![0.0; n];
+            self.mean_accel_lateral = vec![0.0; n];
         }
 
         let v_now = current_speed(state, self.last_v);
-        let model = Model::new(state, constraints, v_now, working.dt, prep.allow_reverse);
+        let vy_now = current_lateral_speed(state, self.last_vy);
+        let model = Model::new(state, constraints, v_now, vy_now, working.dt, prep.allow_reverse);
         let reference = match &self.trajectory {
             Some(traj) => build_timed_reference(traj, self.clock, n, working.dt),
             None => build_reference(
@@ -562,32 +645,44 @@ impl MppiFollower {
             ),
         };
         let w = self.weights(&working);
-        model.clamp_controls(&mut self.mean_steering, &mut self.mean_acceleration);
+        model.clamp_controls(
+            &mut self.mean_steering,
+            &mut self.mean_acceleration,
+            &mut self.mean_accel_lateral,
+        );
 
         let sigma_s = working.steering_noise.max(1e-6);
         let sigma_a = working.acceleration_noise.max(1e-6);
+        let sigma_al = working.acceleration_noise.max(1e-6);
         let dist_s = Normal::new(0.0, sigma_s).unwrap();
         let dist_a = Normal::new(0.0, sigma_a).unwrap();
+        let dist_al = Normal::new(0.0, sigma_al).unwrap();
         let lambda = working.temperature.max(1e-6);
 
         let mut costs = vec![0.0; k];
         let mut noise_s = vec![vec![0.0; n]; k];
         let mut noise_a = vec![vec![0.0; n]; k];
+        let mut noise_al = vec![vec![0.0; n]; k];
         let mut steer = vec![0.0; n];
         let mut accel = vec![0.0; n];
+        let mut accel_lat = vec![0.0; n];
         for j in 0..k {
             let mut control_cost = 0.0;
             for t in 0..n {
                 let es = dist_s.sample(&mut self.rng);
                 let ea = dist_a.sample(&mut self.rng);
+                let eal = dist_al.sample(&mut self.rng);
                 noise_s[j][t] = es;
                 noise_a[j][t] = ea;
+                noise_al[j][t] = eal;
                 steer[t] = self.mean_steering[t] + es;
                 accel[t] = self.mean_acceleration[t] + ea;
+                accel_lat[t] = self.mean_accel_lateral[t] + eal;
                 control_cost += self.mean_steering[t] * es / (sigma_s * sigma_s)
-                    + self.mean_acceleration[t] * ea / (sigma_a * sigma_a);
+                    + self.mean_acceleration[t] * ea / (sigma_a * sigma_a)
+                    + self.mean_accel_lateral[t] * eal / (sigma_al * sigma_al);
             }
-            let (c, _) = rollout(&model, &steer, &accel, &reference, &w, extra, false);
+            let (c, _) = rollout(&model, &steer, &accel, &accel_lat, &reference, &w, extra, false);
             costs[j] = c + lambda * control_cost;
         }
 
@@ -595,19 +690,27 @@ impl MppiFollower {
         for t in 0..n {
             let mut ds = 0.0;
             let mut da = 0.0;
+            let mut dal = 0.0;
             for j in 0..k {
                 ds += weights[j] * noise_s[j][t];
                 da += weights[j] * noise_a[j][t];
+                dal += weights[j] * noise_al[j][t];
             }
             self.mean_steering[t] += ds;
             self.mean_acceleration[t] += da;
+            self.mean_accel_lateral[t] += dal;
         }
-        model.clamp_controls(&mut self.mean_steering, &mut self.mean_acceleration);
+        model.clamp_controls(
+            &mut self.mean_steering,
+            &mut self.mean_acceleration,
+            &mut self.mean_accel_lateral,
+        );
 
         let (_, traj) = rollout(
             &model,
             &self.mean_steering,
             &self.mean_acceleration,
+            &self.mean_accel_lateral,
             &reference,
             &w,
             extra,
@@ -617,14 +720,17 @@ impl MppiFollower {
 
         let steer0 = self.mean_steering[0];
         let accel0 = self.mean_acceleration[0];
+        let accel_lat0 = self.mean_accel_lateral[0];
         self.shift_accum += dt;
         if self.shift_accum >= working.dt {
             self.shift_accum -= working.dt;
             self.mean_steering.rotate_left(1);
             self.mean_acceleration.rotate_left(1);
+            self.mean_accel_lateral.rotate_left(1);
             if n > 1 {
                 self.mean_steering[n - 1] = self.mean_steering[n - 2];
                 self.mean_acceleration[n - 1] = self.mean_acceleration[n - 2];
+                self.mean_accel_lateral[n - 1] = self.mean_accel_lateral[n - 2];
             }
         }
 
@@ -635,8 +741,10 @@ impl MppiFollower {
         self.base.status.mode = mode.into();
         let cmd = command_from_controls(
             v_now,
+            vy_now,
             steer0,
             accel0,
+            accel_lat0,
             dt_apply,
             v_cap,
             constraints,
@@ -646,10 +754,16 @@ impl MppiFollower {
             prep.epsi,
             message,
         );
-        self.last_v = if cmd.valid && matches!(self.base.config.output_units, crate::types::OutputUnits::Physical) {
+        let physical = matches!(self.base.config.output_units, crate::types::OutputUnits::Physical);
+        self.last_v = if cmd.valid && physical {
             cmd.linear_velocity
         } else {
             (v_now + accel0 * dt_apply).clamp(-v_cap, v_cap)
+        };
+        self.last_vy = if cmd.valid && physical {
+            cmd.lateral_velocity
+        } else {
+            vy_now + accel_lat0 * dt_apply
         };
         cmd
     }
@@ -695,6 +809,7 @@ impl Controller for MppiFollower {
         let n = self.mppi_config.horizon_steps;
         self.mean_steering = vec![0.0; n];
         self.mean_acceleration = vec![0.0; n];
+        self.mean_accel_lateral = vec![0.0; n];
         self.predicted_trajectory.clear();
         self.is_turning_in_place = false;
         self.shift_accum = 0.0;
@@ -703,6 +818,7 @@ impl Controller for MppiFollower {
     fn reset(&mut self) {
         self.set_path(Path::default());
         self.last_v = 0.0;
+        self.last_vy = 0.0;
     }
 
     fn get_type(&self) -> &'static str {

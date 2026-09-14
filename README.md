@@ -27,7 +27,7 @@ and all emitting the same body-frame twist.
 |                     | **MCA** (DRA-MPPI)       | MPPI + Monte Carlo collision probability over Gaussian-mixture modes  |
 |                     | **SOC** (SVG-MPPI)       | Stein Variational Gradient Descent guides + adaptive-variance MPPI    |
 |                     | **DWA**                  | Fox 1997 window, braking admissibility, recovery rotation            |
-|                     | **TEB**                  | Timed Elastic Band with non-holonomic residual, projected GD on Δt_i  |
+|                     | **TEB**                  | Timed Elastic Band, common-arc residual (skipped if holonomic), GD on Δt_i|
 | Fuzzy               | **FLC**                  | Mamdani, 7 triangular terms, 49-rule additive base, curvature FF      |
 
 All controllers accept the four kinematic models through `SteeringType`.
@@ -42,14 +42,14 @@ Three families of motion model back them:
   turn in place.
 - **Holonomic** — full `(vx, vy, omega)` body-frame control, translation and
   rotation fully decoupled, output through `finalize_holonomic` /
-  `VelocityCommand::lateral_velocity`. Supported end to end by the point
-  controllers (PID, Carrot, PoseRegulator, APF) and the geometric path
-  followers (Pure Pursuit, RegulatedPursuit, VectorPursuit, Stanley, LQR,
-  Kanayama, FLC), plus DWA's sampling window. The optimal-control family
-  that shares one 2-control kinematic core (MPC, iLQR, MPPI, MCA, SOC,
-  TEB) and PoseReach's curve planner do not yet exploit strafing on a
-  holonomic platform — they still produce valid, safe commands, just as
-  the unicycle subset of holonomic motion (see `PLAN.md` round 4).
+  `VelocityCommand::lateral_velocity`. Supported end to end by every
+  controller: the point controllers (PID, Carrot, PoseRegulator, APF), the
+  geometric path followers (Pure Pursuit, RegulatedPursuit, VectorPursuit,
+  Stanley, LQR, Kanayama, FLC), DWA's sampling window, the shared
+  3-control/5-state predictive core (MPC, iLQR, MPPI, MCA, SOC), TEB, and
+  PoseReach, which bypasses its Reeds-Shepp/Dubins planner entirely on a
+  holonomic platform and translates/rotates straight to the goal (see
+  `PLAN.md` round 4).
 
 Obstacle-aware controllers (MCA, SOC, DWA, TEB, RegulatedPursuit, PoseReach,
 APF) consume `WorldConstraints`: Gaussian-mode obstacle predictions and/or

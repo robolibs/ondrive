@@ -9,9 +9,10 @@ use datapod::{Euler, Point, Pose, Quaternion};
 use ondrive::core::kinematics::{finalize_holonomic, world_to_body};
 use ondrive::{
     ApfFollower, CarrotFollower, Controller, ControllerConfig, DwaConfig, DwaFollower, FlcConfig,
-    FlcFollower, GaussianMode, Goal, KanayamaFollower, LqrFollower, Obstacle, OutputUnits, Path,
-    PidFollower, PoseRegulatorFollower, PurePursuitFollower, RegulatedPursuitFollower,
-    RobotConstraints, RobotState, SteeringType, StanleyFollower, VectorPursuitFollower,
+    FlcFollower, GaussianMode, Goal, IlqrFollower, KanayamaFollower, LqrFollower, McaFollower,
+    MpcFollower, MppiFollower, Obstacle, OutputUnits, Path, PidFollower, PoseReachFollower,
+    PoseRegulatorFollower, PurePursuitFollower, RegulatedPursuitFollower, RobotConstraints,
+    RobotState, SocFollower, SteeringType, StanleyFollower, TebFollower, VectorPursuitFollower,
     VelocityCommand, WorldConstraints,
 };
 use std::f64::consts::{FRAC_PI_2, PI};
@@ -188,7 +189,21 @@ fn straight_path(len: f64) -> Path {
     p
 }
 
-fn assert_tracks_while_perpendicular(mut ctrl: impl Controller, name: &str) {
+fn assert_tracks_while_perpendicular(ctrl: impl Controller, name: &str) {
+    assert_tracks_while_perpendicular_checkpoint(ctrl, name, 10);
+}
+
+/// Same property, but the "makes forward progress without rotating first"
+/// checkpoint is taken later: a receding-horizon controller (sampling-based
+/// MPPI/MCA/SOC, or TEB's gradient-descended band) ramps up more cautiously
+/// than a one-shot geometric or DDP solve, so 0.5s is too tight a window —
+/// the property under test is that it never needs to rotate, not how many
+/// control periods it takes to leave the acceleration limit.
+fn assert_tracks_while_perpendicular_slow_start(ctrl: impl Controller, name: &str) {
+    assert_tracks_while_perpendicular_checkpoint(ctrl, name, 40);
+}
+
+fn assert_tracks_while_perpendicular_checkpoint(mut ctrl: impl Controller, name: &str, checkpoint_step: usize) {
     let c = constraints();
     let path = straight_path(10.0);
     let goal = Goal {
@@ -206,15 +221,15 @@ fn assert_tracks_while_perpendicular(mut ctrl: impl Controller, name: &str) {
         allow_move: true,
         ..Default::default()
     };
-    let mut x_after_half_second = None;
+    let mut x_at_checkpoint = None;
     let mut max_cte_settled: f64 = 0.0;
     let mut reached = false;
     for i in 0..3000 {
         let cmd = ctrl.compute_control(&state, &goal, &c, 0.05, None);
         assert!(cmd.valid, "{name}: {}", cmd.status_message);
         integrate(&mut state, &cmd, 0.05);
-        if i == 10 {
-            x_after_half_second = Some(state.pose.point.x);
+        if i == checkpoint_step {
+            x_at_checkpoint = Some(state.pose.point.x);
         }
         if i > 100 {
             max_cte_settled = max_cte_settled.max(ctrl.get_status().cross_track_error.abs());
@@ -226,10 +241,11 @@ fn assert_tracks_while_perpendicular(mut ctrl: impl Controller, name: &str) {
     }
     assert!(reached, "{name}: did not reach the end; final=({:.2},{:.2})", state.pose.point.x, state.pose.point.y);
     assert!(
-        x_after_half_second.unwrap() > 0.1,
-        "{name}: made no forward progress in the first 0.5s while perpendicular to the path (x={:.3}); \
+        x_at_checkpoint.unwrap() > 0.1,
+        "{name}: made no forward progress by t={:.1}s while perpendicular to the path (x={:.3}); \
          a holonomic tracker should not need to rotate first",
-        x_after_half_second.unwrap()
+        checkpoint_step as f64 * 0.05,
+        x_at_checkpoint.unwrap()
     );
     let final_yaw = state.pose.rotation.to_euler().yaw.abs();
     assert!(final_yaw < 0.3, "{name}: final yaw {final_yaw:.3} did not converge to the path tangent");
@@ -344,4 +360,83 @@ fn dwa_holonomic_sidesteps_an_obstacle_directly_ahead() {
     assert!(reached, "final=({:.2},{:.2})", state.pose.point.x, state.pose.point.y);
     assert!(min_clear > 0.3 + 0.5 * (0.4_f64).hypot(0.4), "min_clear={min_clear:.3}");
     assert!(used_lateral, "DWA never sampled a nonzero lateral velocity to sidestep the obstacle");
+}
+
+// ---------------------------------------------------------------------
+// The shared predictive core (MPC, iLQR, MPPI, MCA, SOC) and TEB: the
+// vy/accel_lat channel is only free when `accel_lat_bound()`/`vy_bound()`
+// are nonzero, which happens exactly for `SteeringType::Holonomic`.
+// ---------------------------------------------------------------------
+
+#[test]
+fn mpc_holonomic_tracks_while_perpendicular_to_the_path() {
+    assert_tracks_while_perpendicular(MpcFollower::new(), "mpc");
+}
+
+#[test]
+fn ilqr_holonomic_tracks_while_perpendicular_to_the_path() {
+    assert_tracks_while_perpendicular(IlqrFollower::new(), "ilqr");
+}
+
+#[test]
+fn mppi_holonomic_tracks_while_perpendicular_to_the_path() {
+    assert_tracks_while_perpendicular_slow_start(MppiFollower::new(), "mppi");
+}
+
+#[test]
+fn mca_holonomic_tracks_while_perpendicular_to_the_path() {
+    assert_tracks_while_perpendicular_slow_start(McaFollower::new(), "mca");
+}
+
+#[test]
+fn soc_holonomic_tracks_while_perpendicular_to_the_path() {
+    assert_tracks_while_perpendicular_slow_start(SocFollower::new(), "soc");
+}
+
+#[test]
+fn teb_holonomic_tracks_while_perpendicular_to_the_path() {
+    assert_tracks_while_perpendicular_slow_start(TebFollower::new(), "teb");
+}
+
+#[test]
+fn predictive_family_commands_nonzero_lateral_velocity_when_perpendicular() {
+    let c = constraints();
+    let path = straight_path(10.0);
+    let goal = Goal {
+        target_pose: *path.waypoints.last().unwrap(),
+        tolerance_position: 0.3,
+        tolerance_orientation: PI,
+        ..Default::default()
+    };
+    let state = RobotState { pose: pose(0.0, 0.4, FRAC_PI_2), allow_move: true, ..Default::default() };
+    let cases: Vec<(&str, Box<dyn Controller>)> = vec![
+        ("mpc", Box::new(MpcFollower::new())),
+        ("ilqr", Box::new(IlqrFollower::new())),
+        ("mppi", Box::new(MppiFollower::new())),
+        ("mca", Box::new(McaFollower::new())),
+        ("soc", Box::new(SocFollower::new())),
+        ("teb", Box::new(TebFollower::new())),
+    ];
+    for (name, mut ctrl) in cases {
+        ctrl.set_config(config());
+        ctrl.set_path(path.clone());
+        let cmd = ctrl.compute_control(&state, &goal, &c, 0.05, None);
+        assert!(cmd.valid, "{name}: {}", cmd.status_message);
+        assert!(
+            cmd.lateral_velocity.abs() > 1e-6,
+            "{name}: commanded zero lateral velocity while perpendicular to the path (vy={})",
+            cmd.lateral_velocity
+        );
+    }
+}
+
+// ---------------------------------------------------------------------
+// PoseReach: a holonomic platform bypasses Reeds-Shepp/Dubins entirely and
+// translates/rotates directly toward the target pose.
+// ---------------------------------------------------------------------
+
+#[test]
+fn pose_reach_holonomic_strafes_to_a_goal_beside_it() {
+    assert_strafes_without_turning(PoseReachFollower::new(), (0.0, 3.0));
+    assert_strafes_without_turning(PoseReachFollower::new(), (-2.0, 1.5));
 }

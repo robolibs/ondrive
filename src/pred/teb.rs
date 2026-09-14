@@ -13,11 +13,14 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::controller::{Controller, ControllerBase};
-use crate::core::kinematics::{finalize, is_ackermann, max_curvature, speed_bounds};
+use crate::core::kinematics::{
+    finalize, finalize_holonomic, is_ackermann, is_holonomic, max_curvature, speed_bounds,
+    world_to_body,
+};
 use crate::core::math::{normalize_angle, yaw_of};
 use crate::core::obstacles::CollisionChecker;
 use crate::core::path::{PathCursor, project, sample};
-use crate::pred::mppi::{current_speed, prepare};
+use crate::pred::mppi::{current_lateral_speed, current_speed, prepare};
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::{Point, Pose};
 
@@ -72,6 +75,7 @@ pub struct TebFollower {
     band: Band,
     band_initialised: bool,
     last_v: f64,
+    last_vy: f64,
     auto_path_goal: Option<(f64, f64, f64)>,
 }
 
@@ -97,6 +101,7 @@ struct Problem<'a> {
     v_hi: f64,
     v_start: f64,
     ackermann: bool,
+    holonomic: bool,
 }
 
 impl Problem<'_> {
@@ -148,8 +153,12 @@ impl Problem<'_> {
             prev_v = Some((v, dt));
             last_v = v;
 
-            let kin = (c0 + c1) * dy - (s0 + s1) * dx;
-            cost += c.weight_kinematic * kin * kin;
+            // A holonomic platform can translate off its heading axis, so
+            // the common-arc residual below does not apply to it.
+            if !self.holonomic {
+                let kin = (c0 + c1) * dy - (s0 + s1) * dx;
+                cost += c.weight_kinematic * kin * kin;
+            }
 
             if self.ackermann && self.kappa_max.is_finite() {
                 let r = (dyaw.abs() - ds * self.kappa_max).max(0.0);
@@ -448,7 +457,9 @@ impl Controller for TebFollower {
             }
         };
         let checker = CollisionChecker::new(world, constraints, 0.0);
+        let holonomic = is_holonomic(constraints.steering_type);
         let v_now = current_speed(state, self.last_v);
+        let vy_now = if holonomic { current_lateral_speed(state, self.last_vy) } else { 0.0 };
         let n = self.teb_config.n_poses.max(3);
         if !self.band_initialised || self.band.x.len() != n {
             self.initialise_band(state, prep.proj.arc_length, constraints, &checker);
@@ -474,18 +485,31 @@ impl Controller for TebFollower {
             v_hi,
             v_start: v_now,
             ackermann: is_ackermann(constraints.steering_type),
+            holonomic,
         };
         self.optimise(&problem);
 
         let dt0 = self.band.dt[0].max(1e-3);
         let dx = self.band.x[1] - self.band.x[0];
         let dy = self.band.y[1] - self.band.y[0];
-        let ds = dx.hypot(dy);
         let yaw0 = self.band.yaw[0];
-        let forward = (dx * yaw0.cos() + dy * yaw0.sin()).signum();
-        let a_max = constraints.max_linear_acceleration.abs().max(1e-6);
-        let v = (forward * ds / dt0).clamp(v_now - a_max * dt, v_now + a_max * dt);
         let w = normalize_angle(self.band.yaw[1] - self.band.yaw[0]) / dt0;
+        let a_max = constraints.max_linear_acceleration.abs().max(1e-6);
+
+        if holonomic {
+            let (bx, by) = world_to_body(dx, dy, yaw0);
+            let vx = (bx / dt0).clamp(v_now - a_max * dt, v_now + a_max * dt);
+            let vy = (by / dt0).clamp(vy_now - a_max * dt, vy_now + a_max * dt);
+            self.base.status.mode = "teb_holonomic".into();
+            let cmd = finalize_holonomic(vx, vy, w, constraints, &self.base.config, "TEB tracking");
+            self.last_v = if cmd.valid { vx } else { 0.0 };
+            self.last_vy = if cmd.valid { vy } else { 0.0 };
+            return cmd;
+        }
+
+        let ds = dx.hypot(dy);
+        let forward = (dx * yaw0.cos() + dy * yaw0.sin()).signum();
+        let v = (forward * ds / dt0).clamp(v_now - a_max * dt, v_now + a_max * dt);
 
         self.base.status.mode = "teb".into();
         let cmd = finalize(v, w, constraints, &self.base.config, prep.allow_reverse, "TEB tracking");
@@ -505,6 +529,7 @@ impl Controller for TebFollower {
     fn reset(&mut self) {
         self.set_path(Path::default());
         self.last_v = 0.0;
+        self.last_vy = 0.0;
     }
 
     fn get_type(&self) -> &'static str {
