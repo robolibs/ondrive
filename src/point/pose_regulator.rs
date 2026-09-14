@@ -6,7 +6,10 @@
 //! approached in reverse when allowed.
 
 use crate::controller::{Controller, ControllerBase, check_goal};
-use crate::core::kinematics::{can_turn_in_place, finalize, reverse_allowed, stop};
+use crate::core::kinematics::{
+    can_turn_in_place, finalize, finalize_holonomic, is_holonomic, reverse_allowed, stop,
+    world_to_body,
+};
 use crate::core::math::{normalize_angle, yaw_of};
 use crate::types::{Goal, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use std::f64::consts::PI;
@@ -56,6 +59,20 @@ impl Controller for PoseRegulatorFollower {
             return stop("Goal reached");
         }
         self.base.status.goal_reached = false;
+
+        if is_holonomic(constraints.steering_type) {
+            self.base.status.mode = "regulating_holonomic".into();
+            let (k_rho, k_alpha, _) = self.gains();
+            let dx = goal.target_pose.point.x - state.pose.point.x;
+            let dy = goal.target_pose.point.y - state.pose.point.y;
+            let rho = dx.hypot(dy);
+            let speed = (k_rho * rho).min(constraints.max_linear_velocity.abs());
+            let yaw = yaw_of(&state.pose);
+            let (ux, uy) = if rho > 1e-9 { (dx / rho, dy / rho) } else { (0.0, 0.0) };
+            let (vx, vy) = world_to_body(speed * ux, speed * uy, yaw);
+            let omega = k_alpha * check.yaw_error;
+            return finalize_holonomic(vx, vy, omega, constraints, &cfg, "Regulating to pose");
+        }
         if !can_turn_in_place(constraints.steering_type) {
             self.base.status.mode = "unsupported".into();
             return VelocityCommand::invalid("pose regulator needs a platform that can turn in place");

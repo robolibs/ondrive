@@ -6,8 +6,8 @@
 
 use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
-    can_turn_in_place, finalize, heading_speed_scale, is_ackermann, max_curvature, path_speed,
-    reverse_allowed,
+    can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, holonomic_point_command,
+    is_ackermann, is_holonomic, max_curvature, path_speed, reverse_allowed, world_to_body,
 };
 use crate::core::math::{heading_error, normalize_angle};
 use crate::core::obstacles::CollisionChecker;
@@ -129,6 +129,19 @@ impl Controller for RegulatedPursuitFollower {
             if let Some(cmd) = self.base.arrival(state, goal, constraints, false) {
                 return cmd;
             }
+            if is_holonomic(constraints.steering_type) {
+                self.base.status.mode = "rpp_goal_holonomic".into();
+                return holonomic_point_command(
+                    state.pose.point,
+                    yaw,
+                    goal.target_pose.point,
+                    goal.target_pose.rotation.to_euler().yaw,
+                    self.base.status.distance_to_goal,
+                    &cfg,
+                    constraints,
+                    "Moving to goal",
+                );
+            }
             let mut bearing = heading_error(&state.pose, goal.target_pose.point);
             let mut direction = 1.0;
             if allow_reverse && bearing.abs() > PI / 2.0 {
@@ -179,6 +192,52 @@ impl Controller for RegulatedPursuitFollower {
         let dx = target.x - rear.x;
         let dy = target.y - rear.y;
         let ld = dx.hypot(dy);
+
+        if is_holonomic(constraints.steering_type) {
+            self.base.status.cross_track_error = proj.lateral_error;
+            self.base.status.heading_error = normalize_angle(proj.heading - yaw);
+            self.base.status.goal_reached = false;
+
+            let nominal = speed_cap(&self.base.path.speeds, &proj)
+                .map_or(constraints.max_linear_velocity, |s| {
+                    s.min(constraints.max_linear_velocity)
+                });
+            let mut speed = path_speed(
+                nominal,
+                0.0,
+                self.base.status.distance_to_goal,
+                pos_tol,
+                cfg.kp_linear,
+                constraints,
+            );
+
+            let checker = CollisionChecker::new(world, constraints, 0.0);
+            let mut scale: f64 = 1.0;
+            if rpp.proximity_distance > 0.0 {
+                let c = checker.clearance(0, state.pose.point.x, state.pose.point.y, yaw);
+                if c < rpp.proximity_distance {
+                    scale = scale.min(c.max(0.0) / rpp.proximity_distance);
+                }
+            }
+            speed *= scale.max(rpp.min_speed_scale.clamp(0.0, 1.0));
+
+            let travel_heading = if ld > 1e-9 { dy.atan2(dx) } else { yaw };
+            if rpp.use_collision_check {
+                let stopping = speed * speed / (2.0 * constraints.max_linear_acceleration.abs().max(1e-6));
+                let check_len = (stopping + lookahead).max(0.3);
+                if Self::arc_collides(&checker, rear, travel_heading, 0.0, 1.0, check_len) {
+                    self.base.status.mode = "rpp_blocked_holonomic".into();
+                    return VelocityCommand::invalid("collision ahead on the commanded path");
+                }
+            }
+
+            let (ux, uy) = if ld > 1e-9 { (dx / ld, dy / ld) } else { (0.0, 0.0) };
+            let (vx, vy) = world_to_body(speed * ux, speed * uy, yaw);
+            let omega = cfg.kp_angular.max(0.1) * normalize_angle(proj.heading - yaw);
+            self.base.status.mode = "regulated_pursuit_holonomic".into();
+            return finalize_holonomic(vx, vy, omega, constraints, &cfg, "Following path");
+        }
+
         let alpha = normalize_angle(dy.atan2(dx) - yaw);
         let kappa = if ld > 1e-6 { 2.0 * alpha.sin() / ld } else { 0.0 };
 

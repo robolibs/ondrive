@@ -2,9 +2,11 @@
 //! `(v, omega)` pair becomes a `VelocityCommand`: curvature feasibility for
 //! Ackermann, reverse policy, saturation and output-unit conversion.
 
+use crate::core::math::normalize_angle;
 use crate::types::{
     ControllerConfig, OutputUnits, RobotConstraints, RobotState, SteeringType, VelocityCommand,
 };
+use datapod::Point;
 
 pub fn can_turn_in_place(steering: SteeringType) -> bool {
     !matches!(steering, SteeringType::Ackermann)
@@ -12,6 +14,13 @@ pub fn can_turn_in_place(steering: SteeringType) -> bool {
 
 pub fn is_ackermann(steering: SteeringType) -> bool {
     matches!(steering, SteeringType::Ackermann)
+}
+
+/// True for platforms that can translate in any body-frame direction
+/// independently of heading (omni/mecanum wheels), as opposed to a platform
+/// that can only drive along its own forward axis.
+pub fn is_holonomic(steering: SteeringType) -> bool {
+    matches!(steering, SteeringType::Holonomic)
 }
 
 pub fn reverse_allowed(cfg: &ControllerConfig, state: &RobotState) -> bool {
@@ -144,6 +153,92 @@ pub fn finalize(
         steering_angle,
         ..VelocityCommand::default()
     }
+}
+
+/// Build the final command for a holonomic platform from a body-frame
+/// `(vx, vy, omega)` triple: `vx` forward, `vy` left. Speed is clamped as a
+/// vector (direction preserved) to `max_linear_velocity`; `omega` is
+/// clamped independently to `max_angular_velocity`. Translation and
+/// rotation are otherwise uncoupled, unlike `finalize`.
+pub fn finalize_holonomic(
+    vx: f64,
+    vy: f64,
+    omega: f64,
+    constraints: &RobotConstraints,
+    cfg: &ControllerConfig,
+    message: &str,
+) -> VelocityCommand {
+    if !vx.is_finite() || !vy.is_finite() || !omega.is_finite() {
+        return VelocityCommand::invalid("non-finite command");
+    }
+    let max_speed = constraints.max_linear_velocity.abs();
+    let mag = vx.hypot(vy);
+    let scale = if mag > max_speed && mag > 1e-12 {
+        max_speed / mag
+    } else {
+        1.0
+    };
+    let vx = vx * scale;
+    let vy = vy * scale;
+    let w_max = constraints.max_angular_velocity.max(0.0);
+    let omega = omega.clamp(-w_max, w_max);
+
+    let (linear, lateral, angular) = match cfg.output_units {
+        OutputUnits::Physical => (vx, vy, omega),
+        OutputUnits::Normalized => (
+            if max_speed > 0.0 { vx / max_speed } else { 0.0 },
+            if max_speed > 0.0 { vy / max_speed } else { 0.0 },
+            if w_max > 0.0 { omega / w_max } else { 0.0 },
+        ),
+    };
+
+    VelocityCommand {
+        valid: true,
+        status_message: message.into(),
+        linear_velocity: linear,
+        angular_velocity: angular,
+        lateral_velocity: lateral,
+        steering_angle: 0.0,
+        ..VelocityCommand::default()
+    }
+}
+
+/// Rotate a world-frame vector into the body frame at `yaw`.
+pub fn world_to_body(dx: f64, dy: f64, yaw: f64) -> (f64, f64) {
+    let (s, c) = yaw.sin_cos();
+    (c * dx + s * dy, -s * dx + c * dy)
+}
+
+/// Straight-line holonomic point control: translate directly toward
+/// `target` at a speed shaped by `path_speed`, independently rotate toward
+/// `target_yaw`. The point-goal fallback shared by the path followers on a
+/// holonomic platform, where curvature-based geometry does not apply.
+#[allow(clippy::too_many_arguments)]
+pub fn holonomic_point_command(
+    from: Point,
+    yaw: f64,
+    target: Point,
+    target_yaw: f64,
+    dist_to_goal: f64,
+    cfg: &ControllerConfig,
+    constraints: &RobotConstraints,
+    message: &str,
+) -> VelocityCommand {
+    let dx = target.x - from.x;
+    let dy = target.y - from.y;
+    let d = dx.hypot(dy);
+    let speed = path_speed(
+        constraints.max_linear_velocity,
+        0.0,
+        dist_to_goal,
+        cfg.goal_tolerance,
+        cfg.kp_linear,
+        constraints,
+    );
+    let (ux, uy) = if d > 1e-9 { (dx / d, dy / d) } else { (0.0, 0.0) };
+    let (vx, vy) = world_to_body(speed * ux, speed * uy, yaw);
+    let omega = cfg.kp_angular.max(0.1) * normalize_angle(target_yaw - yaw);
+    finalize_holonomic(vx, vy, omega, constraints, cfg, message)
 }
 
 pub fn stop(message: &str) -> VelocityCommand {

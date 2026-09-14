@@ -8,7 +8,8 @@
 
 use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
-    can_turn_in_place, finalize, heading_speed_scale, path_speed, reverse_allowed,
+    can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, is_holonomic,
+    path_speed, reverse_allowed,
 };
 use crate::core::math::normalize_angle;
 use crate::core::path::{cumulative_lengths, curvature_at_projection, project, speed_cap};
@@ -116,6 +117,26 @@ impl Controller for LqrFollower {
         self.base.status.cross_track_error = e_lat;
         self.base.status.heading_error = theta_e;
         self.base.status.goal_reached = false;
+
+        if is_holonomic(constraints.steering_type) {
+            self.base.status.mode = "lqr_holonomic".into();
+            let kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cum, &proj);
+            let nominal = speed_cap(&self.base.path.speeds, &proj)
+                .map_or(constraints.max_linear_velocity, |v| {
+                    v.min(constraints.max_linear_velocity)
+                });
+            let forward = path_speed(
+                nominal,
+                kappa_path,
+                self.base.status.distance_to_goal,
+                pos_tol,
+                cfg.kp_linear,
+                constraints,
+            );
+            let lateral = -cfg.k_cross_track.max(1e-6) * e_lat;
+            let omega = cfg.kp_angular.max(0.1) * theta_e;
+            return finalize_holonomic(forward, lateral, omega, constraints, &cfg, "LQR tracking");
+        }
 
         if state.turn_first && can_turn_in_place(constraints.steering_type) && theta_e.abs() > ang_tol
         {

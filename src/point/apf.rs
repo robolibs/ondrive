@@ -5,8 +5,11 @@
 //! goal the controller stops and reports mode `apf_local_minimum`.
 
 use crate::controller::{Controller, ControllerBase};
-use crate::core::kinematics::{finalize, heading_speed_scale, reverse_allowed, stop};
-use crate::core::math::normalize_angle;
+use crate::core::kinematics::{
+    finalize, finalize_holonomic, heading_speed_scale, is_holonomic, reverse_allowed, stop,
+    world_to_body,
+};
+use crate::core::math::{normalize_angle, yaw_of};
 use crate::core::obstacles::{CollisionChecker, obstacle_at};
 use crate::types::{Goal, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use std::f64::consts::PI;
@@ -113,6 +116,16 @@ impl Controller for ApfFollower {
             self.base.status.mode = "apf_local_minimum".into();
             return stop("APF local minimum");
         }
+        let dist = self.base.status.distance_to_goal;
+        if is_holonomic(constraints.steering_type) {
+            self.base.status.mode = "apf_holonomic".into();
+            let speed =
+                (cfg.kp_linear.max(0.1) * dist).min(constraints.max_linear_velocity) * magnitude.min(1.0);
+            let (ux, uy) = (fx / magnitude, fy / magnitude);
+            let (vx, vy) = world_to_body(speed * ux, speed * uy, yaw);
+            let omega = cfg.kp_angular.max(0.1) * normalize_angle(yaw_of(&goal.target_pose) - yaw);
+            return finalize_holonomic(vx, vy, omega, constraints, &cfg, "Following potential field");
+        }
         let mut err = normalize_angle(fy.atan2(fx) - yaw);
         let mut direction = 1.0;
         if allow_reverse && err.abs() > PI / 2.0 {
@@ -120,7 +133,6 @@ impl Controller for ApfFollower {
             err = normalize_angle(err + PI);
         }
         self.base.status.heading_error = err;
-        let dist = self.base.status.distance_to_goal;
         let v = direction
             * (cfg.kp_linear.max(0.1) * dist).min(constraints.max_linear_velocity)
             * heading_speed_scale(err, constraints)

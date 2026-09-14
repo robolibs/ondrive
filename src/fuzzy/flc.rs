@@ -6,8 +6,8 @@
 
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::{
-    can_turn_in_place, finalize, heading_speed_scale, is_ackermann, path_speed,
-    steering_to_curvature,
+    can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, is_ackermann,
+    is_holonomic, path_speed, steering_to_curvature,
 };
 use crate::core::path::{PathCursor, curvature_at_projection, speed_cap};
 use crate::pred::mppi::prepare;
@@ -201,6 +201,12 @@ impl Controller for FlcFollower {
         } else {
             u * flc.max_steering + v * kappa_path
         };
+
+        if is_holonomic(constraints.steering_type) {
+            self.base.status.mode = "flc_holonomic".into();
+            let lateral = -cfg.k_cross_track.max(1e-6) * e_lat;
+            return finalize_holonomic(v, lateral, omega, constraints, &cfg, "FLC tracking");
+        }
 
         self.base.status.mode = "flc".into();
         finalize(v, omega, constraints, &cfg, prep.allow_reverse, "FLC tracking")

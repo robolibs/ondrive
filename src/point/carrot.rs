@@ -3,9 +3,10 @@
 
 use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
-    can_turn_in_place, finalize, heading_speed_scale, reverse_allowed, unreachable_arc_speed_floor,
+    can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, is_holonomic,
+    reverse_allowed, unreachable_arc_speed_floor, world_to_body,
 };
-use crate::core::math::{heading_error, normalize_angle};
+use crate::core::math::{heading_error, normalize_angle, yaw_of};
 use crate::types::{Goal, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use std::f64::consts::PI;
 
@@ -17,6 +18,43 @@ pub struct CarrotFollower {
 impl CarrotFollower {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Holonomic point control: proportional translation toward the goal
+    /// position and independent proportional rotation toward the goal
+    /// orientation, transformed into the body frame at the end.
+    fn compute_holonomic(
+        &mut self,
+        state: &RobotState,
+        goal: &Goal,
+        constraints: &RobotConstraints,
+        cfg: &crate::types::ControllerConfig,
+    ) -> VelocityCommand {
+        let dx = goal.target_pose.point.x - state.pose.point.x;
+        let dy = goal.target_pose.point.y - state.pose.point.y;
+        let distance = dx.hypot(dy);
+        let orientation_err = normalize_angle(yaw_of(&goal.target_pose) - yaw_of(&state.pose));
+
+        self.base.status.distance_to_goal = distance;
+        self.base.status.heading_error = orientation_err;
+        self.base.status.cross_track_error = 0.0;
+        self.base.status.goal_reached = false;
+        self.base.status.mode = "carrot_holonomic".into();
+
+        let carrot = cfg.lookahead_distance.max(1e-3);
+        let speed = (cfg.kp_linear * distance.min(carrot) * (distance / carrot).min(1.0).sqrt()
+            + cfg.kp_linear * (distance - carrot).max(0.0))
+        .max(0.0);
+        let omega = cfg.kp_angular * orientation_err;
+
+        let yaw = yaw_of(&state.pose);
+        let (ux, uy) = if distance > 1e-9 {
+            (dx / distance, dy / distance)
+        } else {
+            (0.0, 0.0)
+        };
+        let (vx, vy) = world_to_body(speed * ux, speed * uy, yaw);
+        finalize_holonomic(vx, vy, omega, constraints, cfg, "Chasing carrot")
     }
 }
 
@@ -37,6 +75,10 @@ impl Controller for CarrotFollower {
 
         if let Some(cmd) = self.base.arrival(state, goal, constraints, false) {
             return cmd;
+        }
+
+        if is_holonomic(constraints.steering_type) {
+            return self.compute_holonomic(state, goal, constraints, &cfg);
         }
 
         let distance = state.pose.point.distance_to_2d(goal.target_pose.point);

@@ -30,11 +30,30 @@ and all emitting the same body-frame twist.
 |                     | **TEB**                  | Timed Elastic Band with non-holonomic residual, projected GD on Δt_i  |
 | Fuzzy               | **FLC**                  | Mamdani, 7 triangular terms, 49-rule additive base, curvature FF      |
 
-All controllers accept the four kinematic models through `SteeringType`:
-differential, Ackermann, holonomic, skid-steer. Obstacle-aware controllers
-(MCA, SOC, DWA, TEB, RegulatedPursuit, PoseReach, APF) consume
-`WorldConstraints`: Gaussian-mode obstacle predictions and/or an occupancy
-grid, through one footprint-aware collision checker.
+All controllers accept the four kinematic models through `SteeringType`.
+Three families of motion model back them:
+
+- **Ackermann** — the true bicycle model. A single virtual front wheel,
+  curvature `= tan(steer) / wheelbase`, integrated at the rear axle
+  (offset by `rear_wheelbase`), steering and turning-radius limits enforced
+  by `finalize`.
+- **Differential / SkidSteer** — the unicycle model. `v` and `omega` are
+  commanded independently with no wheelbase constraint; the platform can
+  turn in place.
+- **Holonomic** — full `(vx, vy, omega)` body-frame control, translation and
+  rotation fully decoupled, output through `finalize_holonomic` /
+  `VelocityCommand::lateral_velocity`. Supported end to end by the point
+  controllers (PID, Carrot, PoseRegulator, APF) and the geometric path
+  followers (Pure Pursuit, RegulatedPursuit, VectorPursuit, Stanley, LQR,
+  Kanayama, FLC), plus DWA's sampling window. The optimal-control family
+  that shares one 2-control kinematic core (MPC, iLQR, MPPI, MCA, SOC,
+  TEB) and PoseReach's curve planner do not yet exploit strafing on a
+  holonomic platform — they still produce valid, safe commands, just as
+  the unicycle subset of holonomic motion (see `PLAN.md` round 4).
+
+Obstacle-aware controllers (MCA, SOC, DWA, TEB, RegulatedPursuit, PoseReach,
+APF) consume `WorldConstraints`: Gaussian-mode obstacle predictions and/or
+an occupancy grid, through one footprint-aware collision checker.
 
 ## Command contract
 
@@ -44,6 +63,8 @@ regardless of algorithm or steering type:
 - `linear_velocity` is the body forward speed (m/s), negative when reversing.
 - `angular_velocity` is the body yaw rate (rad/s). Integrating
   `yaw += angular_velocity * dt` is always correct.
+- `lateral_velocity` is the body leftward speed (m/s); zero except from a
+  holonomic-capable controller with `SteeringType::Holonomic`.
 - `steering_angle` is the equivalent Ackermann front-wheel angle (rad),
   consistent with the two values above; zero for other steering types.
 - Ackermann commands never exceed the curvature allowed by

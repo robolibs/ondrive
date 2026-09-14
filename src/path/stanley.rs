@@ -4,8 +4,9 @@
 
 use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
-    can_turn_in_place, finalize, heading_speed_scale, is_ackermann, path_speed, reverse_allowed,
-    steering_limit, steering_to_curvature, wheelbase,
+    can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, holonomic_point_command,
+    is_ackermann, is_holonomic, path_speed, reverse_allowed, steering_limit, steering_to_curvature,
+    wheelbase,
 };
 use crate::core::math::{heading_error, normalize_angle};
 use crate::core::path::{
@@ -57,6 +58,20 @@ impl StanleyFollower {
         allow_reverse: bool,
     ) -> VelocityCommand {
         let cfg = self.base.config.clone();
+        if is_holonomic(constraints.steering_type) {
+            self.base.status.mode = "stanley_goal_holonomic".into();
+            let yaw = state.pose.rotation.to_euler().yaw;
+            return holonomic_point_command(
+                state.pose.point,
+                yaw,
+                goal.target_pose.point,
+                goal.target_pose.rotation.to_euler().yaw,
+                self.base.status.distance_to_goal,
+                &cfg,
+                constraints,
+                "Moving to goal",
+            );
+        }
         let mut bearing = heading_error(&state.pose, goal.target_pose.point);
         let mut direction = 1.0;
         if allow_reverse && bearing.abs() > PI / 2.0 {
@@ -132,6 +147,33 @@ impl Controller for StanleyFollower {
         let passed_end = proj.beyond_end && proj.distance < 2.0 * pos_tol;
         if let Some(cmd) = self.base.arrival(state, goal, constraints, passed_end) {
             return cmd;
+        }
+
+        if is_holonomic(constraints.steering_type) {
+            let theta_e = normalize_angle(proj.heading - yaw);
+            self.base.status.cross_track_error = proj.lateral_error;
+            self.base.status.heading_error = theta_e;
+            self.base.status.goal_reached = false;
+            self.base.status.mode = "stanley_holonomic".into();
+
+            let kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cum, &proj);
+            let nominal = speed_cap(&self.base.path.speeds, &proj)
+                .map_or(constraints.max_linear_velocity, |v| {
+                    v.min(constraints.max_linear_velocity)
+                });
+            let forward = path_speed(
+                nominal,
+                kappa_path,
+                self.base.status.distance_to_goal,
+                pos_tol,
+                cfg.kp_linear,
+                constraints,
+            );
+            // Strafe directly against the lateral error (positive = robot
+            // left of the path, so a negative vy pulls it back on line).
+            let lateral = -cfg.k_cross_track * proj.lateral_error;
+            let omega = cfg.kp_angular.max(0.1) * theta_e;
+            return finalize_holonomic(forward, lateral, omega, constraints, &cfg, "Following path");
         }
 
         let mut theta_e = normalize_angle(proj.heading - yaw);

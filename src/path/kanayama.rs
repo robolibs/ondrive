@@ -6,7 +6,7 @@
 //! from a point a short preview ahead of the projection on the path.
 
 use crate::controller::{Controller, ControllerBase};
-use crate::core::kinematics::{finalize, path_speed};
+use crate::core::kinematics::{finalize, finalize_holonomic, is_holonomic, path_speed};
 use crate::core::math::{normalize_angle, yaw_of};
 use crate::core::path::{PathCursor, curvature_at_projection, sample, speed_cap};
 use crate::pred::mppi::prepare;
@@ -79,6 +79,21 @@ impl Controller for KanayamaFollower {
         let e_y = -s * dx + c * dy;
         let e_theta = normalize_angle(yaw_r - yaw);
         let (k_x, k_y, k_theta) = self.gains();
+
+        if is_holonomic(constraints.steering_type) {
+            // e_x, e_y, e_theta are already body-frame errors against the
+            // moving reference, so translation and rotation correct
+            // independently with no coupling term needed.
+            let vx = v_r * e_theta.cos() + k_x * e_x;
+            let vy = k_y * e_y;
+            let omega = omega_r + k_theta * e_theta.sin();
+            self.base.status.mode = if self.trajectory.is_some() {
+                "kanayama_timed_holonomic".into()
+            } else {
+                "kanayama_holonomic".into()
+            };
+            return finalize_holonomic(vx, vy, omega, constraints, &cfg, "Kanayama tracking");
+        }
 
         let v = v_r * e_theta.cos() + k_x * e_x;
         let omega = omega_r + v_r.abs() * (k_y * e_y + k_theta * e_theta.sin());

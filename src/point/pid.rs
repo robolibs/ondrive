@@ -4,9 +4,10 @@
 
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::{
-    can_turn_in_place, finalize, heading_speed_scale, reverse_allowed, unreachable_arc_speed_floor,
+    can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, is_holonomic,
+    reverse_allowed, unreachable_arc_speed_floor, world_to_body,
 };
-use crate::core::math::{heading_error, normalize_angle};
+use crate::core::math::{heading_error, normalize_angle, yaw_of};
 use crate::types::{Goal, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
 use std::f64::consts::PI;
@@ -48,6 +49,76 @@ impl PidFollower {
             self.last_goal = Some(p);
         }
     }
+
+    /// Holonomic point control: translation (toward the goal position) and
+    /// rotation (toward the goal orientation) are independent PID loops,
+    /// each transformed into the body frame at the end.
+    fn compute_holonomic(
+        &mut self,
+        state: &RobotState,
+        goal: &Goal,
+        constraints: &RobotConstraints,
+        dt: f64,
+        cfg: &crate::types::ControllerConfig,
+    ) -> VelocityCommand {
+        let dx = goal.target_pose.point.x - state.pose.point.x;
+        let dy = goal.target_pose.point.y - state.pose.point.y;
+        let distance = dx.hypot(dy);
+        let orientation_err = normalize_angle(yaw_of(&goal.target_pose) - yaw_of(&state.pose));
+
+        self.linear_integral = clamped_integral(
+            self.linear_integral,
+            distance,
+            dt,
+            cfg.ki_linear,
+            constraints.max_linear_velocity,
+        );
+        let linear_derivative = if self.has_last {
+            (distance - self.last_distance_error) / dt
+        } else {
+            0.0
+        };
+        let speed = (cfg.kp_linear * distance
+            + cfg.ki_linear * self.linear_integral
+            + cfg.kd_linear * linear_derivative)
+            .max(0.0);
+
+        self.angular_integral = clamped_integral(
+            self.angular_integral,
+            orientation_err,
+            dt,
+            cfg.ki_angular,
+            constraints.max_angular_velocity,
+        );
+        let angular_derivative = if self.has_last {
+            normalize_angle(orientation_err - self.last_heading_error) / dt
+        } else {
+            0.0
+        };
+        let omega = cfg.kp_angular * orientation_err
+            + cfg.ki_angular * self.angular_integral
+            + cfg.kd_angular * angular_derivative;
+
+        self.last_distance_error = distance;
+        self.last_heading_error = orientation_err;
+        self.has_last = true;
+        self.last_direction = 1.0;
+
+        self.base.status.distance_to_goal = distance;
+        self.base.status.heading_error = orientation_err;
+        self.base.status.cross_track_error = 0.0;
+        self.base.status.goal_reached = false;
+        self.base.status.mode = "tracking_holonomic".into();
+
+        let yaw = yaw_of(&state.pose);
+        let (ux, uy) = if distance > 1e-9 {
+            (dx / distance, dy / distance)
+        } else {
+            (0.0, 0.0)
+        };
+        let (vx, vy) = world_to_body(speed * ux, speed * uy, yaw);
+        finalize_holonomic(vx, vy, omega, constraints, cfg, "Tracking goal")
+    }
 }
 
 fn clamped_integral(acc: f64, err: f64, dt: f64, gain: f64, output_limit: f64) -> f64 {
@@ -79,6 +150,10 @@ impl Controller for PidFollower {
         if let Some(cmd) = self.base.arrival(state, goal, constraints, false) {
             self.clear_loops();
             return cmd;
+        }
+
+        if is_holonomic(constraints.steering_type) {
+            return self.compute_holonomic(state, goal, constraints, dt, &cfg);
         }
 
         let distance = state.pose.point.distance_to_2d(goal.target_pose.point);
