@@ -48,8 +48,7 @@ Three families of motion model back them:
   Stanley, LQR, Kanayama, FLC), DWA's sampling window, the shared
   3-control/5-state predictive core (MPC, iLQR, MPPI, MCA, SOC), TEB, and
   PoseReach, which bypasses its Reeds-Shepp/Dubins planner entirely on a
-  holonomic platform and translates/rotates straight to the goal (see
-  `PLAN.md` round 4).
+  holonomic platform and translates/rotates straight to the goal.
 
 Obstacle-aware controllers (MCA, SOC, DWA, TEB, RegulatedPursuit, PoseReach,
 APF) consume `WorldConstraints`: Gaussian-mode obstacle predictions and/or
@@ -315,8 +314,6 @@ make build              # cargo build --lib
 make test               # cargo test --all-targets
 make bind               # regenerate the C header + build the Python wheel
 ```
-
-See [`PLAN.md`](PLAN.md) for the controller roadmap.
 
 ## Status
 

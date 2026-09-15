@@ -47,3 +47,87 @@ approx = "0.5"
 [[bench]]
 name = "tick"
 harness = false
+
+[[example]]
+name = "apf"
+path = "examples/rust/apf.rs"
+
+[[example]]
+name = "carrot"
+path = "examples/rust/carrot.rs"
+
+[[example]]
+name = "dwa"
+path = "examples/rust/dwa.rs"
+
+[[example]]
+name = "flc"
+path = "examples/rust/flc.rs"
+
+[[example]]
+name = "ilc"
+path = "examples/rust/ilc.rs"
+
+[[example]]
+name = "ilqr"
+path = "examples/rust/ilqr.rs"
+
+[[example]]
+name = "kanayama"
+path = "examples/rust/kanayama.rs"
+
+[[example]]
+name = "lqr"
+path = "examples/rust/lqr.rs"
+
+[[example]]
+name = "mca"
+path = "examples/rust/mca.rs"
+
+[[example]]
+name = "mpc"
+path = "examples/rust/mpc.rs"
+
+[[example]]
+name = "mppi"
+path = "examples/rust/mppi.rs"
+
+[[example]]
+name = "pid"
+path = "examples/rust/pid.rs"
+
+[[example]]
+name = "pose_reach"
+path = "examples/rust/pose_reach.rs"
+
+[[example]]
+name = "pose_regulator"
+path = "examples/rust/pose_regulator.rs"
+
+[[example]]
+name = "pure"
+path = "examples/rust/pure.rs"
+
+[[example]]
+name = "rpp"
+path = "examples/rust/rpp.rs"
+
+[[example]]
+name = "soc"
+path = "examples/rust/soc.rs"
+
+[[example]]
+name = "stan"
+path = "examples/rust/stan.rs"
+
+[[example]]
+name = "teb"
+path = "examples/rust/teb.rs"
+
+[[example]]
+name = "vector"
+path = "examples/rust/vector.rs"
+
+[[example]]
+name = "verify"
+path = "examples/rust/verify.rs"
