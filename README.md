@@ -121,7 +121,7 @@ at constant speed.
 
 ```toml
 [dependencies]
-ondrive = { git = "https://codeberg.org/robolibs/ondrive.git" }
+ondrive = { git = "https://github.com/robolibs/ondrive" }
 ```
 
 The crate depends on the sibling `datapod` crate for geometry types.
