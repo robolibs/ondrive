@@ -1,13 +1,23 @@
-use crate::controller::Controller;
+use crate::controller::{Controller, check_goal};
+use crate::core::kinematics::stop;
+use crate::core::obstacles::CollisionChecker;
+use crate::core::path::{PathCursor, end_heading, segment_heading};
 use crate::fuzzy::FlcFollower;
-use crate::path::{LqrFollower, PurePursuitFollower, StanleyFollower};
-use crate::point::{CarrotFollower, PidFollower};
-use crate::pred::{DwaFollower, McaFollower, MpcFollower, MppiFollower, SocFollower, TebFollower};
-use crate::types::{
-    ControllerConfig, ControllerStatus, Goal, Path, RobotConstraints, RobotState, VelocityCommand,
-    WorldConstraints,
+use crate::path::{
+    IlcFollower, KanayamaFollower, LqrFollower, PurePursuitFollower, RegulatedPursuitFollower,
+    StanleyFollower, VectorPursuitFollower,
 };
-use datapod::{Point, Pose, Quaternion};
+use crate::point::{
+    ApfFollower, CarrotFollower, PidFollower, PoseReachFollower, PoseRegulatorFollower,
+};
+use crate::pred::{
+    DwaFollower, IlqrFollower, McaFollower, MpcFollower, MppiFollower, SocFollower, TebFollower,
+};
+use crate::types::{
+    ControllerConfig, ControllerStatus, Goal, Path, RobotConstraints, RobotState, Trajectory,
+    VelocityCommand, WorldConstraints,
+};
+use datapod::{Euler, Point, Pose, Quaternion};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TrackerKind {
@@ -23,6 +33,22 @@ pub enum TrackerKind {
     Dwa,
     Teb,
     Flc,
+    RegulatedPursuit,
+    PoseReach,
+    Ilqr,
+    PoseRegulator,
+    VectorPursuit,
+    Kanayama,
+    Apf,
+    Ilc,
+}
+
+impl TrackerKind {
+    /// Point-to-point controllers are driven through a path waypoint by
+    /// waypoint by the tracker; path followers consume the whole path.
+    pub fn is_point_controller(self) -> bool {
+        matches!(self, TrackerKind::Pid | TrackerKind::Carrot | TrackerKind::Dwa | TrackerKind::PoseReach | TrackerKind::PoseRegulator | TrackerKind::Apf)
+    }
 }
 
 pub struct Tracker {
@@ -31,6 +57,13 @@ pub struct Tracker {
     constraints: RobotConstraints,
     goal: Option<Goal>,
     path: Option<Path>,
+    cursor: PathCursor,
+    waypoint_index: usize,
+    projection_segment: usize,
+    path_completed: bool,
+    trajectory: Option<Trajectory>,
+    clock: f64,
+    clock_origin: Option<f64>,
 }
 
 impl Tracker {
@@ -42,6 +75,13 @@ impl Tracker {
             constraints: RobotConstraints::default(),
             goal: None,
             path: None,
+            cursor: PathCursor::default(),
+            waypoint_index: 0,
+            projection_segment: 0,
+            path_completed: false,
+            trajectory: None,
+            clock: 0.0,
+            clock_origin: None,
         }
     }
 
@@ -76,7 +116,14 @@ impl Tracker {
     }
 
     pub fn set_path(&mut self, path: Path) {
+        self.trajectory = None;
+        self.clock = 0.0;
+        self.clock_origin = None;
+        self.cursor.set_path(&path.waypoints);
         self.path = Some(path.clone());
+        self.waypoint_index = 0;
+        self.projection_segment = 0;
+        self.path_completed = false;
         self.controller.set_path(path);
     }
 
@@ -84,8 +131,38 @@ impl Tracker {
         self.path.as_ref()
     }
 
+    /// Install a timed trajectory. Its poses become the path; the tracker
+    /// clock restarts and advances by `dt` every tick (or follows
+    /// `RobotState::timestamp` when that is provided and increasing).
+    pub fn set_trajectory(&mut self, trajectory: Trajectory) {
+        self.cursor.set_path(&trajectory.poses);
+        self.path = Some(trajectory.to_path());
+        self.waypoint_index = 0;
+        self.projection_segment = 0;
+        self.path_completed = false;
+        self.clock = 0.0;
+        self.clock_origin = None;
+        self.controller.set_trajectory(trajectory.clone());
+        self.trajectory = Some(trajectory);
+    }
+
+    pub fn trajectory(&self) -> Option<&Trajectory> {
+        self.trajectory.as_ref()
+    }
+
+    /// Seconds elapsed on the installed trajectory.
+    pub fn trajectory_time(&self) -> f64 {
+        self.clock
+    }
+
     pub fn clear_path(&mut self) {
         self.path = None;
+        self.trajectory = None;
+        self.clock = 0.0;
+        self.clock_origin = None;
+        self.waypoint_index = 0;
+        self.projection_segment = 0;
+        self.path_completed = false;
         self.controller.set_path(Path::default());
     }
 
@@ -101,26 +178,156 @@ impl Tracker {
         self.controller.get_status()
     }
 
-    pub fn reset(&mut self) {
-        self.controller.reset();
+    pub fn controller(&self) -> &dyn Controller {
+        self.controller.as_ref()
     }
 
+    pub fn controller_mut(&mut self) -> &mut dyn Controller {
+        self.controller.as_mut()
+    }
+
+    pub fn reset(&mut self) {
+        self.controller.reset();
+        self.waypoint_index = 0;
+        self.path_completed = false;
+    }
+
+    /// One control period. Order of precedence:
+    /// 1. `dt` must be positive and finite;
+    /// 2. `allow_move == false` yields a valid zero command;
+    /// 3. an explicit goal is used as-is; otherwise a goal is derived from
+    ///    the path (the current waypoint for point controllers, the path
+    ///    end for path followers);
+    /// 4. with neither goal nor path the command is invalid.
     pub fn tick(
         &mut self,
         state: &RobotState,
         dt: f64,
         world: Option<&WorldConstraints>,
     ) -> VelocityCommand {
-        let Some(goal) = self.goal.as_ref() else {
-            return VelocityCommand::invalid("no goal set");
+        if !(dt.is_finite() && dt > 0.0) {
+            return VelocityCommand::invalid("dt must be positive and finite");
+        }
+        if !state.allow_move {
+            return stop("Movement disabled");
+        }
+        if self.trajectory.is_some() {
+            if state.timestamp > 0.0 {
+                let origin = *self.clock_origin.get_or_insert(state.timestamp);
+                self.clock = (state.timestamp - origin).max(self.clock);
+            } else {
+                self.clock += dt;
+            }
+            self.controller.set_time(self.clock);
+        }
+
+        let goal = match self.resolve_goal(state, world) {
+            Ok(Some(g)) => g,
+            Ok(None) => return stop("Path completed"),
+            Err(msg) => return VelocityCommand::invalid(msg),
         };
-        self.controller
-            .compute_control(state, goal, &self.constraints, dt, world)
+
+        let cmd = self
+            .controller
+            .compute_control(state, &goal, &self.constraints, dt, world);
+
+        if self.goal.is_none() && self.path.is_some() && self.controller.get_status().goal_reached
+        {
+            self.path_completed = true;
+        }
+        cmd
+    }
+
+    fn resolve_goal(
+        &mut self,
+        state: &RobotState,
+        world: Option<&WorldConstraints>,
+    ) -> Result<Option<Goal>, &'static str> {
+        if let Some(g) = &self.goal {
+            return Ok(Some(g.clone()));
+        }
+        let Some(path) = self.path.as_ref() else {
+            return Err("no goal set");
+        };
+        if path.waypoints.is_empty() {
+            return Err("path is empty");
+        }
+        if self.path_completed {
+            return Ok(None);
+        }
+        let cfg = self.controller.get_config();
+
+        if self.kind.is_point_controller() {
+            let n = path.waypoints.len();
+            let hint = self.projection_segment.min(n.saturating_sub(2));
+            let Some(proj) = self.cursor.project(&path.waypoints, state.pose.point, hint) else {
+                return Err("path is empty");
+            };
+            self.projection_segment = proj.segment;
+            let cum = &self.cursor.cum;
+            let tol = cfg.goal_tolerance;
+            let ahead = cfg.lookahead_distance.max(2.0 * tol);
+            let s_target = proj.arc_length + ahead;
+            let mut idx = cum
+                .iter()
+                .position(|s| *s >= s_target - 1e-9)
+                .unwrap_or(n - 1)
+                .max(proj.segment + 1)
+                .min(n - 1);
+            if world.is_some() {
+                let checker = CollisionChecker::new(world, &self.constraints, WAYPOINT_MARGIN);
+                while idx + 1 < n && blocked(&path.waypoints, idx, &checker) {
+                    idx += 1;
+                }
+            }
+            let last = idx + 1 >= n;
+            let wp = path.waypoints[idx];
+            let yaw = if last {
+                end_heading(&path.waypoints)
+            } else {
+                segment_heading(&path.waypoints, idx)
+            };
+            self.waypoint_index = idx;
+            return Ok(Some(Goal {
+                target_pose: Pose {
+                    point: wp.point,
+                    rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, yaw)),
+                },
+                target_velocity: None,
+                tolerance_position: tol,
+                tolerance_orientation: if last {
+                    cfg.angular_tolerance
+                } else {
+                    std::f64::consts::PI
+                },
+            }));
+        }
+
+        let last = *path.waypoints.last().unwrap();
+        Ok(Some(Goal {
+            target_pose: Pose {
+                point: last.point,
+                rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, end_heading(&path.waypoints))),
+            },
+            target_velocity: None,
+            tolerance_position: cfg.goal_tolerance,
+            tolerance_orientation: cfg.angular_tolerance,
+        }))
+    }
+
+    /// Planned trajectory of the underlying controller, if it predicts one.
+    pub fn predicted_trajectory(&self) -> Vec<Point> {
+        self.controller.predicted_trajectory()
     }
 
     /// True if the last tick put the controller in the goal-reached state.
     pub fn is_goal_reached(&self) -> bool {
         self.controller.get_status().goal_reached
+    }
+
+    /// True once a path driven without an explicit goal has been consumed.
+    pub fn is_path_completed(&self) -> bool {
+        self.path_completed
     }
 
     /// The point the tracker is currently aiming at: the active goal's
@@ -131,11 +338,19 @@ impl Tracker {
             return Some(g.target_pose.point);
         }
         let path = self.path.as_ref()?;
-        let idx = self
-            .controller
-            .get_path_index()
-            .min(path.waypoints.len().saturating_sub(1));
+        let idx = if self.kind.is_point_controller() {
+            self.waypoint_index
+        } else {
+            self.controller.get_path_index()
+        }
+        .min(path.waypoints.len().saturating_sub(1));
         Some(path.waypoints.get(idx)?.point)
+    }
+
+    /// Distance from `pose` to the active goal, if any.
+    pub fn distance_to_goal(&self, pose: &Pose) -> Option<f64> {
+        let g = self.goal.as_ref()?;
+        Some(check_goal(pose, g, &self.controller.get_config()).distance)
     }
 
     /// Clear the goal and path, reset the controller, and return a safe
@@ -144,11 +359,7 @@ impl Tracker {
         self.clear_goal();
         self.clear_path();
         self.controller.reset();
-        VelocityCommand {
-            valid: true,
-            status_message: "Emergency stop".into(),
-            ..VelocityCommand::default()
-        }
+        stop("Emergency stop")
     }
 
     /// Densify the current path by inserting interpolated poses so that
@@ -162,16 +373,22 @@ impl Tracker {
         if path.waypoints.len() < 2 || max_segment_m <= 0.0 {
             return;
         }
-
-        let densified = densify_path(&path.waypoints, max_segment_m);
-        path.waypoints = densified;
+        smoothen_path(path, max_segment_m);
+        self.cursor.set_path(&path.waypoints);
+        self.waypoint_index = 0;
+        self.projection_segment = 0;
         self.controller.set_path(path.clone());
     }
 }
 
-fn densify_path(waypoints: &[Pose], max_segment_m: f64) -> Vec<Pose> {
+fn densify_path(waypoints: &[Pose], speeds: &[f64], max_segment_m: f64) -> (Vec<Pose>, Vec<f64>) {
     let mut out = Vec::with_capacity(waypoints.len() * 2);
+    let mut out_speeds = Vec::new();
+    let has_speeds = speeds.len() == waypoints.len();
     out.push(waypoints[0]);
+    if has_speeds {
+        out_speeds.push(speeds[0]);
+    }
     for i in 0..waypoints.len() - 1 {
         let start = waypoints[i];
         let end = waypoints[i + 1];
@@ -193,15 +410,19 @@ fn densify_path(waypoints: &[Pose], max_segment_m: f64) -> Vec<Pose> {
                 point: p,
                 rotation: rot,
             });
+            if has_speeds {
+                out_speeds.push(speeds[i] + t * (speeds[i + 1] - speeds[i]));
+            }
         }
         out.push(end);
+        if has_speeds {
+            out_speeds.push(speeds[i + 1]);
+        }
     }
-    out
+    (out, out_speeds)
 }
 
 fn slerp(a: Quaternion, b: Quaternion, t: f64) -> Quaternion {
-    // Spherical linear interpolation between unit quaternions. We hand-roll
-    // it so we don't assume a particular helper on the datapod side.
     let mut cos_half = a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z;
     let (bw, bx, by, bz) = if cos_half < 0.0 {
         cos_half = -cos_half;
@@ -211,7 +432,6 @@ fn slerp(a: Quaternion, b: Quaternion, t: f64) -> Quaternion {
     };
 
     if cos_half > 0.9995 {
-        // Linear fall-back when quaternions are nearly identical.
         let w = a.w + t * (bw - a.w);
         let x = a.x + t * (bx - a.x);
         let y = a.y + t * (by - a.y);
@@ -238,11 +458,16 @@ fn slerp(a: Quaternion, b: Quaternion, t: f64) -> Quaternion {
 }
 
 /// Free-function path densification for callers that don't use `Tracker`.
+/// Per-waypoint speeds are interpolated when present.
 pub fn smoothen_path(path: &mut Path, max_segment_m: f64) {
     if path.waypoints.len() < 2 || max_segment_m <= 0.0 {
         return;
     }
-    path.waypoints = densify_path(&path.waypoints, max_segment_m);
+    let (wps, speeds) = densify_path(&path.waypoints, &path.speeds, max_segment_m);
+    path.waypoints = wps;
+    if !speeds.is_empty() {
+        path.speeds = speeds;
+    }
 }
 
 fn make_controller(kind: TrackerKind) -> Box<dyn Controller> {
@@ -259,5 +484,23 @@ fn make_controller(kind: TrackerKind) -> Box<dyn Controller> {
         TrackerKind::Dwa => Box::new(DwaFollower::new()),
         TrackerKind::Teb => Box::new(TebFollower::new()),
         TrackerKind::Flc => Box::new(FlcFollower::new()),
+        TrackerKind::RegulatedPursuit => Box::new(RegulatedPursuitFollower::new()),
+        TrackerKind::PoseReach => Box::new(PoseReachFollower::new()),
+        TrackerKind::Ilqr => Box::new(IlqrFollower::new()),
+        TrackerKind::PoseRegulator => Box::new(PoseRegulatorFollower::new()),
+        TrackerKind::VectorPursuit => Box::new(VectorPursuitFollower::new()),
+        TrackerKind::Kanayama => Box::new(KanayamaFollower::new()),
+        TrackerKind::Apf => Box::new(ApfFollower::new()),
+        TrackerKind::Ilc => Box::new(IlcFollower::default()),
     }
+}
+
+/// Safety margin around obstacles when choosing a waypoint target.
+const WAYPOINT_MARGIN: f64 = 0.3;
+
+/// True when the robot footprint placed at waypoint `idx` collides now.
+fn blocked(waypoints: &[Pose], idx: usize, checker: &CollisionChecker) -> bool {
+    let p = waypoints[idx].point;
+    let heading = segment_heading(waypoints, idx.min(waypoints.len().saturating_sub(2)));
+    checker.collides(0, p.x, p.y, heading)
 }

@@ -1,0 +1,42 @@
+//! SOC demo: a differential robot on a sine path with an obstacle beside
+//! the path. Obstacle in red, plan in magenta.
+
+#[path = "common/viz.rs"]
+mod viz;
+#[path = "common/demo.rs"]
+mod demo;
+
+use ondrive::{SteeringType, TrackerKind};
+
+fn static_obstacle(x: f64, y: f64, radius: f64) -> ondrive::Obstacle {
+    ondrive::Obstacle {
+        id: 0,
+        radius,
+        modes: vec![ondrive::GaussianMode {
+            weight: 1.0,
+            mean_x: vec![x; 40],
+            mean_y: vec![y; 40],
+            std_x: vec![0.05; 40],
+            std_y: vec![0.05; 40],
+        }],
+    }
+}
+
+fn main() {
+    let y = (8.0_f64 * 0.35).sin() * 1.2 + 0.4;
+    let world = ondrive::WorldConstraints {
+        obstacles: vec![static_obstacle(8.0, y, 0.3)],
+        ..Default::default()
+    };
+    demo::run(demo::Demo {
+        name: "soc",
+        kind: TrackerKind::Soc,
+        path: demo::sine(20.0, 1.2, 0.35),
+        constraints: demo::constraints(SteeringType::Differential, 1.0),
+        config: demo::config(),
+        start: demo::pose(0.0, 0.0, 0.0),
+        world: Some(world),
+        dt: 0.1,
+        max_time: 120.0,
+    });
+}

@@ -4,7 +4,7 @@
 //! Each example imports this module via `#[path = "common/viz.rs"] mod viz;`.
 #![allow(dead_code)]
 
-use ondrive::{ControllerStatus, Goal, Path as OPath, RobotState};
+use ondrive::{WorldConstraints, ControllerStatus, Goal, Path as OPath, RobotState};
 use rerun::{Color, RecordingStream};
 
 pub fn red() -> Color {
@@ -171,4 +171,35 @@ pub fn show_controller_status(rec: &RecordingStream, status: &ControllerStatus, 
         if status.goal_reached { "Yes" } else { "No" }
     );
     let _ = rec.log(entity, &rerun::TextLog::new(text));
+}
+
+/// Sleep for one control period so a live viewer receives the simulation
+/// at real-time speed.
+pub fn pace(dt: f64) {
+    std::thread::sleep(std::time::Duration::from_secs_f64(dt.max(0.0)));
+}
+
+/// Obstacle discs at their predicted position for horizon `step`.
+pub fn show_obstacles(rec: &RecordingStream, world: &WorldConstraints, step: usize, entity: &str) {
+    let mut centers: Vec<[f32; 3]> = Vec::new();
+    let mut radii: Vec<f32> = Vec::new();
+    for obs in &world.obstacles {
+        for md in &obs.modes {
+            if md.mean_x.is_empty() || md.mean_y.is_empty() {
+                continue;
+            }
+            let i = step.min(md.mean_x.len() - 1).min(md.mean_y.len() - 1);
+            centers.push([md.mean_x[i] as f32, md.mean_y[i] as f32, 0.0]);
+            radii.push(obs.radius as f32);
+        }
+    }
+    if centers.is_empty() {
+        return;
+    }
+    let _ = rec.log(
+        entity,
+        &rerun::Points3D::new(centers)
+            .with_colors([red()])
+            .with_radii(radii),
+    );
 }

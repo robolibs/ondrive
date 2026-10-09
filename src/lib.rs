@@ -25,14 +25,21 @@ pub use crate::core::math::{
 pub use crate::tracker::{Tracker, TrackerKind, smoothen_path};
 pub use crate::types::{
     ControllerConfig, ControllerStatus, GaussianMode, Goal, Obstacle, OutputType, OutputUnits,
-    Path, RobotConstraints, RobotState, SteeringType, Velocity, VelocityCommand, WorldConstraints,
-    Zone,
+    Footprint, OccupancyGrid, Path, RobotConstraints, RobotState, SteeringType, Trajectory,
+    TrajectorySample, Velocity, VelocityCommand, WorldConstraints, Zone,
 };
 
 pub use crate::fuzzy::{FlcConfig, FlcFollower, Term};
-pub use crate::path::{LqrFollower, PurePursuitFollower, StanleyFollower};
-pub use crate::point::{CarrotFollower, PidFollower};
+pub use crate::path::{
+    IlcConfig, IlcFollower, KanayamaFollower, LqrFollower, PurePursuitFollower,
+    RegulatedPursuitConfig, RegulatedPursuitFollower, StanleyFollower, VectorPursuitConfig,
+    VectorPursuitFollower,
+};
+pub use crate::point::{
+    ApfConfig, ApfFollower, CarrotFollower, PidFollower, PoseReachConfig, PoseReachFollower,
+    PoseRegulatorFollower,
+};
 pub use crate::pred::{
-    DwaConfig, DwaFollower, McaConfig, McaFollower, MpcConfig, MpcFollower, MppiConfig,
-    MppiFollower, SocConfig, SocFollower, TebConfig, TebFollower,
+    DwaConfig, DwaFollower, IlqrConfig, IlqrFollower, McaConfig, McaFollower, MpcConfig,
+    MpcFollower, MppiConfig, MppiFollower, SocConfig, SocFollower, TebConfig, TebFollower,
 };

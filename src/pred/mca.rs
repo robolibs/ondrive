@@ -1,21 +1,22 @@
-//! MCA (Monte Carlo Approximation) — risk-aware MPPI with dynamic obstacle
-//! collision probabilities evaluated by uniform-rejection Monte Carlo over
-//! each horizon step's bounding box.
+//! MCA — risk-aware MPPI (DRA-MPPI, Trevisan & Alonso-Mora 2024).
 //!
-//! When `WorldConstraints::obstacles` is empty, this behaves exactly like
-//! MPPI (via a re-implemented rollout loop, not via inheritance).
+//! Obstacle positions are sampled from their Gaussian-mixture predictions
+//! once per horizon step and shared by every rollout; the collision
+//! probability of a rollout point is the fraction of samples inside the
+//! combined radius. Soft cost is proportional to that probability, and a
+//! hard penalty applies above `risk_threshold`.
+//!
+//! Without obstacles this is exactly MPPI.
 
-use crate::controller::{Controller, ControllerBase, is_goal_reached};
-use crate::core::math::normalize_angle;
+use crate::controller::{Controller, ControllerBase};
+use crate::core::obstacles::CollisionChecker;
 use crate::pred::mppi::{MppiConfig, MppiFollower};
 use crate::types::{
-    Goal, Obstacle, OutputUnits, RobotConstraints, RobotState, SteeringType, VelocityCommand,
-    WorldConstraints,
+    ControllerConfig, ControllerStatus, Goal, Obstacle, Path, RobotConstraints, RobotState,
+    VelocityCommand, WorldConstraints,
 };
-use datapod::Point;
-use rand::{SeedableRng, rngs::StdRng};
-use rand_distr::{Distribution, Normal, Uniform};
-use std::f64::consts::PI;
+use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand_distr::{Distribution, Normal};
 
 #[derive(Clone, Debug)]
 pub struct McaConfig {
@@ -23,6 +24,7 @@ pub struct McaConfig {
     pub dt: f64,
 
     pub num_samples: usize,
+    /// Obstacle position samples per obstacle per horizon step.
     pub num_mc_samples: usize,
     pub temperature: f64,
     pub steering_noise: f64,
@@ -55,21 +57,21 @@ impl Default for McaConfig {
             horizon_steps: 20,
             dt: 0.1,
             num_samples: 400,
-            num_mc_samples: 20000,
+            num_mc_samples: 300,
             temperature: 1.0,
             steering_noise: 0.5,
             acceleration_noise: 0.3,
-            weight_cte: 100.0,
+            weight_cte: 50.0,
             weight_epsi: 100.0,
-            weight_vel: 1.0,
+            weight_vel: 100.0,
             weight_steering: 10.0,
             weight_acceleration: 5.0,
             weight_soft_risk: 50.0,
-            weight_hard_risk: 1e6,
+            weight_hard_risk: 1e4,
             risk_threshold: 0.05,
             min_velocity_scale: 0.1,
             risk_slowdown_gain: 5.0,
-            robot_radius_margin: 0.5,
+            robot_radius_margin: 0.1,
             ref_velocity: 1.0,
             turn_first_activation_deg: 60.0,
             turn_first_release_deg: 15.0,
@@ -100,16 +102,17 @@ impl McaConfig {
     }
 }
 
+/// Horizon steps whose collision probability drives the risk slowdown.
+const IMMINENT_STEPS: usize = 5;
+
+/// Sampled obstacle positions for one horizon step: `(x, y, radius)`.
+type StepSamples = Vec<Vec<(f64, f64, f64)>>;
+
 #[derive(Clone, Debug)]
 pub struct McaFollower {
     pub mca_config: McaConfig,
     mppi: MppiFollower,
     rng: StdRng,
-    sample_collision_probs: Vec<Vec<f64>>,
-    // Persistent mean controls (warm-start across ticks). MPPI shifts these
-    // left by one after each tick and the first entry is the output.
-    mean_steering: Vec<f64>,
-    mean_acceleration: Vec<f64>,
 }
 
 impl Default for McaFollower {
@@ -124,164 +127,79 @@ impl McaFollower {
     }
 
     pub fn with_mca_config(cfg: McaConfig) -> Self {
-        let n = cfg.horizon_steps;
-        let mppi = MppiFollower::with_mppi_config(cfg.to_mppi());
         Self {
+            mppi: MppiFollower::with_mppi_config(cfg.to_mppi()),
             mca_config: cfg,
-            mppi,
             rng: StdRng::from_entropy(),
-            sample_collision_probs: Vec::new(),
-            mean_steering: vec![0.0; n],
-            mean_acceleration: vec![0.0; n],
         }
     }
 
     pub fn with_seed(cfg: McaConfig, seed: u64) -> Self {
-        let n = cfg.horizon_steps;
-        let mppi = MppiFollower::with_seed(cfg.to_mppi(), seed.wrapping_add(1));
         Self {
+            mppi: MppiFollower::with_seed(cfg.to_mppi(), seed.wrapping_add(1)),
             mca_config: cfg,
-            mppi,
             rng: StdRng::seed_from_u64(seed),
-            sample_collision_probs: Vec::new(),
-            mean_steering: vec![0.0; n],
-            mean_acceleration: vec![0.0; n],
         }
     }
 
     pub fn set_mca_config(&mut self, cfg: McaConfig) {
-        let n = cfg.horizon_steps;
-        self.mean_steering = vec![0.0; n];
-        self.mean_acceleration = vec![0.0; n];
         self.mppi.set_mppi_config(cfg.to_mppi());
         self.mca_config = cfg;
     }
 
-    pub fn sample_collision_probs(&self) -> &[Vec<f64>] {
-        &self.sample_collision_probs
+    pub fn predicted_trajectory(&self) -> &[datapod::Point] {
+        self.mppi.predicted_trajectory()
     }
 
-    fn evaluate_obstacle_pdf(&self, obs: &Obstacle, timestep: usize, x: f64, y: f64) -> f64 {
-        if obs.modes.is_empty() {
-            return 0.0;
-        }
-        let mut total = 0.0;
-        for mode in &obs.modes {
-            if timestep >= mode.mean_x.len() || timestep >= mode.mean_y.len() {
+    /// Draw `m` positions per obstacle for horizon steps `1..=n` from the
+    /// Gaussian mixture, holding the last predicted step when the
+    /// prediction is shorter than the horizon.
+    fn sample_obstacles(&mut self, obstacles: &[Obstacle], n: usize, m: usize) -> StepSamples {
+        let mut out: StepSamples = vec![Vec::new(); n];
+        for obs in obstacles {
+            let modes: Vec<_> = obs
+                .modes
+                .iter()
+                .filter(|md| md.weight.is_finite() && md.weight > 0.0 && !md.mean_x.is_empty() && !md.mean_y.is_empty())
+                .collect();
+            if modes.is_empty() {
                 continue;
             }
-            let mean_x = mode.mean_x[timestep];
-            let mean_y = mode.mean_y[timestep];
-            let std_x = mode.std_x[timestep].max(1e-6);
-            let std_y = mode.std_y[timestep].max(1e-6);
-            let dx = x - mean_x;
-            let dy = y - mean_y;
-            let exp_x = -(dx * dx) / (2.0 * std_x * std_x);
-            let exp_y = -(dy * dy) / (2.0 * std_y * std_y);
-            let norm_x = 1.0 / (std_x * (2.0 * PI).sqrt());
-            let norm_y = 1.0 / (std_y * (2.0 * PI).sqrt());
-            total += mode.weight * norm_x * norm_y * (exp_x + exp_y).exp();
-        }
-        total
-    }
-
-    fn compute_collision_probabilities(
-        &mut self,
-        trajectories: &[Vec<Point>],
-        timestep: usize,
-        robot_radius: f64,
-        obstacles: &[Obstacle],
-    ) -> Vec<f64> {
-        let k = trajectories.len();
-        let mut collision_probs = vec![0.0_f64; k];
-        if obstacles.is_empty() {
-            return collision_probs;
-        }
-
-        let mut x_min = f64::MAX;
-        let mut x_max = f64::MIN;
-        let mut y_min = f64::MAX;
-        let mut y_max = f64::MIN;
-        for t in trajectories {
-            if timestep >= t.len() {
-                continue;
-            }
-            let p = t[timestep];
-            x_min = x_min.min(p.x);
-            x_max = x_max.max(p.x);
-            y_min = y_min.min(p.y);
-            y_max = y_max.max(p.y);
-        }
-        if !x_min.is_finite() || !x_max.is_finite() {
-            return collision_probs;
-        }
-
-        let max_obstacle_radius = obstacles.iter().map(|o| o.radius).fold(0.0_f64, f64::max);
-        let total_radius = robot_radius + max_obstacle_radius;
-
-        x_min -= total_radius;
-        x_max += total_radius;
-        y_min -= total_radius;
-        y_max += total_radius;
-
-        if x_max - x_min < 1e-9 || y_max - y_min < 1e-9 {
-            return collision_probs;
-        }
-
-        let nmc = self.mca_config.num_mc_samples;
-        let dist_x = Uniform::new(x_min, x_max);
-        let dist_y = Uniform::new(y_min, y_max);
-
-        let mut mc_x = Vec::with_capacity(nmc);
-        let mut mc_y = Vec::with_capacity(nmc);
-        let mut joint_prob = vec![0.0_f64; nmc];
-        for _ in 0..nmc {
-            mc_x.push(dist_x.sample(&mut self.rng));
-            mc_y.push(dist_y.sample(&mut self.rng));
-        }
-
-        let area_element = (x_max - x_min) * (y_max - y_min) / nmc as f64;
-        for j in 0..nmc {
-            let mut prob_no_collision = 1.0;
-            for obs in obstacles {
-                let pdf = self.evaluate_obstacle_pdf(obs, timestep, mc_x[j], mc_y[j]);
-                let marginal = (pdf * area_element).clamp(0.0, 1.0);
-                prob_no_collision *= 1.0 - marginal;
-            }
-            joint_prob[j] = 1.0 - prob_no_collision;
-        }
-
-        let bbox_area = (x_max - x_min) * (y_max - y_min);
-
-        for (k_idx, t) in trajectories.iter().enumerate() {
-            if timestep >= t.len() {
-                continue;
-            }
-            let robot_pos = t[timestep];
-            let collision_radius = robot_radius + max_obstacle_radius;
-            let collision_radius_sq = collision_radius * collision_radius;
-            let collision_area = PI * collision_radius_sq;
-
-            let mut sum_prob = 0.0;
-            let mut count_in_region = 0;
-            for j in 0..nmc {
-                let dx = robot_pos.x - mc_x[j];
-                let dy = robot_pos.y - mc_y[j];
-                if dx * dx + dy * dy <= collision_radius_sq {
-                    sum_prob += joint_prob[j];
-                    count_in_region += 1;
+            let total_w: f64 = modes.iter().map(|md| md.weight).sum();
+            for (step, bucket) in out.iter_mut().enumerate() {
+                let t = step + 1;
+                for _ in 0..m {
+                    let mut pick = self.rng.r#gen::<f64>() * total_w;
+                    let mut chosen = modes[modes.len() - 1];
+                    for md in &modes {
+                        if pick < md.weight {
+                            chosen = md;
+                            break;
+                        }
+                        pick -= md.weight;
+                    }
+                    let ti = t.min(chosen.mean_x.len() - 1).min(chosen.mean_y.len() - 1);
+                    let sx = chosen.std_x.get(ti).copied().filter(|s| s.is_finite()).unwrap_or(0.0).max(0.0);
+                    let sy = chosen.std_y.get(ti).copied().filter(|s| s.is_finite()).unwrap_or(0.0).max(0.0);
+                    let x = match Normal::new(chosen.mean_x[ti], sx) {
+                        Ok(d) if sx > 0.0 => d.sample(&mut self.rng),
+                        _ => chosen.mean_x[ti],
+                    };
+                    let y = match Normal::new(chosen.mean_y[ti], sy) {
+                        Ok(d) if sy > 0.0 => d.sample(&mut self.rng),
+                        _ => chosen.mean_y[ti],
+                    };
+                    bucket.push((x, y, obs.radius.max(0.0)));
                 }
             }
-
-            if count_in_region > 0 {
-                let p =
-                    (collision_area / count_in_region as f64) * sum_prob / bbox_area * nmc as f64;
-                collision_probs[k_idx] = p.clamp(0.0, 1.0);
-            }
         }
-
-        collision_probs
+        out
     }
+}
+
+fn robot_radius(constraints: &RobotConstraints, margin: f64) -> f64 {
+    let r = 0.5 * constraints.robot_width.hypot(constraints.robot_length);
+    (if r < 0.05 { 0.3 } else { r }) + margin.max(0.0)
 }
 
 impl Controller for McaFollower {
@@ -293,302 +211,130 @@ impl Controller for McaFollower {
         dt: f64,
         world: Option<&WorldConstraints>,
     ) -> VelocityCommand {
-        // Without obstacles, behave exactly like MPPI.
-        let has_obstacles = world.is_some_and(|w| !w.obstacles.is_empty());
-        if !has_obstacles {
-            let cmd = self
-                .mppi
-                .compute_control(state, goal, constraints, dt, world);
-            // keep our own status mirrored so callers observe MCA state.
-            return cmd;
-        }
-        let obstacles = world.unwrap().obstacles.clone();
-
-        if self.mppi.base.path.waypoints.is_empty() {
-            return VelocityCommand::invalid("no path");
-        }
-
-        let error = self.mppi.calculate_path_error(state);
-        let working = self.mca_config.to_mppi();
-        let is_diff = matches!(
-            constraints.steering_type,
-            SteeringType::Differential | SteeringType::SkidSteer
-        );
-
-        let cfg = self.mppi.base.config.clone();
-        let (reached, dist, yaw_diff) = is_goal_reached(
-            &state.pose,
-            &goal.target_pose,
-            cfg.goal_tolerance,
-            cfg.angular_tolerance,
-        );
-        self.mppi.base.status.distance_to_goal = dist;
-        self.mppi.base.status.heading_error = yaw_diff;
-        if reached {
-            self.mppi.base.status.goal_reached = true;
-            self.mppi.base.status.mode = "stopped".into();
-            return VelocityCommand {
-                valid: true,
-                status_message: "Goal reached".into(),
-                ..VelocityCommand::default()
-            };
-        }
-
-        let n = working.horizon_steps;
-        let k = working.num_samples;
-        let dt_internal = working.dt;
-
-        let ref_traj = self.mppi.calculate_reference_trajectory(&error, &working);
-
-        let steering_dist = Normal::new(0.0, working.steering_noise.max(1e-9)).unwrap();
-        let accel_dist = Normal::new(0.0, working.acceleration_noise.max(1e-9)).unwrap();
-
-        if self.mean_steering.len() != n {
-            self.mean_steering = vec![0.0; n];
-            self.mean_acceleration = vec![0.0; n];
-        }
-
-        let mut costs = vec![0.0_f64; k];
-        let mut noise_steering = vec![vec![0.0_f64; n]; k];
-        let mut noise_accel = vec![vec![0.0_f64; n]; k];
-        let mut trajectories: Vec<Vec<Point>> = vec![Vec::with_capacity(n + 1); k];
-
-        for sample_idx in 0..k {
-            let mut x = state.pose.point.x;
-            let mut y = state.pose.point.y;
-            let mut yaw = state.pose.rotation.to_euler().yaw;
-            let mut v = state.velocity.linear;
-            let mut sample_cost = 0.0;
-            trajectories[sample_idx].push(Point::new(x, y, 0.0));
-
-            for i in 0..n {
-                let eps_delta = steering_dist.sample(&mut self.rng);
-                let eps_acc = accel_dist.sample(&mut self.rng);
-                noise_steering[sample_idx][i] = eps_delta;
-                noise_accel[sample_idx][i] = eps_acc;
-
-                let mut delta_or_omega = self.mean_steering[i] + eps_delta;
-                let mut a = self.mean_acceleration[i] + eps_acc;
-                if is_diff {
-                    delta_or_omega = delta_or_omega.clamp(
-                        -constraints.max_angular_velocity,
-                        constraints.max_angular_velocity,
-                    );
-                } else {
-                    delta_or_omega = delta_or_omega.clamp(
-                        -constraints.max_steering_angle,
-                        constraints.max_steering_angle,
-                    );
-                }
-                a = a.clamp(
-                    -constraints.max_linear_acceleration,
-                    constraints.max_linear_acceleration,
-                );
-
-                let lf = constraints.wheelbase;
-                x += v * yaw.cos() * dt_internal;
-                y += v * yaw.sin() * dt_internal;
-                if is_diff {
-                    yaw += delta_or_omega * dt_internal;
-                } else {
-                    yaw += v * delta_or_omega / lf * dt_internal;
-                }
-                yaw = normalize_angle(yaw);
-                v += a * dt_internal;
-                v = v.clamp(
-                    constraints.min_linear_velocity,
-                    constraints.max_linear_velocity,
-                );
-
-                trajectories[sample_idx].push(Point::new(x, y, 0.0));
-
-                let ref_idx = (i + 1).min(ref_traj.x.len() - 1);
-                let r_x = ref_traj.x[ref_idx];
-                let r_y = ref_traj.y[ref_idx];
-                let r_yaw = ref_traj.yaw[ref_idx];
-                let r_v = ref_traj.velocity[ref_idx];
-
-                let dx = x - r_x;
-                let dy = y - r_y;
-                let cte = -dx * r_yaw.sin() + dy * r_yaw.cos();
-                let epsi = normalize_angle(yaw - r_yaw);
-                let vel_error = v - r_v;
-
-                let mut cost = 0.0;
-                cost += working.weight_cte * cte * cte;
-                cost += working.weight_epsi * epsi * epsi;
-                cost += working.weight_vel * vel_error * vel_error;
-                cost += working.weight_steering * delta_or_omega * delta_or_omega;
-                cost += working.weight_acceleration * a * a;
-                sample_cost += cost * dt_internal;
-            }
-            costs[sample_idx] = sample_cost;
-        }
-
-        // Collision risk terms
-        let mut robot_radius = constraints.robot_width.max(constraints.robot_length) / 2.0;
-        if robot_radius < 0.1 {
-            robot_radius = 0.5;
-        }
-
-        self.sample_collision_probs = vec![vec![0.0_f64; n]; k];
-        for t in 0..n {
-            let probs = self.compute_collision_probabilities(
-                &trajectories,
-                t + 1,
-                robot_radius,
-                &obstacles,
-            );
-            for idx in 0..k {
-                self.sample_collision_probs[idx][t] = probs[idx];
-                let soft = self.mca_config.weight_soft_risk * probs[idx];
-                let hard = if probs[idx] > self.mca_config.risk_threshold {
-                    self.mca_config.weight_hard_risk
-                } else {
-                    0.0
-                };
-                costs[idx] += (soft + hard) * dt_internal;
-            }
-        }
-
-        // Importance weights
-        let temperature = working.temperature.max(1e-6);
-        let beta = 1.0 / temperature;
-        let min_cost = costs.iter().cloned().fold(f64::INFINITY, f64::min);
-        let mut weights = vec![0.0_f64; k];
-        let mut weight_sum = 0.0_f64;
-        for i in 0..k {
-            let exp = (-beta * (costs[i] - min_cost)).max(-60.0);
-            let w = exp.exp();
-            weights[i] = w;
-            weight_sum += w;
-        }
-        if weight_sum < 1e-12 {
-            weight_sum = 1.0;
-        }
-
-        for i in 0..n {
-            let mut d_delta = 0.0;
-            let mut d_acc = 0.0;
-            for j in 0..k {
-                let w = weights[j] / weight_sum;
-                d_delta += w * noise_steering[j][i];
-                d_acc += w * noise_accel[j][i];
-            }
-            self.mean_steering[i] += d_delta;
-            self.mean_acceleration[i] += d_acc;
-            if is_diff {
-                self.mean_steering[i] = self.mean_steering[i].clamp(
-                    -constraints.max_angular_velocity,
-                    constraints.max_angular_velocity,
-                );
-            } else {
-                self.mean_steering[i] = self.mean_steering[i].clamp(
-                    -constraints.max_steering_angle,
-                    constraints.max_steering_angle,
-                );
-            }
-            self.mean_acceleration[i] = self.mean_acceleration[i].clamp(
-                -constraints.max_linear_acceleration,
-                constraints.max_linear_acceleration,
+        let obstacles: Vec<Obstacle> = world
+            .map(|w| {
+                w.obstacles
+                    .iter()
+                    .filter(|o| {
+                        o.modes.iter().any(|m| {
+                            m.weight.is_finite()
+                                && m.weight > 0.0
+                                && !m.mean_x.is_empty()
+                                && !m.mean_y.is_empty()
+                        })
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let has_grid = world.is_some_and(|w| w.grid.is_some());
+        if obstacles.is_empty() && !has_grid {
+            return self.mppi.step_with(
+                state,
+                goal,
+                constraints,
+                dt,
+                &|_, _, _, _| 0.0,
+                1.0,
+                "MCA tracking",
+                "mca_tracking",
             );
         }
 
-        let steering_or_omega = *self.mean_steering.first().unwrap_or(&0.0);
-        let acceleration = *self.mean_acceleration.first().unwrap_or(&0.0);
+        let n = self.mca_config.horizon_steps.max(1);
+        let m = self.mca_config.num_mc_samples.max(1);
+        let samples = self.sample_obstacles(&obstacles, n, m);
+        let per_obstacle = m as f64;
+        let robot_r = robot_radius(constraints, self.mca_config.robot_radius_margin);
+        let soft = self.mca_config.weight_soft_risk;
+        let hard = self.mca_config.weight_hard_risk;
+        let threshold = self.mca_config.risk_threshold;
+        let obstacle_count = obstacles.len();
 
-        // Shift the mean sequences left by one for next-tick warm-start.
-        for i in 0..n.saturating_sub(1) {
-            self.mean_steering[i] = self.mean_steering[i + 1];
-            self.mean_acceleration[i] = self.mean_acceleration[i + 1];
-        }
-        if n > 0 {
-            self.mean_steering[n - 1] = 0.0;
-            self.mean_acceleration[n - 1] = 0.0;
-        }
-
-        self.mppi.base.status.distance_to_goal =
-            state.pose.point.distance_to(goal.target_pose.point);
-        self.mppi.base.status.cross_track_error = error.cte.abs();
-        self.mppi.base.status.heading_error = error.epsi.abs();
-        self.mppi.base.status.goal_reached = false;
-        self.mppi.base.status.mode = "mca_tracking".into();
-
-        let mut target_velocity = state.velocity.linear + acceleration * dt_internal;
-        let min_vel = if cfg.allow_reverse {
-            constraints.min_linear_velocity
-        } else {
-            0.0
-        };
-        target_velocity = target_velocity.clamp(min_vel, constraints.max_linear_velocity);
-
-        let angular_output = if is_diff {
-            steering_or_omega.clamp(
-                -constraints.max_angular_velocity,
-                constraints.max_angular_velocity,
-            )
-        } else {
-            steering_or_omega.clamp(
-                -constraints.max_steering_angle,
-                constraints.max_steering_angle,
-            )
-        };
-
-        let (linear, angular) = match cfg.output_units {
-            OutputUnits::Normalized => {
-                let linear = if constraints.max_linear_velocity > 0.0 {
-                    target_velocity / constraints.max_linear_velocity
-                } else {
-                    0.0
-                };
-                let angular = if is_diff {
-                    if constraints.max_angular_velocity > 0.0 {
-                        angular_output / constraints.max_angular_velocity
-                    } else {
-                        0.0
-                    }
-                } else if constraints.max_steering_angle > 0.0 {
-                    angular_output / constraints.max_steering_angle
-                } else {
-                    0.0
-                };
-                (linear, angular)
+        let collision_probability = |step: usize, x: f64, y: f64| -> f64 {
+            let bucket = &samples[step.min(n - 1)];
+            if bucket.is_empty() {
+                return 0.0;
             }
-            OutputUnits::Physical => (target_velocity, angular_output),
+            let mut survive = 1.0;
+            for o in 0..obstacle_count {
+                let slice = &bucket[o * m..(o + 1) * m];
+                let hits = slice
+                    .iter()
+                    .filter(|(ox, oy, r)| (x - ox).hypot(y - oy) < r + robot_r)
+                    .count();
+                survive *= 1.0 - hits as f64 / per_obstacle;
+            }
+            1.0 - survive
+        };
+        let checker = CollisionChecker::new(world, constraints, self.mca_config.robot_radius_margin);
+        let has_grid = world.is_some_and(|w| w.grid.is_some());
+        let extra = |step: usize, x: f64, y: f64, yaw: f64| -> f64 {
+            let mut p = collision_probability(step, x, y);
+            if has_grid && checker.clearance(step + 1, x, y, yaw) < 0.0 {
+                p = 1.0;
+            }
+            soft * p + if p > threshold { hard } else { 0.0 }
         };
 
-        VelocityCommand {
-            valid: true,
-            status_message: "MCA tracking".into(),
-            linear_velocity: linear,
-            angular_velocity: angular,
-            ..VelocityCommand::default()
-        }
+        let risk = self
+            .mppi
+            .predicted_trajectory()
+            .iter()
+            .enumerate()
+            .skip(1)
+            .take(IMMINENT_STEPS)
+            .map(|(i, p)| collision_probability(i - 1, p.x, p.y))
+            .fold(0.0_f64, f64::max);
+        let ref_scale = (1.0 - self.mca_config.risk_slowdown_gain.max(0.0) * risk)
+            .clamp(self.mca_config.min_velocity_scale.clamp(0.0, 1.0), 1.0);
+
+        self.mppi.step_with(
+            state,
+            goal,
+            constraints,
+            dt,
+            &extra,
+            ref_scale,
+            "MCA tracking",
+            "mca_tracking",
+        )
     }
 
-    fn set_path(&mut self, path: crate::types::Path) {
+    fn set_path(&mut self, path: Path) {
         self.mppi.set_path(path);
+    }
+
+    fn set_trajectory(&mut self, trajectory: crate::types::Trajectory) {
+        self.mppi.set_trajectory(trajectory);
+    }
+
+    fn set_time(&mut self, t: f64) {
+        self.mppi.set_time(t);
     }
 
     fn reset(&mut self) {
         self.mppi.reset();
-        self.sample_collision_probs.clear();
     }
 
-    fn get_status(&self) -> crate::types::ControllerStatus {
+    fn get_status(&self) -> ControllerStatus {
         self.mppi.get_status()
     }
 
-    fn set_config(&mut self, config: crate::types::ControllerConfig) {
+    fn set_config(&mut self, config: ControllerConfig) {
         self.mppi.set_config(config);
     }
 
-    fn get_config(&self) -> crate::types::ControllerConfig {
+    fn get_config(&self) -> ControllerConfig {
         self.mppi.get_config()
     }
 
     fn get_type(&self) -> &'static str {
         "mca_follower"
+    }
+
+    fn predicted_trajectory(&self) -> Vec<datapod::Point> {
+        self.mppi.predicted_trajectory().to_vec()
     }
 
     fn get_path_index(&self) -> usize {

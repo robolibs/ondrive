@@ -1,15 +1,31 @@
-use crate::controller::{Controller, ControllerBase, is_goal_reached};
-use crate::core::math::normalize_angle;
-use crate::types::{
-    Goal, OutputUnits, RobotConstraints, RobotState, SteeringType, VelocityCommand,
-    WorldConstraints,
+//! Pure Pursuit (Coulter 1992). The rear axle chases a point at the
+//! lookahead arc length ahead of its projection on the path; the arc
+//! through both points has curvature `2 sin(alpha) / L_d`.
+
+use crate::controller::{Controller, ControllerBase, effective_tolerances};
+use crate::core::kinematics::{
+    can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, holonomic_point_command,
+    is_ackermann, is_holonomic, path_speed, reverse_allowed, world_to_body,
 };
+use crate::core::math::{heading_error, normalize_angle};
+use crate::core::path::{
+    cumulative_lengths, curvature_at_projection, cusp_after, project, sample, speed_cap,
+};
+use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
 use std::f64::consts::PI;
+
+/// Lookahead shrink per unit of path curvature (metres of lookahead per
+/// unit curvature), keeping tight bends from being cut.
+const CURVATURE_LOOKAHEAD_GAIN: f64 = 0.5;
+const SEARCH_WINDOW: usize = 64;
 
 #[derive(Clone, Debug, Default)]
 pub struct PurePursuitFollower {
     pub base: ControllerBase,
+    cum: Vec<f64>,
+    started: bool,
+    lookahead_point: Option<Point>,
 }
 
 impl PurePursuitFollower {
@@ -17,109 +33,53 @@ impl PurePursuitFollower {
         Self::default()
     }
 
-    fn find_lookahead_point(
+    /// The point currently being chased, for visualisation.
+    pub fn lookahead_point(&self) -> Option<Point> {
+        self.lookahead_point
+    }
+
+    fn chase_goal(
         &mut self,
-        rear_axle: Point,
-        lookahead: f64,
-        progress: f64,
-    ) -> Option<Point> {
-        let waypoints = &self.base.path.waypoints;
-        if waypoints.is_empty() {
-            return None;
+        state: &RobotState,
+        goal: &Goal,
+        constraints: &RobotConstraints,
+        allow_reverse: bool,
+    ) -> VelocityCommand {
+        let cfg = self.base.config.clone();
+        if is_holonomic(constraints.steering_type) {
+            self.base.status.mode = "pure_pursuit_goal_holonomic".into();
+            let yaw = state.pose.rotation.to_euler().yaw;
+            return holonomic_point_command(
+                state.pose.point,
+                yaw,
+                goal.target_pose.point,
+                goal.target_pose.rotation.to_euler().yaw,
+                self.base.status.distance_to_goal,
+                &cfg,
+                constraints,
+                "Moving to goal",
+            );
         }
-
-        while self.base.path_index + 1 < waypoints.len() {
-            let current = waypoints[self.base.path_index].point;
-            let next = waypoints[self.base.path_index + 1].point;
-
-            let dist_to_current = rear_axle.distance_to(current);
-            let dx_to_current = current.x - rear_axle.x;
-            let dy_to_current = current.y - rear_axle.y;
-            let dx_path = next.x - current.x;
-            let dy_path = next.y - current.y;
-            let dot = dx_to_current * dx_path + dy_to_current * dy_path;
-
-            if dist_to_current < progress || dot < 0.0 {
-                self.base.path_index += 1;
-            } else {
-                break;
-            }
+        let mut bearing = heading_error(&state.pose, goal.target_pose.point);
+        let mut direction = 1.0;
+        if allow_reverse && bearing.abs() > PI / 2.0 {
+            direction = -1.0;
+            bearing = normalize_angle(bearing + PI);
         }
-
-        let mut min_diff = f64::MAX;
-        let mut best: Option<Point> = None;
-
-        for i in self.base.path_index..waypoints.len() {
-            let wp = waypoints[i].point;
-            let dist = rear_axle.distance_to(wp);
-            let diff = (dist - lookahead).abs();
-            if diff < min_diff && dist >= lookahead * 0.5 {
-                min_diff = diff;
-                best = Some(wp);
-            }
-
-            if i + 1 < waypoints.len() {
-                let next = waypoints[i + 1].point;
-                if let Some(intersection) =
-                    find_circle_segment_intersection(rear_axle, lookahead, wp, next)
-                {
-                    let d = rear_axle.distance_to(intersection);
-                    let diff = (d - lookahead).abs();
-                    if diff < min_diff {
-                        min_diff = diff;
-                        best = Some(intersection);
-                    }
-                }
-            }
-
-            if dist > lookahead * 2.0 {
-                break;
-            }
-        }
-
-        if best.is_none() && self.base.path_index < waypoints.len() {
-            best = Some(waypoints.last().unwrap().point);
-        }
-        best
-    }
-}
-
-fn find_circle_segment_intersection(
-    center: Point,
-    radius: f64,
-    start: Point,
-    end: Point,
-) -> Option<Point> {
-    let mut dx = end.x - start.x;
-    let mut dy = end.y - start.y;
-    let seg_len = dx.hypot(dy);
-    if seg_len < 1e-6 {
-        return None;
-    }
-    dx /= seg_len;
-    dy /= seg_len;
-
-    let fx = center.x - start.x;
-    let fy = center.y - start.y;
-    let projection = fx * dx + fy * dy;
-
-    let closest_x = start.x + projection * dx;
-    let closest_y = start.y + projection * dy;
-    let dist_to_line = (center.x - closest_x).hypot(center.y - closest_y);
-    if dist_to_line > radius {
-        return None;
-    }
-
-    let half_chord = (radius * radius - dist_to_line * dist_to_line).sqrt();
-    let t1 = projection - half_chord;
-    let t2 = projection + half_chord;
-
-    if t2 >= 0.0 && t2 <= seg_len {
-        Some(Point::new(start.x + t2 * dx, start.y + t2 * dy, 0.0))
-    } else if t1 >= 0.0 && t1 <= seg_len {
-        Some(Point::new(start.x + t1 * dx, start.y + t1 * dy, 0.0))
-    } else {
-        None
+        let dist = self.base.status.distance_to_goal;
+        let omega = cfg.kp_angular.max(0.1) * bearing;
+        let v = direction
+            * path_speed(
+                constraints.max_linear_velocity,
+                0.0,
+                dist,
+                cfg.goal_tolerance,
+                cfg.kp_linear,
+                constraints,
+            )
+            * heading_speed_scale(bearing, constraints);
+        self.base.status.mode = "pure_pursuit_goal".into();
+        finalize(v, omega, constraints, &cfg, allow_reverse, "Moving to goal")
     }
 }
 
@@ -129,121 +89,160 @@ impl Controller for PurePursuitFollower {
         state: &RobotState,
         goal: &Goal,
         constraints: &RobotConstraints,
-        _dt: f64,
+        dt: f64,
         _world: Option<&WorldConstraints>,
     ) -> VelocityCommand {
+        if !(dt.is_finite() && dt > 0.0) {
+            return VelocityCommand::invalid("dt must be positive and finite");
+        }
+        if self.cum.len() != self.base.path.waypoints.len() {
+            self.cum = cumulative_lengths(&self.base.path.waypoints);
+            self.started = false;
+            self.base.path_index = 0;
+        }
         let cfg = self.base.config.clone();
-
-        let wheelbase = if constraints.wheelbase > 0.0 {
-            constraints.wheelbase
-        } else {
-            1.0
-        };
-
+        let allow_reverse = reverse_allowed(&cfg, state);
         let yaw = state.pose.rotation.to_euler().yaw;
-        let rear_x = state.pose.point.x - (wheelbase / 2.0) * yaw.cos();
-        let rear_y = state.pose.point.y - (wheelbase / 2.0) * yaw.sin();
-        let rear_axle = Point::new(rear_x, rear_y, 0.0);
 
-        let k_lookahead = 0.1;
-        let base_lookahead = cfg.lookahead_distance;
-        let lookahead = (k_lookahead * state.velocity.linear.abs() + base_lookahead)
-            .clamp(base_lookahead, base_lookahead * 3.0);
-
-        let progress = wheelbase * 1.5;
-        let has_path = !self.base.path.waypoints.is_empty();
-        let target_point = if has_path {
-            self.find_lookahead_point(rear_axle, lookahead, progress)
-                .unwrap_or(goal.target_pose.point)
-        } else {
-            goal.target_pose.point
-        };
-
-        let (reached, dist, yaw_diff) = is_goal_reached(
-            &state.pose,
-            &goal.target_pose,
-            cfg.goal_tolerance,
-            cfg.angular_tolerance,
-        );
-        self.base.status.distance_to_goal = dist;
-        self.base.status.heading_error = yaw_diff;
-
-        if reached {
-            self.base.status.goal_reached = true;
-            self.base.status.mode = "stopped".into();
-            return VelocityCommand {
-                valid: true,
-                status_message: "Goal reached".into(),
-                ..VelocityCommand::default()
-            };
+        if self.base.path.waypoints.is_empty() {
+            if let Some(cmd) = self.base.arrival(state, goal, constraints, false) {
+                return cmd;
+            }
+            return self.chase_goal(state, goal, constraints, allow_reverse);
         }
 
-        let is_diff = matches!(
-            constraints.steering_type,
-            SteeringType::Differential | SteeringType::SkidSteer
+        let axle_offset = if is_ackermann(constraints.steering_type) {
+            constraints.rear_wheelbase.max(0.0)
+        } else {
+            0.0
+        };
+        let rear = Point::new(
+            state.pose.point.x - axle_offset * yaw.cos(),
+            state.pose.point.y - axle_offset * yaw.sin(),
+            0.0,
         );
 
-        let dx = target_point.x - rear_x;
-        let dy = target_point.y - rear_y;
+        let window = if self.started {
+            SEARCH_WINDOW
+        } else {
+            usize::MAX
+        };
+        let Some(proj) = project(
+            &self.base.path.waypoints,
+            &self.cum,
+            rear,
+            self.base.path_index,
+            2,
+            window,
+        ) else {
+            return VelocityCommand::invalid("no path");
+        };
+        self.started = true;
+        self.base.path_index = proj.segment;
+
+        let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
+        let passed_end = proj.beyond_end && proj.distance < 2.0 * pos_tol;
+        if let Some(cmd) = self.base.arrival(state, goal, constraints, passed_end) {
+            self.lookahead_point = None;
+            return cmd;
+        }
+
+        let base_lookahead = cfg.lookahead_distance.max(1e-3);
+        let kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cum, &proj).abs();
+        let lookahead = ((base_lookahead + cfg.lookahead_time.max(0.0) * state.velocity.linear.abs())
+            / (1.0 + CURVATURE_LOOKAHEAD_GAIN * kappa_path * base_lookahead))
+            .clamp(0.5 * base_lookahead, 3.0 * base_lookahead);
+        let mut s_target = proj.arc_length + lookahead;
+        let mut stop_distance = self.base.status.distance_to_goal;
+        if let Some(cusp) = cusp_after(&self.base.path.speeds, &self.cum, proj.arc_length) {
+            s_target = s_target.min(cusp);
+            stop_distance = stop_distance.min((cusp - proj.arc_length).max(0.0));
+        }
+        let (target, _) = sample(&self.base.path.waypoints, &self.cum, s_target);
+        self.lookahead_point = Some(target);
+
+        let dx = target.x - rear.x;
+        let dy = target.y - rear.y;
+        let ld = dx.hypot(dy);
+
+        if is_holonomic(constraints.steering_type) {
+            self.base.status.cross_track_error = proj.lateral_error;
+            self.base.status.heading_error = normalize_angle(proj.heading - yaw);
+            self.base.status.goal_reached = false;
+            self.base.status.mode = "pure_pursuit_holonomic".into();
+
+            let nominal = speed_cap(&self.base.path.speeds, &proj)
+                .map_or(constraints.max_linear_velocity, |s| {
+                    s.min(constraints.max_linear_velocity)
+                });
+            let speed = path_speed(nominal, 0.0, stop_distance, pos_tol, cfg.kp_linear, constraints);
+            let (ux, uy) = if ld > 1e-9 { (dx / ld, dy / ld) } else { (0.0, 0.0) };
+            let (vx, vy) = world_to_body(speed * ux, speed * uy, yaw);
+            let omega = cfg.kp_angular.max(0.1) * normalize_angle(proj.heading - yaw);
+            return finalize_holonomic(vx, vy, omega, constraints, &cfg, "Following path");
+        }
+
         let alpha = normalize_angle(dy.atan2(dx) - yaw);
-
-        self.base.status.distance_to_goal = state.pose.point.distance_to(goal.target_pose.point);
-        self.base.status.cross_track_error = (alpha.sin() * dx.hypot(dy)).abs();
-        self.base.status.goal_reached = false;
-        self.base.status.mode = "pure_pursuit".into();
-
-        let kp_angular = 2.5;
-
-        if is_diff && state.turn_first && alpha.abs() > cfg.angular_tolerance {
-            let angular_physical = (kp_angular * alpha).clamp(
-                -constraints.max_angular_velocity,
-                constraints.max_angular_velocity,
-            );
-            let (linear, angular) = match cfg.output_units {
-                OutputUnits::Normalized => {
-                    (0.0, angular_physical / constraints.max_angular_velocity)
-                }
-                OutputUnits::Physical => (0.0, angular_physical),
-            };
-            self.base.status.mode = "turning".into();
-            return VelocityCommand {
-                valid: true,
-                status_message: "Turning to align".into(),
-                linear_velocity: linear,
-                angular_velocity: angular,
-                ..VelocityCommand::default()
-            };
-        }
-
-        let angular_physical = (kp_angular * alpha).clamp(
-            -constraints.max_angular_velocity,
-            constraints.max_angular_velocity,
-        );
-
-        let alpha_mag = alpha.abs();
-        let linear_physical = if alpha_mag > PI * 0.66 {
-            constraints.max_linear_velocity * 0.3
-        } else if alpha_mag > PI / 3.0 {
-            constraints.max_linear_velocity * 0.6
+        let kappa = if ld > 1e-6 {
+            2.0 * alpha.sin() / ld
         } else {
-            constraints.max_linear_velocity
+            0.0
         };
 
-        let (linear, angular) = match cfg.output_units {
-            OutputUnits::Normalized => (
-                linear_physical / constraints.max_linear_velocity,
-                angular_physical / constraints.max_angular_velocity,
-            ),
-            OutputUnits::Physical => (linear_physical, angular_physical),
-        };
-
-        VelocityCommand {
-            valid: true,
-            status_message: "Following path".into(),
-            linear_velocity: linear,
-            angular_velocity: angular,
-            ..VelocityCommand::default()
+        let mut direction = 1.0;
+        let mut alpha_eff = alpha;
+        if allow_reverse && alpha.abs() > PI / 2.0 {
+            direction = -1.0;
+            alpha_eff = normalize_angle(alpha + PI);
         }
+
+        self.base.status.cross_track_error = proj.lateral_error;
+        self.base.status.heading_error = normalize_angle(proj.heading - yaw);
+        self.base.status.goal_reached = false;
+
+        if state.turn_first
+            && can_turn_in_place(constraints.steering_type)
+            && alpha_eff.abs() > ang_tol
+        {
+            self.base.status.mode = "turning".into();
+            let omega = cfg.kp_angular.max(0.1) * alpha_eff;
+            return finalize(0.0, omega, constraints, &cfg, allow_reverse, "Turning to align");
+        }
+
+        let nominal = speed_cap(&self.base.path.speeds, &proj)
+            .map_or(constraints.max_linear_velocity, |s| {
+                s.min(constraints.max_linear_velocity)
+            });
+        let scale = heading_speed_scale(alpha_eff, constraints);
+        let v = direction
+            * path_speed(nominal, kappa, stop_distance, pos_tol, cfg.kp_linear, constraints)
+            * scale;
+
+        let mut omega = v * kappa;
+        if can_turn_in_place(constraints.steering_type) {
+            omega += (1.0 - scale) * cfg.kp_angular.max(0.1) * alpha_eff;
+        }
+
+        self.base.status.mode = if direction > 0.0 {
+            "pure_pursuit".into()
+        } else {
+            "pure_pursuit_reverse".into()
+        };
+        finalize(v, omega, constraints, &cfg, allow_reverse, "Following path")
+    }
+
+    fn set_path(&mut self, path: Path) {
+        self.cum = cumulative_lengths(&path.waypoints);
+        self.base.path = path;
+        self.base.path_index = 0;
+        self.base.status = Default::default();
+        self.started = false;
+        self.lookahead_point = None;
+    }
+
+    fn reset(&mut self) {
+        self.set_path(Path::default());
+        self.base.status = Default::default();
     }
 
     fn get_type(&self) -> &'static str {

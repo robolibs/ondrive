@@ -1,8 +1,13 @@
-use crate::controller::{Controller, ControllerBase, is_goal_reached};
-use crate::core::math::heading_error;
-use crate::types::{
-    Goal, RobotConstraints, RobotState, SteeringType, VelocityCommand, WorldConstraints,
+//! Carrot point-to-point controller: proportional heading control onto the
+//! bearing to the goal with speed scaled by distance and heading error.
+
+use crate::controller::{Controller, ControllerBase, effective_tolerances};
+use crate::core::kinematics::{
+    can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, is_holonomic,
+    reverse_allowed, unreachable_arc_speed_floor, world_to_body,
 };
+use crate::core::math::{heading_error, normalize_angle, yaw_of};
+use crate::types::{Goal, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use std::f64::consts::PI;
 
 #[derive(Clone, Debug, Default)]
@@ -14,6 +19,43 @@ impl CarrotFollower {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Holonomic point control: proportional translation toward the goal
+    /// position and independent proportional rotation toward the goal
+    /// orientation, transformed into the body frame at the end.
+    fn compute_holonomic(
+        &mut self,
+        state: &RobotState,
+        goal: &Goal,
+        constraints: &RobotConstraints,
+        cfg: &crate::types::ControllerConfig,
+    ) -> VelocityCommand {
+        let dx = goal.target_pose.point.x - state.pose.point.x;
+        let dy = goal.target_pose.point.y - state.pose.point.y;
+        let distance = dx.hypot(dy);
+        let orientation_err = normalize_angle(yaw_of(&goal.target_pose) - yaw_of(&state.pose));
+
+        self.base.status.distance_to_goal = distance;
+        self.base.status.heading_error = orientation_err;
+        self.base.status.cross_track_error = 0.0;
+        self.base.status.goal_reached = false;
+        self.base.status.mode = "carrot_holonomic".into();
+
+        let carrot = cfg.lookahead_distance.max(1e-3);
+        let speed = (cfg.kp_linear * distance.min(carrot) * (distance / carrot).min(1.0).sqrt()
+            + cfg.kp_linear * (distance - carrot).max(0.0))
+        .max(0.0);
+        let omega = cfg.kp_angular * orientation_err;
+
+        let yaw = yaw_of(&state.pose);
+        let (ux, uy) = if distance > 1e-9 {
+            (dx / distance, dy / distance)
+        } else {
+            (0.0, 0.0)
+        };
+        let (vx, vy) = world_to_body(speed * ux, speed * uy, yaw);
+        finalize_holonomic(vx, vy, omega, constraints, cfg, "Chasing carrot")
+    }
 }
 
 impl Controller for CarrotFollower {
@@ -22,75 +64,58 @@ impl Controller for CarrotFollower {
         state: &RobotState,
         goal: &Goal,
         constraints: &RobotConstraints,
-        _dt: f64,
+        dt: f64,
         _world: Option<&WorldConstraints>,
     ) -> VelocityCommand {
+        if !(dt.is_finite() && dt > 0.0) {
+            return VelocityCommand::invalid("dt must be positive and finite");
+        }
         let cfg = self.base.config.clone();
+        let allow_reverse = reverse_allowed(&cfg, state);
 
-        let (reached, dist, yaw_diff) = is_goal_reached(
-            &state.pose,
-            &goal.target_pose,
-            cfg.goal_tolerance,
-            cfg.angular_tolerance,
-        );
-        self.base.status.distance_to_goal = dist;
-        self.base.status.heading_error = yaw_diff;
-
-        if reached {
-            self.base.status.goal_reached = true;
-            self.base.status.mode = "stopped".into();
-            return VelocityCommand {
-                valid: true,
-                status_message: "Goal reached".into(),
-                ..VelocityCommand::default()
-            };
+        if let Some(cmd) = self.base.arrival(state, goal, constraints, false) {
+            return cmd;
         }
 
-        let is_diff = matches!(
-            constraints.steering_type,
-            SteeringType::Differential | SteeringType::SkidSteer
-        );
+        if is_holonomic(constraints.steering_type) {
+            return self.compute_holonomic(state, goal, constraints, &cfg);
+        }
 
-        let dx = goal.target_pose.point.x - state.pose.point.x;
-        let dy = goal.target_pose.point.y - state.pose.point.y;
-        let distance = (dx * dx + dy * dy).sqrt();
-        let heading_err = heading_error(&state.pose, goal.target_pose.point);
+        let distance = state.pose.point.distance_to_2d(goal.target_pose.point);
+        let mut bearing_err = heading_error(&state.pose, goal.target_pose.point);
+        let mut direction = 1.0;
+        if allow_reverse && bearing_err.abs() > PI / 2.0 {
+            direction = -1.0;
+            bearing_err = normalize_angle(bearing_err + PI);
+        }
 
         self.base.status.distance_to_goal = distance;
-        self.base.status.heading_error = heading_err;
+        self.base.status.heading_error = bearing_err;
+        self.base.status.cross_track_error = 0.0;
         self.base.status.goal_reached = false;
 
-        let angular_control = cfg.kp_angular * heading_err;
+        let omega = cfg.kp_angular * bearing_err;
 
-        if is_diff && state.turn_first && heading_err.abs() > cfg.angular_tolerance {
+        let (_, ang_tol) = effective_tolerances(goal, &cfg);
+        if state.turn_first
+            && can_turn_in_place(constraints.steering_type)
+            && bearing_err.abs() > ang_tol
+        {
             self.base.status.mode = "turning".into();
-            return VelocityCommand {
-                valid: true,
-                status_message: "Turning to align".into(),
-                linear_velocity: 0.0,
-                angular_velocity: angular_control.clamp(
-                    -constraints.max_angular_velocity,
-                    constraints.max_angular_velocity,
-                ),
-                ..VelocityCommand::default()
-            };
+            return finalize(0.0, omega, constraints, &cfg, allow_reverse, "Turning to align");
         }
 
-        let turn_reduction = 1.0 - (heading_err.abs() / PI).min(0.8);
-        let distance_scale = (distance / (cfg.goal_tolerance * 5.0)).min(1.0);
-        let linear_control = cfg.kp_linear * distance * turn_reduction * distance_scale;
+        let carrot = cfg.lookahead_distance.max(1e-3);
+        let speed = cfg.kp_linear * distance.min(carrot) * (distance / carrot).min(1.0).sqrt()
+            + cfg.kp_linear * (distance - carrot).max(0.0);
+        let mut v = speed.max(0.0) * heading_speed_scale(bearing_err, constraints);
+        if let Some(floor) = unreachable_arc_speed_floor(bearing_err, distance, constraints) {
+            v = v.max(floor);
+        }
+        let v = direction * v;
 
         self.base.status.mode = "carrot".into();
-        VelocityCommand {
-            valid: true,
-            status_message: "Chasing carrot".into(),
-            linear_velocity: linear_control.clamp(0.0, constraints.max_linear_velocity),
-            angular_velocity: angular_control.clamp(
-                -constraints.max_angular_velocity,
-                constraints.max_angular_velocity,
-            ),
-            ..VelocityCommand::default()
-        }
+        finalize(v, omega, constraints, &cfg, allow_reverse, "Chasing carrot")
     }
 
     fn get_type(&self) -> &'static str {

@@ -1,13 +1,28 @@
-#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+//! MPPI (Williams et al. 2017) plus the rollout, reference-trajectory and
+//! output helpers shared by the whole predictive family.
+//!
+//! Controls are `(steer, accel, accel_lat)` per horizon step: `steer` is a
+//! front-wheel steering angle for Ackermann platforms and a yaw rate
+//! otherwise; `accel_lat` (lateral acceleration) is only free for a
+//! holonomic platform — its bound is exactly zero otherwise, so `vy` never
+//! leaves zero and every formula below reduces to the non-holonomic one
+//! bit-for-bit.
 
-use crate::controller::{Controller, ControllerBase, is_goal_reached};
+#![allow(clippy::too_many_arguments)]
+
+use crate::controller::{Controller, ControllerBase, effective_tolerances};
+use crate::core::kinematics::{
+    can_turn_in_place, finalize, finalize_holonomic, is_ackermann, is_holonomic, reverse_allowed,
+    steering_limit, wheelbase,
+};
 use crate::core::math::normalize_angle;
+use crate::core::path::{PathCursor, PathProjection, sample};
 use crate::types::{
-    Goal, OutputUnits, RobotConstraints, RobotState, SteeringType, VelocityCommand,
+    ControllerConfig, Goal, Path, RobotConstraints, RobotState, Trajectory, VelocityCommand,
     WorldConstraints,
 };
 use datapod::Point;
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, Normal};
 use std::f64::consts::PI;
 
@@ -48,7 +63,7 @@ impl Default for MppiConfig {
             acceleration_noise: 0.3,
             weight_cte: 100.0,
             weight_epsi: 100.0,
-            weight_vel: 1.0,
+            weight_vel: 50.0,
             weight_steering: 10.0,
             weight_acceleration: 5.0,
             ref_velocity: 1.0,
@@ -59,27 +74,454 @@ impl Default for MppiConfig {
     }
 }
 
-pub(crate) struct PathError {
-    pub nearest_index: usize,
-    pub cte: f64,
-    pub epsi: f64,
-}
-
-pub(crate) struct ReferenceTrajectory {
+/// Reference states along the path, one per horizon step plus the origin.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Reference {
     pub x: Vec<f64>,
     pub y: Vec<f64>,
     pub yaw: Vec<f64>,
-    pub velocity: Vec<f64>,
+    pub v: Vec<f64>,
+}
+
+pub(crate) fn build_reference(
+    path: &Path,
+    cum: &[f64],
+    start_s: f64,
+    horizon: usize,
+    dt: f64,
+    ref_velocity: f64,
+    decel_distance: f64,
+) -> Reference {
+    let total = cum.last().copied().unwrap_or(0.0);
+    let speeds = &path.speeds;
+    let mut r = Reference {
+        x: Vec::with_capacity(horizon + 1),
+        y: Vec::with_capacity(horizon + 1),
+        yaw: Vec::with_capacity(horizon + 1),
+        v: Vec::with_capacity(horizon + 1),
+    };
+    let mut s = start_s;
+    for _ in 0..=horizon {
+        let (p, h) = sample(&path.waypoints, cum, s);
+        let remaining = (total - s).max(0.0);
+        let taper = if decel_distance > 1e-6 {
+            (remaining / decel_distance).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let mut v = ref_velocity * taper;
+        if let Some(cap) = speed_at_arc_length(speeds, cum, s) {
+            v = v.min(cap);
+        }
+        r.x.push(p.x);
+        r.y.push(p.y);
+        r.yaw.push(h);
+        r.v.push(v);
+        s += v.max(0.0) * dt;
+    }
+    r
+}
+
+/// Reference states sampled by time on a trajectory, from `t0` every `dt`.
+pub(crate) fn build_timed_reference(traj: &Trajectory, t0: f64, horizon: usize, dt: f64) -> Reference {
+    let mut r = Reference::default();
+    for i in 0..=horizon {
+        let s = traj.sample(t0 + i as f64 * dt);
+        r.x.push(s.pose.point.x);
+        r.y.push(s.pose.point.y);
+        r.yaw.push(s.pose.rotation.to_euler().yaw);
+        r.v.push(if s.finished { 0.0 } else { s.speed });
+    }
+    r
+}
+
+/// Per-waypoint speed cap at arc length `s`, if the path carries speeds.
+pub(crate) fn speed_at_arc_length(speeds: &[f64], cum: &[f64], s: f64) -> Option<f64> {
+    if speeds.is_empty() || speeds.len() != cum.len() {
+        return None;
+    }
+    let idx = match cum.binary_search_by(|c| c.partial_cmp(&s).unwrap_or(std::cmp::Ordering::Equal)) {
+        Ok(i) => i,
+        Err(i) => i.saturating_sub(1),
+    }
+    .min(speeds.len() - 1);
+    speeds.get(idx).copied().filter(|v| *v > 0.0)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CostWeights {
+    pub cte: f64,
+    pub epsi: f64,
+    pub vel: f64,
+    pub steering: f64,
+    pub accel: f64,
+}
+
+/// Kinematic model shared by every rollout in one tick. State is
+/// `(x, y, yaw, v, vy)`; `vy` (lateral speed) and its control `accel_lat`
+/// only move away from zero on a holonomic platform.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Model<'a> {
+    pub constraints: &'a RobotConstraints,
+    pub x0: f64,
+    pub y0: f64,
+    pub yaw0: f64,
+    pub v0: f64,
+    pub vy0: f64,
+    pub dt: f64,
+    pub ackermann: bool,
+    pub holonomic: bool,
+    pub v_min: f64,
+    pub v_max: f64,
+    /// Distance from the rear axle forward to the pose origin.
+    pub axle_offset: f64,
+}
+
+impl<'a> Model<'a> {
+    pub fn new(
+        state: &RobotState,
+        constraints: &'a RobotConstraints,
+        v0: f64,
+        vy0: f64,
+        dt: f64,
+        allow_reverse: bool,
+    ) -> Self {
+        let (v_min, v_max) = crate::core::kinematics::speed_bounds(constraints, allow_reverse);
+        let ackermann = is_ackermann(constraints.steering_type);
+        let holonomic = is_holonomic(constraints.steering_type);
+        let axle_offset = if ackermann {
+            constraints.rear_wheelbase.max(0.0)
+        } else {
+            0.0
+        };
+        let yaw0 = state.pose.rotation.to_euler().yaw;
+        Self {
+            constraints,
+            x0: state.pose.point.x - axle_offset * yaw0.cos(),
+            y0: state.pose.point.y - axle_offset * yaw0.sin(),
+            yaw0,
+            v0,
+            vy0: if holonomic { vy0 } else { 0.0 },
+            dt,
+            ackermann,
+            holonomic,
+            v_min,
+            v_max,
+            axle_offset,
+        }
+    }
+
+    pub fn steer_bound(&self) -> f64 {
+        if self.ackermann {
+            steering_limit(self.constraints)
+        } else {
+            self.constraints.max_angular_velocity.abs()
+        }
+    }
+
+    pub fn accel_bound(&self) -> f64 {
+        self.constraints.max_linear_acceleration.abs().max(1e-6)
+    }
+
+    /// Lateral acceleration bound: zero except on a holonomic platform, so
+    /// `vy` can never leave zero anywhere else.
+    pub fn accel_lat_bound(&self) -> f64 {
+        if self.holonomic {
+            self.constraints.max_linear_acceleration.abs().max(1e-6)
+        } else {
+            0.0
+        }
+    }
+
+    /// Largest lateral speed magnitude: zero except on a holonomic
+    /// platform.
+    pub fn vy_bound(&self) -> f64 {
+        if self.holonomic {
+            self.constraints.max_linear_velocity.abs()
+        } else {
+            0.0
+        }
+    }
+
+    pub fn clamp_controls(&self, steer: &mut [f64], accel: &mut [f64], accel_lat: &mut [f64]) {
+        let sb = self.steer_bound();
+        let ab = self.accel_bound();
+        let lb = self.accel_lat_bound();
+        for s in steer.iter_mut() {
+            *s = s.clamp(-sb, sb);
+        }
+        for a in accel.iter_mut() {
+            *a = a.clamp(-ab, ab);
+        }
+        for a in accel_lat.iter_mut() {
+            *a = a.clamp(-lb, lb);
+        }
+    }
+
+    /// Pose origin for a rear-axle state.
+    pub fn origin(&self, x: f64, y: f64, yaw: f64) -> (f64, f64) {
+        (x + self.axle_offset * yaw.cos(), y + self.axle_offset * yaw.sin())
+    }
+
+    pub fn step(
+        &self,
+        x: &mut f64,
+        y: &mut f64,
+        yaw: &mut f64,
+        v: &mut f64,
+        vy: &mut f64,
+        steer: f64,
+        accel: f64,
+        accel_lat: f64,
+    ) {
+        // vy is exactly 0.0 here unless holonomic (accel_lat is clamped to
+        // a zero bound otherwise), so this reduces to the plain unicycle
+        // position update for every other steering type.
+        let (s, c) = yaw.sin_cos();
+        *x += (*v * c - *vy * s) * self.dt;
+        *y += (*v * s + *vy * c) * self.dt;
+        let w_max = self.constraints.max_angular_velocity.abs();
+        if self.ackermann {
+            let w = (*v * steer.tan() / wheelbase(self.constraints)).clamp(-w_max, w_max);
+            *yaw += w * self.dt;
+        } else {
+            *yaw += steer * self.dt;
+        }
+        *yaw = normalize_angle(*yaw);
+        *v = (*v + accel * self.dt).clamp(self.v_min, self.v_max);
+        let vyb = self.vy_bound();
+        *vy = (*vy + accel_lat * self.dt).clamp(-vyb, vyb);
+    }
+}
+
+/// Roll out one control sequence and return `(cost, trajectory)`. `extra`
+/// receives `(step index, x, y, yaw)` after every integration step and
+/// returns an additional stage cost (obstacles, risk, ...).
+pub(crate) fn rollout(
+    model: &Model,
+    steer: &[f64],
+    accel: &[f64],
+    accel_lat: &[f64],
+    reference: &Reference,
+    w: &CostWeights,
+    extra: &dyn Fn(usize, f64, f64, f64) -> f64,
+    collect: bool,
+) -> (f64, Vec<Point>) {
+    let n = steer.len().min(accel.len()).min(accel_lat.len());
+    let sb = model.steer_bound();
+    let ab = model.accel_bound();
+    let lb = model.accel_lat_bound();
+    let (mut x, mut y, mut yaw, mut v, mut vy) = (model.x0, model.y0, model.yaw0, model.v0, model.vy0);
+    let mut traj = Vec::new();
+    if collect {
+        traj.reserve(n + 1);
+        let (ox, oy) = model.origin(x, y, yaw);
+        traj.push(Point::new(ox, oy, 0.0));
+    }
+    let mut cost = 0.0;
+    for i in 0..n {
+        let s = steer[i].clamp(-sb, sb);
+        let a = accel[i].clamp(-ab, ab);
+        let al = accel_lat[i].clamp(-lb, lb);
+        model.step(&mut x, &mut y, &mut yaw, &mut v, &mut vy, s, a, al);
+        let (x, y) = model.origin(x, y, yaw);
+        let yaw_here = yaw;
+        if collect {
+            traj.push(Point::new(x, y, 0.0));
+        }
+        let ri = (i + 1).min(reference.x.len().saturating_sub(1));
+        let (rx, ry, ryaw, rv) = if reference.x.is_empty() {
+            (x, y, yaw, v)
+        } else {
+            (reference.x[ri], reference.y[ri], reference.yaw[ri], reference.v[ri])
+        };
+        let dx = x - rx;
+        let dy = y - ry;
+        let cte = -dx * ryaw.sin() + dy * ryaw.cos();
+        let along = dx * ryaw.cos() + dy * ryaw.sin();
+        let epsi = normalize_angle(yaw - ryaw);
+        let ve = v - rv;
+        let mut stage = w.cte * (cte * cte + 0.25 * along * along)
+            + w.epsi * epsi * epsi
+            + w.vel * ve * ve
+            + w.steering * s * s
+            + w.accel * (a * a + al * al);
+        stage += extra(i, x, y, yaw_here);
+        cost += stage * model.dt;
+    }
+    (cost, traj)
+}
+
+/// Result of the shared pre-processing every predictive controller runs.
+pub(crate) struct Prepared {
+    pub proj: PathProjection,
+    pub pos_tol: f64,
+    pub ang_tol: f64,
+    pub epsi: f64,
+    pub allow_reverse: bool,
+}
+
+/// Projection, status bookkeeping and arrival handling. `Err(cmd)` carries
+/// the command to return immediately (invalid input, or stop/align).
+pub(crate) fn prepare(
+    base: &mut ControllerBase,
+    cursor: &mut PathCursor,
+    state: &RobotState,
+    goal: &Goal,
+    constraints: &RobotConstraints,
+    dt: f64,
+) -> Result<Prepared, VelocityCommand> {
+    if !(dt.is_finite() && dt > 0.0) {
+        return Err(VelocityCommand::invalid("dt must be positive and finite"));
+    }
+    if base.path.waypoints.is_empty() {
+        return Err(VelocityCommand::invalid("no path"));
+    }
+    let cfg = base.config.clone();
+    let allow_reverse = reverse_allowed(&cfg, state);
+    let Some(proj) = cursor.project(&base.path.waypoints, state.pose.point, base.path_index) else {
+        return Err(VelocityCommand::invalid("no path"));
+    };
+    base.path_index = proj.segment;
+    let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
+    let passed_end = proj.beyond_end && proj.distance < 2.0 * pos_tol;
+    if let Some(cmd) = base.arrival(state, goal, constraints, passed_end) {
+        return Err(cmd);
+    }
+    let yaw = state.pose.rotation.to_euler().yaw;
+    let epsi = normalize_angle(proj.heading - yaw);
+    base.status.cross_track_error = proj.lateral_error;
+    base.status.heading_error = epsi;
+    base.status.goal_reached = false;
+    Ok(Prepared {
+        proj,
+        pos_tol,
+        ang_tol,
+        epsi,
+        allow_reverse,
+    })
+}
+
+/// Speed feedback with a fallback on the last commanded speed for callers
+/// that do not report velocity.
+pub(crate) fn current_speed(state: &RobotState, last_commanded: f64) -> f64 {
+    if state.velocity.linear.abs() > 1e-9 {
+        state.velocity.linear
+    } else {
+        last_commanded
+    }
+}
+
+/// Lateral-speed feedback, analogous to `current_speed`. Only meaningful on
+/// a holonomic platform; callers pass 0.0 as the fallback otherwise.
+pub(crate) fn current_lateral_speed(state: &RobotState, last_commanded: f64) -> f64 {
+    if state.velocity.lateral.abs() > 1e-9 {
+        state.velocity.lateral
+    } else {
+        last_commanded
+    }
+}
+
+/// Turn-in-place hysteresis shared by the predictive controllers.
+pub(crate) fn update_turn_in_place(
+    flag: &mut bool,
+    state: &RobotState,
+    constraints: &RobotConstraints,
+    epsi: f64,
+    activation_deg: f64,
+    release_deg: f64,
+) -> bool {
+    if state.turn_first && can_turn_in_place(constraints.steering_type) {
+        let activation = activation_deg * PI / 180.0;
+        let release = release_deg * PI / 180.0;
+        if !*flag {
+            if epsi.abs() > activation {
+                *flag = true;
+            }
+        } else if epsi.abs() < release {
+            *flag = false;
+        }
+    } else {
+        *flag = false;
+    }
+    *flag
+}
+
+/// Convert the first `(steer, accel, accel_lat)` of a solution into a
+/// command. On a holonomic platform `steer` is the yaw rate (holonomic is
+/// never Ackermann) and `vy_now`/`accel_lat` drive the lateral axis
+/// independently; otherwise `accel_lat` is always 0 and this is identical
+/// to the old two-control conversion.
+pub(crate) fn command_from_controls(
+    v_now: f64,
+    vy_now: f64,
+    steer: f64,
+    accel: f64,
+    accel_lat: f64,
+    dt: f64,
+    v_cap: f64,
+    constraints: &RobotConstraints,
+    cfg: &ControllerConfig,
+    allow_reverse: bool,
+    turning_in_place: bool,
+    epsi: f64,
+    message: &str,
+) -> VelocityCommand {
+    if turning_in_place {
+        let omega = cfg.kp_angular.max(0.1) * epsi;
+        return finalize(0.0, omega, constraints, cfg, allow_reverse, "Turning to align");
+    }
+    let cap = if v_cap > 0.0 { v_cap } else { f64::INFINITY };
+    let v = (v_now + accel * dt).clamp(-cap, cap);
+    if is_holonomic(constraints.steering_type) {
+        let vy = vy_now + accel_lat * dt;
+        return finalize_holonomic(v, vy, steer, constraints, cfg, message);
+    }
+    let omega = if is_ackermann(constraints.steering_type) {
+        v * steer.tan() / wheelbase(constraints)
+    } else {
+        steer
+    };
+    finalize(v, omega, constraints, cfg, allow_reverse, message)
+}
+
+/// Importance weights `exp(-(S - min S) / lambda)`, normalised.
+pub(crate) fn importance_weights(costs: &[f64], temperature: f64) -> Vec<f64> {
+    let lambda = temperature.max(1e-6);
+    let min = costs.iter().cloned().fold(f64::INFINITY, f64::min);
+    let mut w: Vec<f64> = costs
+        .iter()
+        .map(|c| (-(c - min) / lambda).max(-700.0).exp())
+        .collect();
+    let sum: f64 = w.iter().sum();
+    if sum > 1e-300 {
+        for x in w.iter_mut() {
+            *x /= sum;
+        }
+    } else {
+        let n = w.len().max(1) as f64;
+        for x in w.iter_mut() {
+            *x = 1.0 / n;
+        }
+    }
+    w
 }
 
 #[derive(Clone, Debug)]
 pub struct MppiFollower {
     pub base: ControllerBase,
     pub mppi_config: MppiConfig,
+    cursor: PathCursor,
     mean_steering: Vec<f64>,
     mean_acceleration: Vec<f64>,
+    mean_accel_lateral: Vec<f64>,
     predicted_trajectory: Vec<Point>,
     is_turning_in_place: bool,
+    last_v: f64,
+    last_vy: f64,
+    shift_accum: f64,
+    trajectory: Option<Trajectory>,
+    clock: f64,
     rng: StdRng,
 }
 
@@ -95,27 +537,29 @@ impl MppiFollower {
     }
 
     pub fn with_mppi_config(cfg: MppiConfig) -> Self {
-        let n = cfg.horizon_steps;
-        Self {
-            base: ControllerBase::default(),
-            mean_steering: vec![0.0; n],
-            mean_acceleration: vec![0.0; n],
-            predicted_trajectory: Vec::new(),
-            is_turning_in_place: false,
-            rng: StdRng::from_entropy(),
-            mppi_config: cfg,
-        }
+        Self::build(cfg, StdRng::from_entropy())
     }
 
     pub fn with_seed(cfg: MppiConfig, seed: u64) -> Self {
+        Self::build(cfg, StdRng::seed_from_u64(seed))
+    }
+
+    fn build(cfg: MppiConfig, rng: StdRng) -> Self {
         let n = cfg.horizon_steps;
         Self {
             base: ControllerBase::default(),
             mean_steering: vec![0.0; n],
             mean_acceleration: vec![0.0; n],
+            mean_accel_lateral: vec![0.0; n],
             predicted_trajectory: Vec::new(),
             is_turning_in_place: false,
-            rng: StdRng::seed_from_u64(seed),
+            last_v: 0.0,
+            last_vy: 0.0,
+            shift_accum: 0.0,
+            trajectory: None,
+            clock: 0.0,
+            rng,
+            cursor: PathCursor::default(),
             mppi_config: cfg,
         }
     }
@@ -124,6 +568,7 @@ impl MppiFollower {
         let n = cfg.horizon_steps;
         self.mean_steering = vec![0.0; n];
         self.mean_acceleration = vec![0.0; n];
+        self.mean_accel_lateral = vec![0.0; n];
         self.mppi_config = cfg;
     }
 
@@ -131,213 +576,196 @@ impl MppiFollower {
         &self.predicted_trajectory
     }
 
-    pub(crate) fn calculate_path_error(&mut self, state: &RobotState) -> PathError {
-        let waypoints = &self.base.path.waypoints;
-        let mut min_distance = f64::MAX;
-        let mut nearest_idx = self.base.path_index;
-
-        for i in self.base.path_index..waypoints.len() {
-            let dist = state.pose.point.distance_to(waypoints[i].point);
-            if dist < min_distance {
-                min_distance = dist;
-                nearest_idx = i;
-            }
-            if i > self.base.path_index && dist > min_distance * 1.5 {
-                break;
-            }
+    pub(crate) fn weights(&self, cfg: &MppiConfig) -> CostWeights {
+        CostWeights {
+            cte: cfg.weight_cte,
+            epsi: cfg.weight_epsi,
+            vel: cfg.weight_vel,
+            steering: cfg.weight_steering,
+            accel: cfg.weight_acceleration,
         }
+    }
 
-        let nearest_point = waypoints[nearest_idx].point;
-        let path_heading = if nearest_idx + 1 < waypoints.len() {
-            let next = waypoints[nearest_idx + 1].point;
-            (next.y - nearest_point.y).atan2(next.x - nearest_point.x)
-        } else {
-            waypoints[nearest_idx].rotation.to_euler().yaw
+    /// Full MPPI tick with an additional stage cost `extra(step, x, y, yaw)`
+    /// and a scale on the executed speed (risk slowdown).
+    pub(crate) fn step_with(
+        &mut self,
+        state: &RobotState,
+        goal: &Goal,
+        constraints: &RobotConstraints,
+        dt: f64,
+        extra: &dyn Fn(usize, f64, f64, f64) -> f64,
+        ref_scale: f64,
+        message: &str,
+        mode: &str,
+    ) -> VelocityCommand {
+        let prep = match prepare(&mut self.base, &mut self.cursor, state, goal, constraints, dt) {
+            Ok(p) => p,
+            Err(cmd) => {
+                self.predicted_trajectory.clear();
+                return cmd;
+            }
         };
-
-        let dx = state.pose.point.x - nearest_point.x;
-        let dy = state.pose.point.y - nearest_point.y;
-        let cte = -dx * path_heading.sin() + dy * path_heading.cos();
-        let epsi = normalize_angle(state.pose.rotation.to_euler().yaw - path_heading);
-
-        self.base.path_index = nearest_idx;
-        PathError {
-            nearest_index: nearest_idx,
-            cte,
-            epsi,
+        let mut working = self.mppi_config.clone();
+        let turning = update_turn_in_place(
+            &mut self.is_turning_in_place,
+            state,
+            constraints,
+            prep.epsi,
+            working.turn_first_activation_deg,
+            working.turn_first_release_deg,
+        );
+        if turning {
+            working.ref_velocity = 0.2;
+            working.weight_vel = 50.0;
         }
-    }
+        let speed_scale = ref_scale.clamp(0.0, 1.0);
 
-    pub(crate) fn calculate_reference_trajectory(
-        &self,
-        error: &PathError,
-        working_cfg: &MppiConfig,
-    ) -> ReferenceTrajectory {
-        let waypoints = &self.base.path.waypoints;
-        let start_idx = error.nearest_index;
-        let horizon = working_cfg.horizon_steps;
-
-        let mut remaining = vec![0.0_f64; waypoints.len()];
-        for i in (0..waypoints.len().saturating_sub(1)).rev() {
-            remaining[i] =
-                remaining[i + 1] + waypoints[i].point.distance_to(waypoints[i + 1].point);
+        let n = working.horizon_steps.max(1);
+        let k = working.num_samples.max(1);
+        if self.mean_steering.len() != n {
+            self.mean_steering = vec![0.0; n];
+            self.mean_acceleration = vec![0.0; n];
+            self.mean_accel_lateral = vec![0.0; n];
         }
 
-        let mut ref_traj = ReferenceTrajectory {
-            x: Vec::with_capacity(horizon + 1),
-            y: Vec::with_capacity(horizon + 1),
-            yaw: Vec::with_capacity(horizon + 1),
-            velocity: Vec::with_capacity(horizon + 1),
+        let v_now = current_speed(state, self.last_v);
+        let vy_now = current_lateral_speed(state, self.last_vy);
+        let model = Model::new(state, constraints, v_now, vy_now, working.dt, prep.allow_reverse);
+        let reference = match &self.trajectory {
+            Some(traj) => build_timed_reference(traj, self.clock, n, working.dt),
+            None => build_reference(
+                &self.base.path,
+                &self.cursor.cum,
+                prep.proj.arc_length,
+                n,
+                working.dt,
+                working.ref_velocity.min(constraints.max_linear_velocity),
+                working.decel_distance,
+            ),
         };
-
-        for i in 0..=horizon {
-            let distance_ahead = working_cfg.ref_velocity * working_cfg.dt * i as f64;
-
-            let mut target_idx = start_idx;
-            let mut accumulated = 0.0;
-            while target_idx + 1 < waypoints.len() && accumulated < distance_ahead {
-                accumulated += waypoints[target_idx]
-                    .point
-                    .distance_to(waypoints[target_idx + 1].point);
-                if accumulated < distance_ahead {
-                    target_idx += 1;
-                }
-            }
-            let target_idx = target_idx.min(waypoints.len() - 1);
-
-            ref_traj.x.push(waypoints[target_idx].point.x);
-            ref_traj.y.push(waypoints[target_idx].point.y);
-
-            let yaw = if target_idx + 1 < waypoints.len() {
-                let next = waypoints[target_idx + 1].point;
-                let curr = waypoints[target_idx].point;
-                (next.y - curr.y).atan2(next.x - curr.x)
-            } else {
-                waypoints[target_idx].rotation.to_euler().yaw
-            };
-            ref_traj.yaw.push(yaw);
-
-            let dist_to_end = remaining[target_idx];
-            let ref_vel =
-                if working_cfg.decel_distance > 1e-6 && dist_to_end < working_cfg.decel_distance {
-                    (working_cfg.ref_velocity * (dist_to_end / working_cfg.decel_distance)).max(0.0)
-                } else {
-                    working_cfg.ref_velocity
-                };
-            ref_traj.velocity.push(ref_vel);
-        }
-        ref_traj
-    }
-}
-
-/// Shared single-sample rollout used by MPPI and its variants (MCA, SOC).
-/// Returns the sample cost and optionally the full trajectory.
-pub(crate) struct RolloutResult {
-    pub cost: f64,
-    pub trajectory: Vec<Point>,
-}
-
-pub(crate) fn rollout_sample<R: Rng>(
-    rng: &mut R,
-    state: &RobotState,
-    constraints: &RobotConstraints,
-    working: &MppiConfig,
-    mean_steering: &[f64],
-    mean_acceleration: &[f64],
-    ref_traj: &ReferenceTrajectory,
-    is_diff: bool,
-    steering_dist: &Normal<f64>,
-    accel_dist: &Normal<f64>,
-    out_noise_steering: &mut [f64],
-    out_noise_accel: &mut [f64],
-    collect_trajectory: bool,
-) -> RolloutResult {
-    let n = working.horizon_steps;
-    let dt = working.dt;
-
-    let mut x = state.pose.point.x;
-    let mut y = state.pose.point.y;
-    let mut yaw = state.pose.rotation.to_euler().yaw;
-    let mut v = state.velocity.linear;
-
-    let mut trajectory = Vec::new();
-    if collect_trajectory {
-        trajectory.reserve(n + 1);
-        trajectory.push(Point::new(x, y, 0.0));
-    }
-
-    let mut sample_cost = 0.0;
-
-    for i in 0..n {
-        let eps_delta = steering_dist.sample(rng);
-        let eps_acc = accel_dist.sample(rng);
-        out_noise_steering[i] = eps_delta;
-        out_noise_accel[i] = eps_acc;
-
-        let mut delta_or_omega = mean_steering[i] + eps_delta;
-        let mut a = mean_acceleration[i] + eps_acc;
-
-        if is_diff {
-            delta_or_omega = delta_or_omega.clamp(
-                -constraints.max_angular_velocity,
-                constraints.max_angular_velocity,
-            );
-        } else {
-            delta_or_omega = delta_or_omega.clamp(
-                -constraints.max_steering_angle,
-                constraints.max_steering_angle,
-            );
-        }
-        a = a.clamp(
-            -constraints.max_linear_acceleration,
-            constraints.max_linear_acceleration,
+        let w = self.weights(&working);
+        model.clamp_controls(
+            &mut self.mean_steering,
+            &mut self.mean_acceleration,
+            &mut self.mean_accel_lateral,
         );
 
-        let lf = constraints.wheelbase;
+        let sigma_s = working.steering_noise.max(1e-6);
+        let sigma_a = working.acceleration_noise.max(1e-6);
+        let sigma_al = working.acceleration_noise.max(1e-6);
+        let dist_s = Normal::new(0.0, sigma_s).unwrap();
+        let dist_a = Normal::new(0.0, sigma_a).unwrap();
+        let dist_al = Normal::new(0.0, sigma_al).unwrap();
+        let lambda = working.temperature.max(1e-6);
 
-        x += v * yaw.cos() * dt;
-        y += v * yaw.sin() * dt;
-        if is_diff {
-            yaw += delta_or_omega * dt;
-        } else {
-            yaw += v * delta_or_omega / lf * dt;
+        let mut costs = vec![0.0; k];
+        let mut noise_s = vec![vec![0.0; n]; k];
+        let mut noise_a = vec![vec![0.0; n]; k];
+        let mut noise_al = vec![vec![0.0; n]; k];
+        let mut steer = vec![0.0; n];
+        let mut accel = vec![0.0; n];
+        let mut accel_lat = vec![0.0; n];
+        for j in 0..k {
+            let mut control_cost = 0.0;
+            for t in 0..n {
+                let es = dist_s.sample(&mut self.rng);
+                let ea = dist_a.sample(&mut self.rng);
+                let eal = dist_al.sample(&mut self.rng);
+                noise_s[j][t] = es;
+                noise_a[j][t] = ea;
+                noise_al[j][t] = eal;
+                steer[t] = self.mean_steering[t] + es;
+                accel[t] = self.mean_acceleration[t] + ea;
+                accel_lat[t] = self.mean_accel_lateral[t] + eal;
+                control_cost += self.mean_steering[t] * es / (sigma_s * sigma_s)
+                    + self.mean_acceleration[t] * ea / (sigma_a * sigma_a)
+                    + self.mean_accel_lateral[t] * eal / (sigma_al * sigma_al);
+            }
+            let (c, _) = rollout(&model, &steer, &accel, &accel_lat, &reference, &w, extra, false);
+            costs[j] = c + lambda * control_cost;
         }
-        yaw = normalize_angle(yaw);
-        v += a * dt;
-        v = v.clamp(
-            constraints.min_linear_velocity,
-            constraints.max_linear_velocity,
+
+        let weights = importance_weights(&costs, lambda);
+        for t in 0..n {
+            let mut ds = 0.0;
+            let mut da = 0.0;
+            let mut dal = 0.0;
+            for j in 0..k {
+                ds += weights[j] * noise_s[j][t];
+                da += weights[j] * noise_a[j][t];
+                dal += weights[j] * noise_al[j][t];
+            }
+            self.mean_steering[t] += ds;
+            self.mean_acceleration[t] += da;
+            self.mean_accel_lateral[t] += dal;
+        }
+        model.clamp_controls(
+            &mut self.mean_steering,
+            &mut self.mean_acceleration,
+            &mut self.mean_accel_lateral,
         );
 
-        if collect_trajectory {
-            trajectory.push(Point::new(x, y, 0.0));
+        let (_, traj) = rollout(
+            &model,
+            &self.mean_steering,
+            &self.mean_acceleration,
+            &self.mean_accel_lateral,
+            &reference,
+            &w,
+            extra,
+            true,
+        );
+        self.predicted_trajectory = traj;
+
+        let steer0 = self.mean_steering[0];
+        let accel0 = self.mean_acceleration[0];
+        let accel_lat0 = self.mean_accel_lateral[0];
+        self.shift_accum += dt;
+        if self.shift_accum >= working.dt {
+            self.shift_accum -= working.dt;
+            self.mean_steering.rotate_left(1);
+            self.mean_acceleration.rotate_left(1);
+            self.mean_accel_lateral.rotate_left(1);
+            if n > 1 {
+                self.mean_steering[n - 1] = self.mean_steering[n - 2];
+                self.mean_acceleration[n - 1] = self.mean_acceleration[n - 2];
+                self.mean_accel_lateral[n - 1] = self.mean_accel_lateral[n - 2];
+            }
         }
 
-        let ref_idx = (i + 1).min(ref_traj.x.len() - 1);
-        let ref_x = ref_traj.x[ref_idx];
-        let ref_y = ref_traj.y[ref_idx];
-        let ref_yaw = ref_traj.yaw[ref_idx];
-        let ref_v = ref_traj.velocity[ref_idx];
-
-        let dx = x - ref_x;
-        let dy = y - ref_y;
-        let cte = -dx * ref_yaw.sin() + dy * ref_yaw.cos();
-        let epsi = normalize_angle(yaw - ref_yaw);
-        let vel_error = v - ref_v;
-
-        let mut cost = 0.0;
-        cost += working.weight_cte * cte * cte;
-        cost += working.weight_epsi * epsi * epsi;
-        cost += working.weight_vel * vel_error * vel_error;
-        cost += working.weight_steering * delta_or_omega * delta_or_omega;
-        cost += working.weight_acceleration * a * a;
-
-        sample_cost += cost * dt;
-    }
-
-    RolloutResult {
-        cost: sample_cost,
-        trajectory,
+        let dt_apply = dt.min(working.dt);
+        let v_cap = speed_at_arc_length(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length)
+            .unwrap_or(f64::INFINITY)
+            .min(speed_scale * constraints.max_linear_velocity.max(0.0));
+        self.base.status.mode = mode.into();
+        let cmd = command_from_controls(
+            v_now,
+            vy_now,
+            steer0,
+            accel0,
+            accel_lat0,
+            dt_apply,
+            v_cap,
+            constraints,
+            &self.base.config,
+            prep.allow_reverse,
+            turning,
+            prep.epsi,
+            message,
+        );
+        let physical = matches!(self.base.config.output_units, crate::types::OutputUnits::Physical);
+        self.last_v = if cmd.valid && physical {
+            cmd.linear_velocity
+        } else {
+            (v_now + accel0 * dt_apply).clamp(-v_cap, v_cap)
+        };
+        self.last_vy = if cmd.valid && physical {
+            cmd.lateral_velocity
+        } else {
+            vy_now + accel_lat0 * dt_apply
+        };
+        cmd
     }
 }
 
@@ -347,245 +775,58 @@ impl Controller for MppiFollower {
         state: &RobotState,
         goal: &Goal,
         constraints: &RobotConstraints,
-        _dt: f64,
+        dt: f64,
         _world: Option<&WorldConstraints>,
     ) -> VelocityCommand {
-        if self.base.path.waypoints.is_empty() {
-            return VelocityCommand::invalid("no path");
-        }
-
-        let error = self.calculate_path_error(state);
-
-        let mut working = self.mppi_config.clone();
-        let is_diff = matches!(
-            constraints.steering_type,
-            SteeringType::Differential | SteeringType::SkidSteer
-        );
-
-        if state.turn_first && is_diff {
-            let activation = self.mppi_config.turn_first_activation_deg * PI / 180.0;
-            let release = self.mppi_config.turn_first_release_deg * PI / 180.0;
-            let heading_err_abs = error.epsi.abs();
-            if !self.is_turning_in_place {
-                if heading_err_abs > activation {
-                    self.is_turning_in_place = true;
-                }
-            } else if heading_err_abs < release {
-                self.is_turning_in_place = false;
-            }
-            if self.is_turning_in_place {
-                working.ref_velocity = 0.2;
-                working.weight_vel = 50.0;
-            }
-        } else {
-            self.is_turning_in_place = false;
-        }
-
-        let cfg = self.base.config.clone();
-        let (reached, dist, yaw_diff) = is_goal_reached(
-            &state.pose,
-            &goal.target_pose,
-            cfg.goal_tolerance,
-            cfg.angular_tolerance,
-        );
-        self.base.status.distance_to_goal = dist;
-        self.base.status.heading_error = yaw_diff;
-
-        if reached {
-            self.base.status.goal_reached = true;
-            self.base.status.mode = "stopped".into();
-            return VelocityCommand {
-                valid: true,
-                status_message: "Goal reached".into(),
-                ..VelocityCommand::default()
-            };
-        }
-
-        let n = working.horizon_steps;
-        let k = working.num_samples;
-        let dt = working.dt;
-
-        if self.mean_steering.len() != n {
-            self.mean_steering = vec![0.0; n];
-            self.mean_acceleration = vec![0.0; n];
-        }
-
-        let ref_traj = self.calculate_reference_trajectory(&error, &working);
-
-        let steering_dist = Normal::new(0.0, working.steering_noise.max(1e-9)).unwrap();
-        let accel_dist = Normal::new(0.0, working.acceleration_noise.max(1e-9)).unwrap();
-
-        let mut costs = vec![0.0_f64; k];
-        let mut noise_steering = vec![vec![0.0_f64; n]; k];
-        let mut noise_accel = vec![vec![0.0_f64; n]; k];
-        let mut best_cost = f64::INFINITY;
-        let mut best_trajectory: Vec<Point> = Vec::new();
-
-        for idx in 0..k {
-            let result = rollout_sample(
-                &mut self.rng,
-                state,
-                constraints,
-                &working,
-                &self.mean_steering,
-                &self.mean_acceleration,
-                &ref_traj,
-                is_diff,
-                &steering_dist,
-                &accel_dist,
-                &mut noise_steering[idx],
-                &mut noise_accel[idx],
-                idx == 0, // only collect the first sample's trajectory initially
-            );
-            costs[idx] = result.cost;
-            if result.cost < best_cost {
-                best_cost = result.cost;
-                if !result.trajectory.is_empty() {
-                    best_trajectory = result.trajectory;
-                }
-            }
-        }
-
-        let temperature = working.temperature.max(1e-6);
-        let beta = 1.0 / temperature;
-        let min_cost = costs.iter().cloned().fold(f64::INFINITY, f64::min);
-
-        let mut weights = vec![0.0_f64; k];
-        let mut weight_sum = 0.0_f64;
-        for i in 0..k {
-            let exponent = (-beta * (costs[i] - min_cost)).max(-60.0);
-            let w = exponent.exp();
-            weights[i] = w;
-            weight_sum += w;
-        }
-        if weight_sum < 1e-12 {
-            weight_sum = 1.0;
-        }
-
-        for i in 0..n {
-            let mut d_delta = 0.0;
-            let mut d_acc = 0.0;
-            for j in 0..k {
-                let w = weights[j] / weight_sum;
-                d_delta += w * noise_steering[j][i];
-                d_acc += w * noise_accel[j][i];
-            }
-            self.mean_steering[i] += d_delta;
-            self.mean_acceleration[i] += d_acc;
-
-            if is_diff {
-                self.mean_steering[i] = self.mean_steering[i].clamp(
-                    -constraints.max_angular_velocity,
-                    constraints.max_angular_velocity,
-                );
-            } else {
-                self.mean_steering[i] = self.mean_steering[i].clamp(
-                    -constraints.max_steering_angle,
-                    constraints.max_steering_angle,
-                );
-            }
-            self.mean_acceleration[i] = self.mean_acceleration[i].clamp(
-                -constraints.max_linear_acceleration,
-                constraints.max_linear_acceleration,
-            );
-        }
-
-        let steering_or_omega = *self.mean_steering.first().unwrap_or(&0.0);
-        let acceleration = *self.mean_acceleration.first().unwrap_or(&0.0);
-
-        // Shift means left for warm-start.
-        for i in 0..n.saturating_sub(1) {
-            self.mean_steering[i] = self.mean_steering[i + 1];
-            self.mean_acceleration[i] = self.mean_acceleration[i + 1];
-        }
-        if n > 0 {
-            self.mean_steering[n - 1] = 0.0;
-            self.mean_acceleration[n - 1] = 0.0;
-        }
-
-        self.predicted_trajectory = best_trajectory;
-
-        self.base.status.distance_to_goal = state.pose.point.distance_to(goal.target_pose.point);
-        self.base.status.cross_track_error = error.cte.abs();
-        self.base.status.heading_error = error.epsi.abs();
-        self.base.status.goal_reached = false;
-        self.base.status.mode = "mppi_tracking".into();
-
-        // Target velocity from actual kinematic integration (same reasoning
-        // as MPC): the sampler is already biasing toward deceleration via
-        // the tapered reference velocity, so integrating current v with the
-        // MPPI acceleration gives a clean output.
-        let mut target_velocity = state.velocity.linear + acceleration * dt;
-        let min_vel = if cfg.allow_reverse {
-            constraints.min_linear_velocity
-        } else {
-            0.0
-        };
-        target_velocity = target_velocity.clamp(min_vel, constraints.max_linear_velocity);
-
-        let angular_output = if is_diff {
-            steering_or_omega.clamp(
-                -constraints.max_angular_velocity,
-                constraints.max_angular_velocity,
-            )
-        } else {
-            steering_or_omega.clamp(
-                -constraints.max_steering_angle,
-                constraints.max_steering_angle,
-            )
-        };
-
-        let (linear, angular) = match cfg.output_units {
-            OutputUnits::Normalized => {
-                let linear = if constraints.max_linear_velocity > 0.0 {
-                    target_velocity / constraints.max_linear_velocity
-                } else {
-                    0.0
-                };
-                let angular = if is_diff {
-                    if constraints.max_angular_velocity > 0.0 {
-                        angular_output / constraints.max_angular_velocity
-                    } else {
-                        0.0
-                    }
-                } else if constraints.max_steering_angle > 0.0 {
-                    angular_output / constraints.max_steering_angle
-                } else {
-                    0.0
-                };
-                (linear, angular)
-            }
-            OutputUnits::Physical => (target_velocity, angular_output),
-        };
-
-        let linear = if self.is_turning_in_place {
-            0.0
-        } else {
-            linear
-        };
-
-        VelocityCommand {
-            valid: true,
-            status_message: "MPPI tracking".into(),
-            linear_velocity: linear,
-            angular_velocity: angular,
-            ..VelocityCommand::default()
-        }
+        self.step_with(
+            state,
+            goal,
+            constraints,
+            dt,
+            &|_, _, _, _| 0.0,
+            1.0,
+            "MPPI tracking",
+            "mppi_tracking",
+        )
     }
 
-    fn reset(&mut self) {
-        self.base.path.waypoints.clear();
+    fn set_trajectory(&mut self, trajectory: Trajectory) {
+        self.set_path(trajectory.to_path());
+        self.trajectory = Some(trajectory);
+        self.clock = 0.0;
+    }
+
+    fn set_time(&mut self, t: f64) {
+        self.clock = t;
+    }
+
+    fn set_path(&mut self, path: Path) {
+        self.trajectory = None;
+        self.cursor.set_path(&path.waypoints);
+        self.base.path = path;
         self.base.path_index = 0;
         self.base.status = Default::default();
         let n = self.mppi_config.horizon_steps;
         self.mean_steering = vec![0.0; n];
         self.mean_acceleration = vec![0.0; n];
+        self.mean_accel_lateral = vec![0.0; n];
         self.predicted_trajectory.clear();
         self.is_turning_in_place = false;
+        self.shift_accum = 0.0;
+    }
+
+    fn reset(&mut self) {
+        self.set_path(Path::default());
+        self.last_v = 0.0;
+        self.last_vy = 0.0;
     }
 
     fn get_type(&self) -> &'static str {
         "mppi_follower"
+    }
+
+    fn predicted_trajectory(&self) -> Vec<Point> {
+        self.predicted_trajectory.clone()
     }
 
     fn base(&self) -> &ControllerBase {
