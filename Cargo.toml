@@ -1,6 +1,6 @@
 [package]
 name = "ondrive"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 description = "Rust motion-control / path-tracking library for mobile robots (PID, pure pursuit, Stanley, LQR, MPC, MPPI, ...)"
 license = "MIT"
