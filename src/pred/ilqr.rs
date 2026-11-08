@@ -17,6 +17,7 @@ use crate::core::obstacles::{footprint_discs, obstacle_barrier};
 use crate::core::path::PathCursor;
 use crate::pred::mpc::{SIDE_SWITCH_COST, guided};
 use crate::pred::mppi::{
+    command_base,
     Model, Reference, build_reference, build_timed_reference, command_from_controls, eased_lateral,
     current_lateral_speed, current_speed, prepare, speed_at_arc_length, update_turn_in_place,
 };
@@ -484,8 +485,12 @@ impl Controller for IlqrFollower {
         let v_now = current_speed(state, self.last_v);
         let vy_now = current_lateral_speed(state, self.last_vy);
         let mut model = Model::new(state, constraints, v_now, vy_now, cfg.dt, prep.allow_reverse);
-        if model.ackermann && model.steer_rate.is_finite() && let Some(a) = self.actuated {
-            model.steer0 = a;
+        if model.ackermann && model.steer_rate.is_finite() {
+            if crate::pred::mpc::measures_steering(state) {
+                self.actuated = Some(model.steer0);
+            } else if let Some(a) = self.actuated {
+                model.steer0 = a;
+            }
         }
         let mut reference = match &self.trajectory {
             Some(traj) => build_timed_reference(traj, self.clock, n, cfg.dt),
@@ -570,8 +575,9 @@ impl Controller for IlqrFollower {
         let v_cap = speed_at_arc_length(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length)
             .unwrap_or(f64::INFINITY);
         self.base.status.mode = "ilqr_tracking".into();
+        let base = command_base(v_now, self.last_v, accel0);
         let cmd = command_from_controls(
-            v_now,
+            base,
             vy_now,
             steer0,
             accel0,
@@ -585,7 +591,7 @@ impl Controller for IlqrFollower {
             prep.epsi,
             "iLQR tracking",
         );
-        self.last_v = (v_now + accel0 * dt_apply).clamp(-v_cap, v_cap);
+        self.last_v = (base + accel0 * dt_apply).clamp(-v_cap, v_cap);
         self.last_vy = vy_now + accel_lat0 * dt_apply;
         cmd
     }

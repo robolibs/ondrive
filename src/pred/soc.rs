@@ -19,8 +19,9 @@ use crate::core::kinematics::planning;
 use crate::core::obstacles::{CollisionChecker, robot_radius};
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
+    command_base,
     CostWeights, Model, Track, build_reference, build_timed_reference, command_from_controls, current_lateral_speed,
-    correlated_noise, current_speed, detour_relax, detoured, effective_sample_size, guide_paths, savitzky_golay,
+    correlated_noise, current_speed, detour_relax, effective_sample_size, guide_paths, left_by, pick_detour, pursue, savitzky_golay,
     importance_weights, prepare, speed_at_arc_length, update_turn_in_place,
 };
 use crate::types::{
@@ -436,12 +437,19 @@ impl Controller for SocFollower {
         );
         let obstacles: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
         self.debug.guides.clear();
+        let mut detour: Vec<(f64, f64)> = Vec::new();
         if !obstacles.is_empty() {
             let ahead = match &self.trajectory {
                 Some(traj) => build_timed_reference(traj, self.clock, n, cfg.dt),
                 None => build_reference(&self.base.path, &self.cursor.cum, prep.proj.arc_length, n, cfg.dt, speed, 0.0),
             };
-            let points = detoured(&ahead, obstacles, robot_radius(constraints), cfg.dt, &mut self.side);
+            let points = match pick_detour(&ahead, obstacles, robot_radius(constraints), cfg.dt, &mut self.side) {
+                Some(g) => {
+                    detour = (0..g.x.len()).map(|i| (g.x[i], g.y[i])).collect();
+                    left_by(&ahead, &g)
+                }
+                None => Vec::new(),
+            };
             if self.debug_level >= DebugLevel::Basic {
                 self.debug.guides = guide_paths(&ahead, obstacles, robot_radius(constraints), cfg.dt);
             }
@@ -496,6 +504,11 @@ impl Controller for SocFollower {
             for i in 1..3 {
                 model.clamp_controls(&mut guides_s[i], &mut guides_a[i], &mut guides_al[i]);
             }
+        }
+        // A fourth guide pursues the detour round the obstacles ahead.
+        if k_guide >= 4 && detour.len() > 1 {
+            pursue(&model, &detour, speed, &mut guides_s[3], &mut guides_a[3], &mut guides_al[3]);
+            model.clamp_controls(&mut guides_s[3], &mut guides_a[3], &mut guides_al[3]);
         }
 
         if cfg.svgd_iterations > 0 {
@@ -630,8 +643,9 @@ impl Controller for SocFollower {
         let v_cap = speed_at_arc_length(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length)
             .unwrap_or(f64::INFINITY);
         self.base.status.mode = "soc_tracking".into();
+        let base = command_base(v_now, self.last_v, accel0);
         let cmd = command_from_controls(
-            v_now,
+            base,
             vy_now,
             steer0,
             accel0,
@@ -645,7 +659,7 @@ impl Controller for SocFollower {
             prep.epsi,
             "SOC tracking",
         );
-        self.last_v = (v_now + accel0 * dt_apply).clamp(-v_cap, v_cap);
+        self.last_v = (base + accel0 * dt_apply).clamp(-v_cap, v_cap);
         self.last_vy = vy_now + accel_lat0 * dt_apply;
         cmd
     }

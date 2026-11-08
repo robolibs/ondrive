@@ -10,6 +10,7 @@ use crate::core::kinematics::planning;
 use crate::core::obstacles::{CollisionChecker, footprint_discs, obstacle_barrier};
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
+    command_base,
     CostWeights, Model, Reference, build_reference, build_timed_reference, command_from_controls,
     current_lateral_speed, current_speed, prepare, rollout, speed_at_arc_length,
     update_turn_in_place,
@@ -123,6 +124,17 @@ pub(crate) fn reference_path(r: &Reference) -> Vec<Point> {
 
 /// Lateral and heading weight scale where a detour leaves the reference.
 pub(crate) const DETOURED_WEIGHT: f64 = 0.1;
+
+/// Whether `state` measures the steering angle (from its yaw rate and
+/// speed) well enough to start a solve from: moving faster than
+/// `MEASURED_STEERING_SPEED`.
+pub(crate) fn measures_steering(state: &RobotState) -> bool {
+    state.velocity_valid && state.velocity.linear.abs() > MEASURED_STEERING_SPEED
+}
+
+/// Speed, m/s, above which the steering read from yaw rate and speed is
+/// taken over the commanded steering's model.
+const MEASURED_STEERING_SPEED: f64 = 0.3;
 
 /// The steering reached `dt` after commanding `command` from `previous`
 /// (the model's starting steering before any command), through the
@@ -395,8 +407,12 @@ impl Controller for MpcFollower {
         let v_now = current_speed(state, self.last_v);
         let vy_now = current_lateral_speed(state, self.last_vy);
         let mut model = Model::new(state, constraints, v_now, vy_now, cfg.dt, prep.allow_reverse);
-        if model.ackermann && model.steer_rate.is_finite() && let Some(a) = self.actuated {
-            model.steer0 = a;
+        if model.ackermann && model.steer_rate.is_finite() {
+            if measures_steering(state) {
+                self.actuated = Some(model.steer0);
+            } else if let Some(a) = self.actuated {
+                model.steer0 = a;
+            }
         }
         let mut reference = match &self.trajectory {
             Some(traj) => build_timed_reference(traj, self.clock, n, cfg.dt),
@@ -487,8 +503,9 @@ impl Controller for MpcFollower {
         let v_cap = speed_at_arc_length(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length)
             .unwrap_or(f64::INFINITY);
         self.base.status.mode = "mpc_tracking".into();
+        let base = command_base(v_now, self.last_v, accel0);
         let cmd = command_from_controls(
-            v_now,
+            base,
             vy_now,
             steer0,
             accel0,
@@ -502,7 +519,7 @@ impl Controller for MpcFollower {
             prep.epsi,
             "MPC tracking",
         );
-        self.last_v = (v_now + accel0 * dt_apply).clamp(-v_cap, v_cap);
+        self.last_v = (base + accel0 * dt_apply).clamp(-v_cap, v_cap);
         self.last_vy = vy_now + accel_lat0 * dt_apply;
         cmd
     }
