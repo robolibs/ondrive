@@ -248,9 +248,9 @@ impl Controller for McaFollower {
             return self.mppi.step_with(state, goal, constraints, dt, &|_, _, _, _| 0.0, &|_, _| (1.0, 0.0), 1.0, "MCA tracking", "mca_tracking");
         }
 
+        let (n, step) = self.mppi.plan_for(constraints);
+        let (n, step) = (n.max(1), step.max(1e-3));
         let cfg = &self.mca_config;
-        let n = cfg.horizon_steps.max(1);
-        let step = self.mppi.step_for(constraints).max(1e-3);
         let margin = cfg.robot_radius_margin.max(0.0);
         let discs: Vec<(f64, f64)> = footprint_discs(constraints).into_iter().map(|(x, r)| (x, r + margin)).collect();
         let modes: Vec<Vec<Vec<ModeAt>>> = (0..n)

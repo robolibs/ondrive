@@ -46,19 +46,27 @@ pub fn actuation_delay(constraints: &RobotConstraints) -> f64 {
     if lock > 0.0 && rate > 0.0 { (0.5 * lock / rate).min(1.5) } else { 0.0 }
 }
 
-/// Step of a predictive controller planning `n` steps of `dt` at `speed`:
-/// `dt`, stretched on an Ackermann machine so the horizon spans two of its
-/// tightest turning radii and two half swings of its steering (what it takes
-/// to see an obstacle and get round it), at most 12 s in all.
-pub fn planning_step(constraints: &RobotConstraints, speed: f64, n: usize, dt: f64) -> f64 {
-    let n = n.max(1) as f64;
+/// Steps and step of a predictive controller configured for `n` steps of
+/// `dt` at `speed`: as configured, or on an Ackermann machine a horizon long
+/// enough to span two of its tightest turning radii and two half swings of
+/// its steering (what it takes to see an obstacle and get round it), at most
+/// 12 s, made of steps no longer than `MAX_PLANNING_STEP` (or `dt`, if longer).
+pub fn planning(constraints: &RobotConstraints, speed: f64, n: usize, dt: f64) -> (usize, f64) {
+    let n = n.max(1);
     let k = max_curvature(constraints);
     if !is_ackermann(constraints.steering_type) || !(k.is_finite() && k > 0.0) {
-        return dt;
+        return (n, dt);
     }
-    let needed = 2.0 / (k * speed.abs().max(0.1)) + 2.0 * actuation_delay(constraints);
-    (n * dt).max(needed.min(12.0)) / n
+    let needed = (2.0 / (k * speed.abs().max(0.1)) + 2.0 * actuation_delay(constraints)).min(12.0);
+    if needed <= n as f64 * dt {
+        return (n, dt);
+    }
+    let step = (needed / n as f64).min(MAX_PLANNING_STEP.max(dt));
+    ((needed / step).ceil() as usize, step)
 }
+
+/// Longest step `planning` stretches a horizon to, seconds.
+pub const MAX_PLANNING_STEP: f64 = 0.25;
 
 /// Largest path curvature the platform can follow. Unbounded for platforms
 /// that can turn in place.

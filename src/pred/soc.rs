@@ -15,7 +15,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::controller::{Controller, ControllerBase};
-use crate::core::kinematics::planning_step;
+use crate::core::kinematics::planning;
 use crate::core::obstacles::{CollisionChecker, robot_radius};
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
@@ -382,7 +382,7 @@ impl Controller for SocFollower {
             }
         };
         let mut cfg = self.soc_config.clone();
-        cfg.dt = planning_step(constraints, cfg.ref_velocity.min(constraints.max_linear_velocity), cfg.horizon_steps, cfg.dt);
+        (cfg.horizon_steps, cfg.dt) = planning(constraints, cfg.ref_velocity.min(constraints.max_linear_velocity), cfg.horizon_steps, cfg.dt);
         let turning = update_turn_in_place(
             &mut self.is_turning_in_place,
             state,

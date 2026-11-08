@@ -11,7 +11,7 @@
 //! step's time, with a Gauss–Newton Hessian (constrained iLQR).
 
 use crate::controller::{Controller, ControllerBase};
-use crate::core::kinematics::{planning_step, wheelbase};
+use crate::core::kinematics::{planning, wheelbase};
 use crate::core::math::normalize_angle;
 use crate::core::obstacles::{footprint_discs, obstacle_barrier};
 use crate::core::path::PathCursor;
@@ -463,7 +463,7 @@ impl Controller for IlqrFollower {
             }
         };
         let mut cfg = self.ilqr_config.clone();
-        cfg.dt = planning_step(constraints, cfg.ref_velocity.min(constraints.max_linear_velocity), cfg.horizon_steps, cfg.dt);
+        (cfg.horizon_steps, cfg.dt) = planning(constraints, cfg.ref_velocity.min(constraints.max_linear_velocity), cfg.horizon_steps, cfg.dt);
         let turning = update_turn_in_place(
             &mut self.is_turning_in_place,
             state,

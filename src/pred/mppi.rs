@@ -13,7 +13,7 @@
 use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
     can_turn_in_place, finalize, finalize_holonomic, is_ackermann, is_holonomic, reverse_allowed,
-    planning_step, steering_limit, wheelbase,
+    planning, steering_limit, wheelbase,
 };
 use crate::core::math::normalize_angle;
 use crate::core::obstacles::{CollisionChecker, modes_at, robot_radius};
@@ -711,10 +711,11 @@ impl MppiFollower {
         Self::default()
     }
 
-    /// The step this controller plans with on the machine of `constraints`.
-    pub(crate) fn step_for(&self, constraints: &RobotConstraints) -> f64 {
+    /// The steps and step this controller plans with on the machine of
+    /// `constraints`.
+    pub(crate) fn plan_for(&self, constraints: &RobotConstraints) -> (usize, f64) {
         let c = &self.mppi_config;
-        planning_step(constraints, c.ref_velocity.min(constraints.max_linear_velocity), c.horizon_steps, c.dt)
+        planning(constraints, c.ref_velocity.min(constraints.max_linear_velocity), c.horizon_steps, c.dt)
     }
 
     /// Forgets the guides recorded for display.
@@ -830,7 +831,7 @@ impl MppiFollower {
             }
         };
         let mut working = self.mppi_config.clone();
-        working.dt = self.step_for(constraints);
+        (working.horizon_steps, working.dt) = self.plan_for(constraints);
         let turning = update_turn_in_place(
             &mut self.is_turning_in_place,
             state,
@@ -1084,8 +1085,8 @@ impl Controller for MppiFollower {
         if (obstacles.is_empty() && !has_grid) || (cfg.weight_collision <= 0.0 && cfg.weight_repulsion <= 0.0) {
             return self.step_with(state, goal, constraints, dt, &|_, _, _, _| 0.0, &|_, _| (1.0, 0.0), 1.0, "MPPI tracking", "mppi_tracking");
         }
-        let n = cfg.horizon_steps.max(1);
-        let step = self.step_for(constraints).max(1e-3);
+        let (n, step) = self.plan_for(constraints);
+        let (n, step) = (n.max(1), step.max(1e-3));
         let (collision, repulsion, reach) = (cfg.weight_collision, cfg.weight_repulsion, cfg.repulsion_distance.max(1e-3));
         let checker = CollisionChecker::new(world, constraints, 0.0).with_step(step).with_spread(1.0);
         let critic = |i: usize, x: f64, y: f64, yaw: f64| -> f64 {

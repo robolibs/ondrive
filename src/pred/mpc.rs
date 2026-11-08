@@ -6,7 +6,7 @@
 //! zero otherwise, so the solve is identical to the two-control case.
 
 use crate::controller::{Controller, ControllerBase};
-use crate::core::kinematics::planning_step;
+use crate::core::kinematics::planning;
 use crate::core::obstacles::{CollisionChecker, footprint_discs, obstacle_barrier};
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
@@ -341,7 +341,7 @@ impl Controller for MpcFollower {
             }
         };
         let mut cfg = self.mpc_config.clone();
-        cfg.dt = planning_step(constraints, cfg.ref_velocity.min(constraints.max_linear_velocity), cfg.horizon_steps, cfg.dt);
+        (cfg.horizon_steps, cfg.dt) = planning(constraints, cfg.ref_velocity.min(constraints.max_linear_velocity), cfg.horizon_steps, cfg.dt);
         let turning = update_turn_in_place(
             &mut self.is_turning_in_place,
             state,
