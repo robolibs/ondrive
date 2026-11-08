@@ -93,3 +93,15 @@ make.recipe{
     sh.git("rel", a.type)
   end,
 }
+
+make.recipe{
+  name = "test-py",
+  desc = "build the Python wheel and run the Python tests against it",
+  run = function()
+    sh.maturin("build", "--release", "--features", "python", "-o", "target/wheels")
+    local wheel = oslo.fs.glob("target/wheels/" .. NAME .. "-*.whl")[1]
+    assert(wheel, "no wheel in target/wheels")
+    sh.python3("-m", "pip", "install", "-q", "--no-deps", "--upgrade", "--target", "target/python", wheel)
+    sh.env("PYTHONPATH=target/python", "python3", "-m", "unittest", "discover", "-s", "tests/python", "-v")
+  end,
+}
