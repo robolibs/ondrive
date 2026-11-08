@@ -147,7 +147,9 @@ impl Problem<'_> {
             b[(2, 0)] = dt;
         }
         b[(3, 1)] = dt;
-        b[(4, 2)] = dt;
+        if self.model.accel_lat_bound() > 0.0 {
+            b[(4, 2)] = dt;
+        }
         (a, b)
     }
 
@@ -243,26 +245,25 @@ impl Problem<'_> {
         let mut iterations = 0;
         for _ in 0..self.cfg.iterations {
             iterations += 1;
-            // Backward pass.
-            let terminal = self.stage(n - 1, &xs[n], &us[n - 1], true);
-            let mut vx = terminal.lx * self.model.dt;
-            let mut vxx = terminal.lxx * self.model.dt;
+            // Backward pass: stage i's state terms join the cost-to-go at
+            // x_{i+1} and reach x_i and u_i through the dynamics.
+            let mut vx = State::zeros();
+            let mut vxx = Matrix5::zeros();
             let mut ks: Vec<Control> = vec![Control::zeros(); n];
             let mut kks: Vec<Matrix3x5<f64>> = vec![Matrix3x5::zeros(); n];
             let mut ok = true;
             for i in (0..n).rev() {
                 let st = self.stage(i, &xs[i + 1], &us[i], i + 1 == n);
                 let (a, b) = self.jacobians(&xs[i], &us[i]);
-                let lx = st.lx * self.model.dt;
+                let wx = st.lx * self.model.dt + vx;
+                let wxx = st.lxx * self.model.dt + vxx;
                 let lu = st.lu * self.model.dt;
-                let lxx = st.lxx * self.model.dt;
                 let luu = st.luu * self.model.dt;
-                // Value derivatives propagate through the state after the step.
-                let qx = lx + a.transpose() * vx;
-                let qu = lu + b.transpose() * vx;
-                let qxx = lxx + a.transpose() * vxx * a;
-                let quu = luu + b.transpose() * vxx * b + Matrix3::identity() * mu;
-                let qux = b.transpose() * vxx * a;
+                let qx = a.transpose() * wx;
+                let qu = lu + b.transpose() * wx;
+                let qxx = a.transpose() * wxx * a;
+                let quu = luu + b.transpose() * wxx * b + Matrix3::identity() * mu;
+                let qux = b.transpose() * wxx * a;
                 let Some(quu_inv) = quu.try_inverse() else {
                     ok = false;
                     break;
@@ -529,5 +530,56 @@ impl Controller for IlqrFollower {
 
     fn base_mut(&mut self) -> &mut ControllerBase {
         &mut self.base
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::SteeringType;
+
+    fn solved(steering: SteeringType) -> (f64, f64) {
+        let constraints = RobotConstraints {
+            steering_type: steering,
+            wheelbase: 0.5,
+            max_steering_angle: 1.2,
+            min_turning_radius: 0.0,
+            max_angular_velocity: 5.0,
+            max_linear_acceleration: 5.0,
+            max_linear_velocity: 2.0,
+            ..Default::default()
+        };
+        let cfg = IlqrConfig { iterations: 300, convergence: 1e-14, ..Default::default() };
+        let n = cfg.horizon_steps;
+        let x0 = State::new(0.0, 0.0, 0.0, 0.5, 0.0);
+        let model = Model::new(&RobotState::default(), &constraints, 0.5, 0.0, cfg.dt, false);
+        let reference = Reference {
+            x: (0..=n).map(|i| 0.05 * i as f64).collect(),
+            y: vec![0.3; n + 1],
+            yaw: vec![0.0; n + 1],
+            v: vec![0.5; n + 1],
+        };
+        let problem = Problem { model: &model, reference: &reference, cfg: &cfg };
+        let (us, cost, _) = problem.solve(&x0, vec![Control::zeros(); n]);
+        let h = 1e-6;
+        let mut worst: f64 = 0.0;
+        for i in 0..n {
+            for k in 0..2 {
+                let (mut up, mut down) = (us.clone(), us.clone());
+                up[i][k] += h;
+                down[i][k] -= h;
+                let g = (problem.rollout(&x0, &up).1 - problem.rollout(&x0, &down).1) / (2.0 * h);
+                worst = worst.max(g.abs());
+            }
+        }
+        (worst, cost)
+    }
+
+    #[test]
+    fn a_converged_solve_is_a_stationary_point_of_its_cost() {
+        for steering in [SteeringType::Differential, SteeringType::Ackermann] {
+            let (gradient, cost) = solved(steering);
+            assert!(gradient < 1e-3 * cost.max(1.0), "{steering:?}: gradient {gradient:.3e} at cost {cost:.3}");
+        }
     }
 }
