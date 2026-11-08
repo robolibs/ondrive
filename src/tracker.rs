@@ -489,12 +489,13 @@ impl Tracker {
             };
             let cum = &self.cursor.cum;
             let tol = cfg.goal_tolerance;
-            if self.lap.is_none() && proj.beyond_end && proj.distance < 2.0 * tol {
+            let ahead = cfg.lookahead_distance.max(2.0 * tol);
+            let overshoot = (proj.distance.powi(2) - proj.lateral_error.powi(2)).max(0.0).sqrt();
+            if self.lap.is_none() && proj.beyond_end && proj.lateral_error.abs() < 2.0 * tol && overshoot < ahead {
                 self.path_completed = true;
                 return Ok(None);
             }
             let speed_now = if state.velocity_valid { state.velocity.linear } else { self.last_command.map_or(0.0, |c| c.0) };
-            let ahead = cfg.lookahead_distance.max(2.0 * tol);
             let target = |segment: usize, s: f64| {
                 let idx = cum.iter().position(|c| *c >= s - 1e-9).unwrap_or(n - 1).max(segment + 1).min(n - 1);
                 let cap = next_cusp(&path.waypoints, segment).unwrap_or(n - 1);
@@ -540,9 +541,17 @@ impl Tracker {
                 segment_heading(&path.waypoints, idx)
             };
             self.waypoint_index = idx;
+            // An Ackermann robot is aimed one lookahead past the path's end
+            // along its last segment, driving through the end, not round it.
+            let point = if last && self.lap.is_none() && n >= 2 && is_ackermann(self.constraints.steering_type) {
+                let (s, c) = segment_heading(&path.waypoints, n - 2).sin_cos();
+                Point::new(wp.point.x + c * ahead, wp.point.y + s * ahead, wp.point.z)
+            } else {
+                wp.point
+            };
             return Ok(Some(Goal {
                 target_pose: Pose {
-                    point: wp.point,
+                    point,
                     rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, yaw)),
                 },
                 target_velocity: None,
@@ -572,9 +581,10 @@ impl Tracker {
         self.controller.predicted_trajectory()
     }
 
-    /// True if the last tick put the controller in the goal-reached state.
+    /// True if the last tick put the controller in the goal-reached state,
+    /// or a path driven without an explicit goal has been completed.
     pub fn is_goal_reached(&self) -> bool {
-        self.controller.get_status().goal_reached
+        self.controller.get_status().goal_reached || (self.goal.is_none() && self.path_completed)
     }
 
     /// True once a path driven without an explicit goal has been consumed.
