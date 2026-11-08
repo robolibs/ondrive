@@ -26,8 +26,7 @@ python = ["dep:pyo3"]
 python-extension = ["python"]
 
 [dependencies]
-datapod = { git = "https://github.com/robolibs/datapod", tag = "0.4.0" }
-stateup = { git = "https://github.com/robolibs/stateup" }
+datapod = { git = "https://github.com/robolibs/datapod", tag = "0.6.2" }
 nalgebra = "0.33"
 rand = "0.8"
 rand_distr = "0.4"
