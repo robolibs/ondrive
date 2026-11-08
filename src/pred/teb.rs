@@ -24,9 +24,6 @@ use crate::pred::mppi::{build_reference, current_lateral_speed, current_speed, g
 use crate::types::{Goal, Obstacle, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::{Euler, Point, Pose, Quaternion};
 
-/// Seconds of band the command is read over.
-const CONTROL_LOOKAHEAD_S: f64 = 0.4;
-
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TebConfig {
     pub n_poses: usize,
@@ -46,6 +43,8 @@ pub struct TebConfig {
     pub obstacle_margin: f64,
     pub dt_min: f64,
     pub dt_max: f64,
+    /// Seconds of band the command is read over.
+    pub control_lookahead: f64,
 }
 
 impl Default for TebConfig {
@@ -66,6 +65,7 @@ impl Default for TebConfig {
             obstacle_margin: 0.4,
             dt_min: 0.05,
             dt_max: 1.0,
+            control_lookahead: 0.4,
         }
     }
 }
@@ -573,10 +573,10 @@ impl Controller for TebFollower {
         let dy = self.band.y[1] - self.band.y[0];
         let yaw0 = self.band.yaw[0];
         // The turn and speed are read over the first poses spanning
-        // `CONTROL_LOOKAHEAD_S` (teb_local_planner's control look-ahead poses),
+        // `control_lookahead` seconds (teb_local_planner's control look-ahead poses),
         // not one segment, which the last iterations of the solve jostle.
         let (mut k, mut span, mut length) = (1, dt0, dx.hypot(dy));
-        while k + 1 < self.band.x.len() && span < CONTROL_LOOKAHEAD_S {
+        while k + 1 < self.band.x.len() && span < self.teb_config.control_lookahead {
             span += self.band.dt[k].max(1e-3);
             length += (self.band.x[k + 1] - self.band.x[k]).hypot(self.band.y[k + 1] - self.band.y[k]);
             k += 1;
