@@ -134,14 +134,9 @@ impl RegulatedPursuitFollower {
         self.lookahead_point
     }
 
-    /// True when the arc of curvature `kappa` from `rear` collides within
-    /// `length` metres.
-    /// True when the footprint, driven from `(origin, yaw)` at `(v, omega)`
-    /// for `horizon` seconds but no further than `reach` metres, meets an
-    /// obstacle as predicted at each moment.
     /// Smallest clearance along the arc `(v, omega)` from `origin` for
-    /// `horizon` seconds or `reach` metres, against the obstacles as they
-    /// move.
+    /// `horizon` seconds, the robot held where it is once it has gone `reach`
+    /// metres (or a second of the arc), against the obstacles as they move.
     fn arc_clearance(
         checker: &CollisionChecker,
         origin: Point,
@@ -157,19 +152,25 @@ impl RegulatedPursuitFollower {
         let step = 0.05;
         let (mut x, mut y, mut th, mut t, mut travelled) = (origin.x, origin.y, yaw, 0.0, 0.0);
         let mut worst = f64::INFINITY;
+        let reach = reach.max(v.abs() * horizon.min(1.0));
         loop {
             worst = worst.min(checker.clearance_at(t, x, y, th));
-            if t >= horizon || travelled >= reach.max(v.abs() * horizon.min(1.0)) {
+            if t >= horizon {
                 return worst;
             }
-            x += v * step * th.cos();
-            y += v * step * th.sin();
-            th = normalize_angle(th + omega * step);
-            travelled += v.abs() * step;
+            if travelled < reach {
+                x += v * step * th.cos();
+                y += v * step * th.sin();
+                th = normalize_angle(th + omega * step);
+                travelled += v.abs() * step;
+            }
             t += step;
         }
     }
 
+    /// True when the footprint, driven from `(origin, yaw)` at `(v, omega)`
+    /// for `horizon` seconds and held where it is once it has gone `reach`
+    /// metres, meets an obstacle as predicted at each moment.
     fn arc_collides(
         checker: &CollisionChecker,
         origin: Point,
@@ -188,13 +189,15 @@ impl RegulatedPursuitFollower {
             if checker.clearance_at(t, x, y, th) < 0.0 {
                 return true;
             }
-            if t >= horizon || travelled >= reach {
+            if t >= horizon {
                 return false;
             }
-            x += v * step * th.cos();
-            y += v * step * th.sin();
-            th = normalize_angle(th + omega * step);
-            travelled += v.abs() * step;
+            if travelled < reach {
+                x += v * step * th.cos();
+                y += v * step * th.sin();
+                th = normalize_angle(th + omega * step);
+                travelled += v.abs() * step;
+            }
             t += step;
         }
     }
