@@ -82,7 +82,7 @@ impl Default for McaConfig {
             risk_threshold: 0.05,
             min_velocity_scale: 0.4,
             risk_slowdown_gain: 2.0,
-            robot_radius_margin: 0.1,
+            robot_radius_margin: 0.3,
             ref_velocity: 1.0,
             turn_first_activation_deg: 60.0,
             turn_first_release_deg: 15.0,
