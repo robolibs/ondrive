@@ -47,17 +47,22 @@ pub fn actuation_delay(constraints: &RobotConstraints) -> f64 {
 }
 
 /// Steps and step of a predictive controller configured for `n` steps of
-/// `dt` at `speed`: as configured, or on an Ackermann machine a horizon long
-/// enough to span two of its tightest turning radii and two half swings of
-/// its steering (what it takes to see an obstacle and get round it), at most
-/// 12 s, made of steps no longer than `MAX_PLANNING_STEP` (or `dt`, if longer).
+/// `dt` at `speed`: as configured, or a horizon long enough to stop twice
+/// over with a second to react (to see crossing traffic in time to give way),
+/// and on an Ackermann machine to span two of its tightest turning radii and
+/// two half swings of its steering (to get round an obstacle), at most 12 s,
+/// made of steps no longer than `MAX_PLANNING_STEP` (or `dt`, if longer).
 pub fn planning(constraints: &RobotConstraints, speed: f64, n: usize, dt: f64) -> (usize, f64) {
     let n = n.max(1);
+    let accel = constraints.max_linear_acceleration.abs();
+    let stopping = if accel > 1e-6 { 2.0 * speed.abs() / accel + 1.0 } else { 0.0 };
     let k = max_curvature(constraints);
-    if !is_ackermann(constraints.steering_type) || !(k.is_finite() && k > 0.0) {
-        return (n, dt);
-    }
-    let needed = (2.0 / (k * speed.abs().max(0.1)) + 2.0 * actuation_delay(constraints)).min(12.0);
+    let turning = if is_ackermann(constraints.steering_type) && k.is_finite() && k > 0.0 {
+        2.0 / (k * speed.abs().max(0.1)) + 2.0 * actuation_delay(constraints)
+    } else {
+        0.0
+    };
+    let needed = stopping.max(turning).min(12.0);
     if needed <= n as f64 * dt {
         return (n, dt);
     }
