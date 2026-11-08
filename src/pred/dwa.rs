@@ -212,11 +212,12 @@ impl Controller for DwaFollower {
         let y0 = state.pose.point.y;
         let yaw0 = state.pose.rotation.to_euler().yaw;
 
-        // Against obstacles standing or crossing ahead, while braking from here keeps
-        // clear, arcs that would leave the robot unable to stop clear of them
-        // are refused, so the robot gives way.
+        // Against obstacles standing or crossing the course to the goal, while
+        // braking from here keeps clear, arcs that would leave the robot unable
+        // to stop clear of them are refused, so the robot gives way.
+        let course = normalize_angle(yaw0 + bearing);
         let yield_to: Option<WorldConstraints> = world.map(|w| WorldConstraints {
-            obstacles: w.obstacles.iter().filter(|o| !along_heading(o, yaw0)).cloned().collect(),
+            obstacles: w.obstacles.iter().filter(|o| !along_heading(o, course)).cloned().collect(),
             ..Default::default()
         });
         let tail = yield_to
@@ -247,7 +248,9 @@ impl Controller for DwaFollower {
                     let start_clearance = prev_clearance;
                     let mut min_clearance = prev_clearance;
                     let mut free_distance: Option<f64> = None;
+                    let mut stop_at = ((x, y, yaw), 0);
                     for step in 1..=steps {
+                        let before = ((x, y, yaw), step - 1);
                         if holonomic {
                             let (s, c) = yaw.sin_cos();
                             x += (v * c - vy * s) * sim_dt;
@@ -267,6 +270,7 @@ impl Controller for DwaFollower {
                             let boundary = if c < 0.0 { 0.0 } else { dwa.obstacle_margin };
                             let remaining = (prev_clearance - boundary).clamp(0.0, step_len);
                             free_distance = Some(travelled + remaining);
+                            stop_at = before;
                             break;
                         }
                         travelled += step_len;
@@ -276,7 +280,11 @@ impl Controller for DwaFollower {
                             break;
                         }
                     }
-                    if yielding && free_distance.is_none() && tail.as_ref().is_some_and(|c| hit_while_braking(c, (x, y, yaw), speed_mag, a_lin, steps, sim_dt)) {
+                    let ((end, end_step), end_speed) = match free_distance {
+                        Some(_) => (stop_at, 0.0),
+                        None => (((x, y, yaw), steps), speed_mag),
+                    };
+                    if yielding && tail.as_ref().is_some_and(|c| hit_while_braking(c, end, end_speed, a_lin, end_step, sim_dt)) {
                         continue;
                     }
                     let clearance = match free_distance {
@@ -416,7 +424,8 @@ impl Controller for DwaFollower {
 
 /// Whether the robot, braking straight from `(x, y, yaw)` at `speed` with
 /// `decel` after `steps` of `dt`, is hit by an obstacle moving in on it
-/// within `BRAKING_TAIL_S` more: an arc ending there leads to a collision
+/// before it stops or within `BRAKING_TAIL_S` of standing after: an arc
+/// ending there leads to a collision
 /// it can no longer avoid (an inevitable collision state, Fraichard 2004).
 fn hit_while_braking(
     checker: &CollisionChecker,
@@ -429,7 +438,7 @@ fn hit_while_braking(
     if !checker.has_obstacles() {
         return false;
     }
-    let tail = (BRAKING_TAIL_S / dt).ceil() as usize;
+    let tail = ((speed / decel.max(1e-3) + BRAKING_TAIL_S) / dt).ceil() as usize;
     let (s, c) = yaw.sin_cos();
     for k in 1..=tail {
         speed = (speed - decel * dt).max(0.0);
@@ -455,7 +464,8 @@ fn along_heading(o: &crate::types::Obstacle, yaw: f64) -> bool {
     vx.hypot(vy) > 0.1 && (vx * c + vy * s).abs() >= (vx * -s + vy * c).abs()
 }
 
-/// Seconds after an arc in which braking must keep the robot clear.
+/// Seconds of standing, after braking to a stop at the end of an arc, that
+/// must stay clear.
 const BRAKING_TAIL_S: f64 = 2.0;
 
 /// Arcs shown at most when the controller records everything.
@@ -483,8 +493,8 @@ fn arc((x0, y0, yaw0): (f64, f64, f64), (v, vy, w): (f64, f64, f64), steps: usiz
 /// The `(v, w)` of the window whose arc keeps the largest clearance from
 /// the obstacles as they move over `steps` of `dt`: the way out when no
 /// velocity is admissible and an obstacle closes on the robot where it
-/// stands, as one coming head on does. `None` when standing still loses
-/// no clearance, so stopping is safe.
+/// stands, as one coming head on does. `None` when standing still stays
+/// clear over the steps and `BRAKING_TAIL_S` more, so stopping is safe.
 fn evade(
     checker: &CollisionChecker,
     (x0, y0, yaw0): (f64, f64, f64),
@@ -497,10 +507,11 @@ fn evade(
     if !checker.has_obstacles() {
         return None;
     }
-    let staying = (1..=steps).map(|k| checker.clearance(k, x0, y0, yaw0)).fold(f64::INFINITY, f64::min);
-    if staying >= checker.clearance(0, x0, y0, yaw0) - 1e-6 {
+    let hold = steps + (BRAKING_TAIL_S / dt).ceil() as usize;
+    if (1..=hold).all(|k| checker.clearance(k, x0, y0, yaw0) > 0.0) {
         return None;
     }
+    let staying = (1..=steps).map(|k| checker.clearance(k, x0, y0, yaw0)).fold(f64::INFINITY, f64::min);
     let (v_n, w_n) = (v_n.max(2), w_n.max(2));
     let mut best: Option<(f64, f64, f64)> = Some((staying, 0.0, 0.0));
     for vi in 0..v_n {
