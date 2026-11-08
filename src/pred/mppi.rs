@@ -90,7 +90,7 @@ impl Default for MppiConfig {
             weight_vel: 50.0,
             weight_steering: 10.0,
             weight_acceleration: 5.0,
-            weight_progress: 30.0,
+            weight_progress: 80.0,
             ref_velocity: 1.0,
             turn_first_activation_deg: 60.0,
             turn_first_release_deg: 15.0,
@@ -141,6 +141,27 @@ const ALLOW_MARGIN: f64 = 0.3;
 impl Reference {
     pub fn lateral_at(&self, i: usize) -> f64 {
         self.lateral.get(i).copied().unwrap_or(1.0)
+    }
+
+    /// This reference driven at `share` of its pace: point `i` is the one it
+    /// reached at `share · i`, interpolated, and its speeds scaled.
+    pub fn paced(&self, share: f64) -> Reference {
+        let n = self.x.len();
+        let at = |v: &[f64], u: f64| -> f64 {
+            let k = (u.floor() as usize).min(n.saturating_sub(2));
+            let f = (u - k as f64).clamp(0.0, 1.0);
+            if n < 2 { v.first().copied().unwrap_or(0.0) } else { v[k] + f * (v[k + 1] - v[k]) }
+        };
+        let mut out = self.clone();
+        for i in 0..n {
+            let u = share * i as f64;
+            out.x[i] = at(&self.x, u);
+            out.y[i] = at(&self.y, u);
+            let k = (u.round() as usize).min(n - 1);
+            out.yaw[i] = self.yaw[k];
+            out.v[i] = share * self.v[k];
+        }
+        out
     }
 
     pub fn allow_at(&self, i: usize) -> f64 {
@@ -696,6 +717,8 @@ pub struct MppiFollower {
     last_steer: f64,
     /// Side the detour last passed obstacles on: +1 left, −1 right, 0 none.
     side: f64,
+    /// The detour taken round the obstacles ahead, pursued by one sample.
+    guide: Vec<(f64, f64)>,
     debug_level: DebugLevel,
     debug: DebugFrame,
 }
@@ -721,6 +744,7 @@ impl MppiFollower {
     /// Forgets the guides recorded for display.
     pub(crate) fn clear_guides(&mut self) {
         self.debug.guides.clear();
+        self.guide.clear();
     }
 
     /// Points of the reference ahead, `n` steps of `step` at `speed`, that a
@@ -780,6 +804,7 @@ impl MppiFollower {
             lambda: cfg.temperature.max(1e-6),
             last_steer: 0.0,
             side: 0.0,
+            guide: Vec::new(),
             debug_level: DebugLevel::Off,
             debug: DebugFrame::default(),
             mppi_config: cfg,
@@ -931,6 +956,8 @@ impl MppiFollower {
                     accel.fill(0.0);
                     accel_lat.fill(0.0);
                 }
+                // Pure pursuit of the detour round the obstacles ahead.
+                3 if self.guide.len() > 1 => pursue(&model, &self.guide, v_ref, &mut steer, &mut accel, &mut accel_lat),
                 _ => {
                     correlated_noise(&mut steer, sigma_s, working.noise_correlation, &mut self.rng);
                     correlated_noise(&mut accel, sigma_a, working.noise_correlation, &mut self.rng);
@@ -1078,7 +1105,7 @@ impl Controller for MppiFollower {
         dt: f64,
         world: Option<&WorldConstraints>,
     ) -> VelocityCommand {
-        self.debug.guides.clear();
+        self.clear_guides();
         let cfg = &self.mppi_config;
         let obstacles: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
         let has_grid = world.is_some_and(|w| w.grid.is_some());
@@ -1458,6 +1485,41 @@ pub(crate) fn pick_detour(
     *side = best.as_ref().map_or(0.0, |b| b.1);
     best.map(|b| b.2)
 }
+
+/// Controls that drive `model` along `guide` by pure pursuit at `speed`:
+/// the plan of an ancillary controller, sampled beside the noise (Biased-MPPI,
+/// Trevisan & Alonso-Mora 2024), so a detour is among the candidates even
+/// where noise round the previous plan would not find it.
+pub(crate) fn pursue(
+    model: &Model,
+    guide: &[(f64, f64)],
+    speed: f64,
+    steer: &mut [f64],
+    accel: &mut [f64],
+    accel_lat: &mut [f64],
+) {
+    let (sb, ab) = (model.steer_bound(), model.accel_bound());
+    let l = wheelbase(model.constraints);
+    let near = if model.ackermann { 2.0 * l } else { 0.5 };
+    let (mut x, mut y, mut yaw, mut v, mut vy) = (model.x0, model.y0, model.yaw0, model.v0, model.vy0);
+    let mut from = 0;
+    for t in 0..steer.len().min(accel.len()).min(accel_lat.len()) {
+        let d = |p: &(f64, f64)| (p.0 - x).hypot(p.1 - y);
+        from = (from..guide.len()).min_by(|a, b| d(&guide[*a]).total_cmp(&d(&guide[*b]))).unwrap_or(from);
+        let lookahead = (v.abs() * PURSUE_TIME_S).max(near);
+        let target = guide[from..].iter().find(|p| d(p) >= lookahead).unwrap_or(&guide[guide.len() - 1]);
+        let dist = d(target).max(1e-3);
+        let alpha = normalize_angle((target.1 - y).atan2(target.0 - x) - yaw);
+        let kappa = 2.0 * alpha.sin() / dist;
+        steer[t] = if model.ackermann { (kappa * l).atan() } else { speed.max(v.abs()) * kappa }.clamp(-sb, sb);
+        accel[t] = ((speed - v) / model.dt).clamp(-ab, ab);
+        accel_lat[t] = 0.0;
+        model.step(&mut x, &mut y, &mut yaw, &mut v, &mut vy, steer[t], accel[t], 0.0);
+    }
+}
+
+/// Seconds of speed the pursued detour's lookahead spans.
+const PURSUE_TIME_S: f64 = 1.0;
 
 /// Every how many samples one rollout is kept for display.
 const ROLLOUT_STRIDE: usize = 16;

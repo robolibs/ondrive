@@ -510,17 +510,19 @@ impl Controller for IlqrFollower {
         let mut best: Option<(f64, f64, Vec<Control>, usize)> = None;
         let mut tried: Vec<(Vec<Point>, f64)> = Vec::new();
         if self.debug_level >= DebugLevel::Basic {
-            self.debug.guides = guides.iter().skip(1).map(|(g, _)| crate::pred::mpc::reference_path(g)).collect();
+            self.debug.guides = guides.iter().skip(1).map(|g| crate::pred::mpc::reference_path(&g.reference)).collect();
         }
-        for (guide, side) in &guides {
-            let guided = Problem { model: &model, reference: guide, cfg: &cfg, obstacles, discs: discs.clone() };
+        for guide in &guides {
+            let side = &guide.side;
+            let guided = Problem { model: &model, reference: &guide.reference, cfg: &cfg, obstacles, discs: discs.clone() };
             let (us, _, iterations) = guided.solve(&x0, warm.clone());
             let switch = *side != 0.0 && self.side != 0.0 && *side != self.side;
-            let (xs, rolled) = problem.rollout(&x0, &us);
+            let scored = if guide.pace < 1.0 { &guided } else { &problem };
+            let (xs, rolled) = scored.rollout(&x0, &us);
             if self.debug_level == DebugLevel::Full {
                 tried.push((xs.iter().map(|x| { let (ox, oy) = model.origin(x[0], x[1], x[2]); Point::new(ox, oy, 0.0) }).collect(), rolled));
             }
-            let c = rolled * if switch { SIDE_SWITCH_COST } else { 1.0 };
+            let c = rolled * guide.pace_factor() * if switch { SIDE_SWITCH_COST } else { 1.0 };
             if c.is_finite() && best.as_ref().is_none_or(|b| c < b.0) {
                 best = Some((c, *side, us, iterations));
             }
