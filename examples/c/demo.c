@@ -70,8 +70,6 @@ int main(void) {
     state.allow_reverse       = false;
     state.turn_first          = false;
     state.allow_move          = true;
-    state.has_trailer         = false;
-    state.trailer_pose        = state.pose;
 
     const double dt = 0.05;
     double t_sim = 0.0;

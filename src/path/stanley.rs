@@ -144,8 +144,8 @@ impl Controller for StanleyFollower {
             return VelocityCommand::invalid("no path");
         };
         let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
-        let passed_end = proj.beyond_end && proj.distance < 2.0 * pos_tol;
-        if let Some(cmd) = self.base.arrival(state, goal, constraints, passed_end) {
+        let length = self.cum.last().copied().unwrap_or(0.0);
+        if let Some(cmd) = self.base.arrival_on_path(state, goal, constraints, &proj, length) {
             return cmd;
         }
 

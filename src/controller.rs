@@ -1,5 +1,6 @@
 use crate::core::kinematics::{can_turn_in_place, finalize, stop};
 use crate::core::math::{distance_2d, normalize_angle, yaw_of};
+use crate::core::path::PathProjection;
 use crate::types::{
     ControllerConfig, ControllerStatus, Goal, Path, RobotConstraints, RobotState, Trajectory,
     VelocityCommand, WorldConstraints,
@@ -156,11 +157,47 @@ impl ControllerBase {
         constraints: &RobotConstraints,
         extra_position_ok: bool,
     ) -> Option<VelocityCommand> {
+        self.gated_arrival(state, goal, constraints, extra_position_ok, true)
+    }
+
+    /// `arrival` for a path follower projected at `proj` on its path of
+    /// `path_length` metres. A goal at the path end counts as reached only
+    /// once the rest of the path is about as short as the way to the goal.
+    pub fn arrival_on_path(
+        &mut self,
+        state: &RobotState,
+        goal: &Goal,
+        constraints: &RobotConstraints,
+        proj: &PathProjection,
+        path_length: f64,
+    ) -> Option<VelocityCommand> {
+        let (pos_tol, _) = effective_tolerances(goal, &self.config);
+        let passed_end = proj.beyond_end && proj.distance < 2.0 * pos_tol;
+        let goal_at_end = self
+            .path
+            .waypoints
+            .last()
+            .is_some_and(|w| w.point.distance_to_2d(goal.target_pose.point) < 1e-6);
+        let to_goal = distance_2d(state.pose.point, goal.target_pose.point);
+        let to_path = distance_2d(state.pose.point, proj.point);
+        let early =
+            goal_at_end && path_length - proj.arc_length > to_goal + to_path + 2.0 * pos_tol;
+        self.gated_arrival(state, goal, constraints, passed_end, !early)
+    }
+
+    fn gated_arrival(
+        &mut self,
+        state: &RobotState,
+        goal: &Goal,
+        constraints: &RobotConstraints,
+        extra_position_ok: bool,
+        position_allowed: bool,
+    ) -> Option<VelocityCommand> {
         let check = check_goal(&state.pose, goal, &self.config);
         self.status.distance_to_goal = check.distance;
         self.status.heading_error = check.yaw_error;
 
-        let position_ok = check.position_ok || extra_position_ok;
+        let position_ok = (check.position_ok && position_allowed) || extra_position_ok;
         if !position_ok {
             self.status.goal_reached = false;
             return None;

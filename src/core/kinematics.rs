@@ -99,6 +99,21 @@ pub fn path_speed(
     (nominal * curvature_scale.max(0.25)).min(taper).max(0.0)
 }
 
+/// `(v, omega)` of a differential or skid-steer platform, scaled together
+/// (keeping the curvature) so neither wheel of its `track_width` axle runs
+/// faster than `max_linear_velocity`. Other platforms, and a zero track
+/// width, pass through.
+pub fn wheel_limited(v: f64, omega: f64, constraints: &RobotConstraints) -> (f64, f64) {
+    let wheeled = matches!(constraints.steering_type, SteeringType::Differential | SteeringType::SkidSteer);
+    let fastest = v.abs() + (0.5 * constraints.track_width * omega).abs();
+    let cap = constraints.max_linear_velocity.max(0.0);
+    if !wheeled || constraints.track_width <= 0.0 || fastest <= cap {
+        return (v, omega);
+    }
+    let scale = cap / fastest;
+    (v * scale, omega * scale)
+}
+
 /// Build the final command from a physical `(v, omega)` pair.
 pub fn finalize(
     v: f64,
@@ -132,6 +147,7 @@ pub fn finalize(
     }
     let w_max = constraints.max_angular_velocity.max(0.0);
     omega = omega.clamp(-w_max, w_max);
+    let (v, omega) = wheel_limited(v, omega, constraints);
     if is_ackermann(constraints.steering_type) && v.abs() > 1e-6 {
         steering_angle = curvature_to_steering(omega / v, constraints);
     }
@@ -151,7 +167,6 @@ pub fn finalize(
         angular_velocity: angular,
         lateral_velocity: 0.0,
         steering_angle,
-        ..VelocityCommand::default()
     }
 }
 
@@ -199,7 +214,6 @@ pub fn finalize_holonomic(
         angular_velocity: angular,
         lateral_velocity: lateral,
         steering_angle: 0.0,
-        ..VelocityCommand::default()
     }
 }
 

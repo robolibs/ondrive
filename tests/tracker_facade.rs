@@ -138,3 +138,68 @@ fn is_goal_reached_reflects_controller_status() {
     }
     assert!(tracker.is_goal_reached());
 }
+
+#[test]
+fn reset_keeps_the_path_and_restarts_progress_on_it() {
+    let mut path = Path::default();
+    for i in 0..=50 {
+        path.waypoints.push(pose_at(i as f64 * 0.1, 0.0, 0.0));
+    }
+    for i in 1..=50 {
+        path.waypoints
+            .push(pose_at(5.0, i as f64 * 0.1, std::f64::consts::FRAC_PI_2));
+    }
+    let state = RobotState {
+        pose: pose_at(0.5, 0.0, 0.0),
+        allow_move: true,
+        ..Default::default()
+    };
+    let kinds = [
+        TrackerKind::Pid,
+        TrackerKind::Carrot,
+        TrackerKind::PurePursuit,
+        TrackerKind::Stanley,
+        TrackerKind::Lqr,
+        TrackerKind::Mpc,
+        TrackerKind::Dwa,
+        TrackerKind::Teb,
+        TrackerKind::Flc,
+        TrackerKind::RegulatedPursuit,
+        TrackerKind::PoseReach,
+        TrackerKind::Ilqr,
+        TrackerKind::PoseRegulator,
+        TrackerKind::VectorPursuit,
+        TrackerKind::Kanayama,
+        TrackerKind::Apf,
+        TrackerKind::Ilc,
+    ];
+    for kind in kinds {
+        let mut t = Tracker::new(kind);
+        t.init(RobotConstraints {
+            steering_type: ondrive::SteeringType::Differential,
+            ..Default::default()
+        });
+        t.set_path(path.clone());
+        let before = t.tick(&state, 0.05, None);
+        t.tick(&state, 0.05, None);
+        t.reset();
+        assert_eq!(
+            t.path().map(|p| p.waypoints.len()),
+            Some(path.waypoints.len()),
+            "{kind:?}"
+        );
+        let after = t.tick(&state, 0.05, None);
+        assert!(after.valid, "{kind:?}: {}", after.status_message);
+        assert_eq!(before.status_message, after.status_message, "{kind:?}");
+        assert_relative_eq!(
+            before.linear_velocity,
+            after.linear_velocity,
+            epsilon = 1e-9
+        );
+        assert_relative_eq!(
+            before.angular_velocity,
+            after.angular_velocity,
+            epsilon = 1e-9
+        );
+    }
+}

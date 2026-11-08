@@ -384,8 +384,7 @@ pub(crate) fn prepare(
     };
     base.path_index = proj.segment;
     let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
-    let passed_end = proj.beyond_end && proj.distance < 2.0 * pos_tol;
-    if let Some(cmd) = base.arrival(state, goal, constraints, passed_end) {
+    if let Some(cmd) = base.arrival_on_path(state, goal, constraints, &proj, cursor.total_length()) {
         return Err(cmd);
     }
     let yaw = state.pose.rotation.to_euler().yaw;

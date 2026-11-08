@@ -50,6 +50,22 @@ fn fail(msg: impl Into<String>) -> bool {
     false
 }
 
+/// Runs `f`; a panic becomes `fallback` with its message as the last error.
+fn guarded<T>(fallback: T, f: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            set_last_error(format!("ondrive panicked: {msg}"));
+            fallback
+        }
+    }
+}
+
 // ===========================================================================
 // Integer constants for enums (kept explicit so the header can mirror them).
 // ===========================================================================
@@ -188,8 +204,6 @@ pub struct OndriveRobotState {
     pub allow_reverse: bool,
     pub turn_first: bool,
     pub allow_move: bool,
-    pub has_trailer: bool,
-    pub trailer_pose: OndrivePose,
 }
 
 #[repr(C)]
@@ -208,7 +222,6 @@ pub struct OndriveRobotConstraints {
     pub steering_type: u32,
     pub wheelbase: f64,
     pub track_width: f64,
-    pub wheel_radius: f64,
     pub max_linear_velocity: f64,
     pub min_linear_velocity: f64,
     pub max_angular_velocity: f64,
@@ -218,7 +231,6 @@ pub struct OndriveRobotConstraints {
     pub max_steering_rate: f64,
     pub min_turning_radius: f64,
     pub rear_wheelbase: f64,
-    pub max_rear_steering_angle: f64,
     pub robot_width: f64,
     pub robot_length: f64,
 }
@@ -260,7 +272,6 @@ pub struct OndriveVelocityCommand {
     pub lateral_velocity: f64,
     /// Ackermann steering angle (rad) consistent with `angular_velocity`.
     pub steering_angle: f64,
-    pub output_type: u32, // always VelocityCommand for now
 }
 
 // ===========================================================================
@@ -332,8 +343,6 @@ fn state_to_rs(s: OndriveRobotState) -> RobotState {
         allow_reverse: s.allow_reverse,
         turn_first: s.turn_first,
         allow_move: s.allow_move,
-        has_trailer: s.has_trailer,
-        trailer_pose: pose_to_rs(s.trailer_pose),
     }
 }
 
@@ -357,7 +366,6 @@ fn constraints_to_rs(c: OndriveRobotConstraints) -> Option<RobotConstraints> {
         footprint: ondrive_footprint_placeholder(),
         wheelbase: c.wheelbase,
         track_width: c.track_width,
-        wheel_radius: c.wheel_radius,
         max_linear_velocity: c.max_linear_velocity,
         min_linear_velocity: c.min_linear_velocity,
         max_angular_velocity: c.max_angular_velocity,
@@ -367,7 +375,6 @@ fn constraints_to_rs(c: OndriveRobotConstraints) -> Option<RobotConstraints> {
         max_steering_rate: c.max_steering_rate,
         min_turning_radius: c.min_turning_radius,
         rear_wheelbase: c.rear_wheelbase,
-        max_rear_steering_angle: c.max_rear_steering_angle,
         robot_width: c.robot_width,
         robot_length: c.robot_length,
     })
@@ -382,7 +389,6 @@ fn constraints_to_ffi(c: &RobotConstraints) -> OndriveRobotConstraints {
         steering_type: steering_to_u32(c.steering_type),
         wheelbase: c.wheelbase,
         track_width: c.track_width,
-        wheel_radius: c.wheel_radius,
         max_linear_velocity: c.max_linear_velocity,
         min_linear_velocity: c.min_linear_velocity,
         max_angular_velocity: c.max_angular_velocity,
@@ -392,7 +398,6 @@ fn constraints_to_ffi(c: &RobotConstraints) -> OndriveRobotConstraints {
         max_steering_rate: c.max_steering_rate,
         min_turning_radius: c.min_turning_radius,
         rear_wheelbase: c.rear_wheelbase,
-        max_rear_steering_angle: c.max_rear_steering_angle,
         robot_width: c.robot_width,
         robot_length: c.robot_length,
     }
@@ -453,7 +458,6 @@ fn cmd_to_ffi(c: &VelocityCommand) -> OndriveVelocityCommand {
         angular_velocity: c.angular_velocity,
         lateral_velocity: c.lateral_velocity,
         steering_angle: c.steering_angle,
-        output_type: 0, // VelocityCommand
     }
 }
 
@@ -610,12 +614,14 @@ pub extern "C" fn ondrive_path_set_closed(h: *mut OndrivePath, closed: bool) -> 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_path_smoothen(h: *mut OndrivePath, max_segment_m: f64) -> bool {
-    if h.is_null() {
-        return fail("null path handle");
-    }
-    let p = unsafe { &mut *h };
-    crate::smoothen_path(&mut p.path, max_segment_m);
-    ok()
+    guarded(false, || {
+        if h.is_null() {
+            return fail("null path handle");
+        }
+        let p = unsafe { &mut *h };
+        crate::smoothen_path(&mut p.path, max_segment_m);
+        ok()
+    })
 }
 
 // ===========================================================================
@@ -744,14 +750,16 @@ pub struct OndriveTracker {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_tracker_new(kind: u32) -> *mut OndriveTracker {
-    let Some(k) = kind_from_u32(kind) else {
-        set_last_error(format!("unknown tracker kind: {kind}"));
-        return ptr::null_mut();
-    };
-    clear_last_error();
-    Box::into_raw(Box::new(OndriveTracker {
-        tracker: Tracker::new(k),
-    }))
+    guarded(ptr::null_mut(), || {
+        let Some(k) = kind_from_u32(kind) else {
+            set_last_error(format!("unknown tracker kind: {kind}"));
+            return ptr::null_mut();
+        };
+        clear_last_error();
+        Box::into_raw(Box::new(OndriveTracker {
+            tracker: Tracker::new(k),
+        }))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -767,14 +775,16 @@ pub extern "C" fn ondrive_tracker_init(
     h: *mut OndriveTracker,
     constraints: OndriveRobotConstraints,
 ) -> bool {
-    if h.is_null() {
-        return fail("null tracker handle");
-    }
-    let Some(c) = constraints_to_rs(constraints) else {
-        return fail("invalid steering_type in constraints");
-    };
-    unsafe { (*h).tracker.init(c) };
-    ok()
+    guarded(false, || {
+        if h.is_null() {
+            return fail("null tracker handle");
+        }
+        let Some(c) = constraints_to_rs(constraints) else {
+            return fail("invalid steering_type in constraints");
+        };
+        unsafe { (*h).tracker.init(c) };
+        ok()
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -782,14 +792,16 @@ pub extern "C" fn ondrive_tracker_set_config(
     h: *mut OndriveTracker,
     config: OndriveControllerConfig,
 ) -> bool {
-    if h.is_null() {
-        return fail("null tracker handle");
-    }
-    let Some(c) = config_to_rs(config) else {
-        return fail("invalid output_units in config");
-    };
-    unsafe { (*h).tracker.set_config(c) };
-    ok()
+    guarded(false, || {
+        if h.is_null() {
+            return fail("null tracker handle");
+        }
+        let Some(c) = config_to_rs(config) else {
+            return fail("invalid output_units in config");
+        };
+        unsafe { (*h).tracker.set_config(c) };
+        ok()
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -806,11 +818,13 @@ pub extern "C" fn ondrive_tracker_get_config(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_tracker_set_goal(h: *mut OndriveTracker, goal: OndriveGoal) -> bool {
-    if h.is_null() {
-        return fail("null tracker handle");
-    }
-    unsafe { (*h).tracker.set_goal(goal_to_rs(goal)) };
-    ok()
+    guarded(false, || {
+        if h.is_null() {
+            return fail("null tracker handle");
+        }
+        unsafe { (*h).tracker.set_goal(goal_to_rs(goal)) };
+        ok()
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -827,42 +841,50 @@ pub extern "C" fn ondrive_tracker_set_path(
     h: *mut OndriveTracker,
     path: *const OndrivePath,
 ) -> bool {
-    if h.is_null() {
-        return fail("null tracker handle");
-    }
-    if path.is_null() {
-        return fail("null path handle");
-    }
-    let p = unsafe { (*path).path.clone() };
-    unsafe { (*h).tracker.set_path(p) };
-    ok()
+    guarded(false, || {
+        if h.is_null() {
+            return fail("null tracker handle");
+        }
+        if path.is_null() {
+            return fail("null path handle");
+        }
+        let p = unsafe { (*path).path.clone() };
+        unsafe { (*h).tracker.set_path(p) };
+        ok()
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_tracker_clear_path(h: *mut OndriveTracker) -> bool {
-    if h.is_null() {
-        return fail("null tracker handle");
-    }
-    unsafe { (*h).tracker.clear_path() };
-    ok()
+    guarded(false, || {
+        if h.is_null() {
+            return fail("null tracker handle");
+        }
+        unsafe { (*h).tracker.clear_path() };
+        ok()
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_tracker_reset(h: *mut OndriveTracker) -> bool {
-    if h.is_null() {
-        return fail("null tracker handle");
-    }
-    unsafe { (*h).tracker.reset() };
-    ok()
+    guarded(false, || {
+        if h.is_null() {
+            return fail("null tracker handle");
+        }
+        unsafe { (*h).tracker.reset() };
+        ok()
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_tracker_smoothen(h: *mut OndriveTracker, max_segment_m: f64) -> bool {
-    if h.is_null() {
-        return fail("null tracker handle");
-    }
-    unsafe { (*h).tracker.smoothen(max_segment_m) };
-    ok()
+    guarded(false, || {
+        if h.is_null() {
+            return fail("null tracker handle");
+        }
+        unsafe { (*h).tracker.smoothen(max_segment_m) };
+        ok()
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -873,17 +895,19 @@ pub extern "C" fn ondrive_tracker_tick(
     world: *const OndriveWorld,
     out_cmd: *mut OndriveVelocityCommand,
 ) -> bool {
-    if h.is_null() {
-        return fail("null tracker handle");
-    }
-    let w_ref = if world.is_null() {
-        None
-    } else {
-        Some(unsafe { &(*world).world })
-    };
-    let cmd = unsafe { (*h).tracker.tick(&state_to_rs(state), dt, w_ref) };
-    store_cmd_message(&cmd);
-    write_out(out_cmd, cmd_to_ffi(&cmd))
+    guarded(false, || {
+        if h.is_null() {
+            return fail("null tracker handle");
+        }
+        let w_ref = if world.is_null() {
+            None
+        } else {
+            Some(unsafe { &(*world).world })
+        };
+        let cmd = unsafe { (*h).tracker.tick(&state_to_rs(state), dt, w_ref) };
+        store_cmd_message(&cmd);
+        write_out(out_cmd, cmd_to_ffi(&cmd))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -891,12 +915,14 @@ pub extern "C" fn ondrive_tracker_emergency_stop(
     h: *mut OndriveTracker,
     out_cmd: *mut OndriveVelocityCommand,
 ) -> bool {
-    if h.is_null() {
-        return fail("null tracker handle");
-    }
-    let cmd = unsafe { (*h).tracker.emergency_stop() };
-    store_cmd_message(&cmd);
-    write_out(out_cmd, cmd_to_ffi(&cmd))
+    guarded(false, || {
+        if h.is_null() {
+            return fail("null tracker handle");
+        }
+        let cmd = unsafe { (*h).tracker.emergency_stop() };
+        store_cmd_message(&cmd);
+        write_out(out_cmd, cmd_to_ffi(&cmd))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -904,12 +930,14 @@ pub extern "C" fn ondrive_tracker_status(
     h: *const OndriveTracker,
     out: *mut OndriveControllerStatus,
 ) -> bool {
-    if h.is_null() {
-        return fail("null tracker handle");
-    }
-    let s = unsafe { (*h).tracker.get_status() };
-    store_status_mode(&s);
-    write_out(out, status_to_ffi(&s))
+    guarded(false, || {
+        if h.is_null() {
+            return fail("null tracker handle");
+        }
+        let s = unsafe { (*h).tracker.get_status() };
+        store_status_mode(&s);
+        write_out(out, status_to_ffi(&s))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -946,13 +974,15 @@ pub extern "C" fn ondrive_tracker_current_target(
     h: *const OndriveTracker,
     out: *mut OndriveVec3,
 ) -> bool {
-    if h.is_null() {
-        return fail("null tracker handle");
-    }
-    match unsafe { (*h).tracker.current_target() } {
-        Some(p) => write_out(out, point_to_vec3(p)),
-        None => fail("no goal or path set"),
-    }
+    guarded(false, || {
+        if h.is_null() {
+            return fail("null tracker handle");
+        }
+        match unsafe { (*h).tracker.current_target() } {
+            Some(p) => write_out(out, point_to_vec3(p)),
+            None => fail("no goal or path set"),
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1025,22 +1055,24 @@ pub extern "C" fn ondrive_tracker_set_trajectory(
     path: *const OndrivePath,
     times: *const f64,
 ) -> bool {
-    if h.is_null() || path.is_null() || times.is_null() {
-        set_last_error("null pointer");
-        return false;
-    }
-    let p = unsafe { &(*path).path };
-    let n = p.waypoints.len();
-    let times = unsafe { std::slice::from_raw_parts(times, n) };
-    let mut speeds = p.speeds.clone();
-    speeds.resize(n, 0.0);
-    let traj = crate::types::Trajectory {
-        poses: p.waypoints.clone(),
-        times: times.to_vec(),
-        speeds,
-    };
-    unsafe { (*h).tracker.set_trajectory(traj) };
-    true
+    guarded(false, || {
+        if h.is_null() || path.is_null() || times.is_null() {
+            set_last_error("null pointer");
+            return false;
+        }
+        let p = unsafe { &(*path).path };
+        let n = p.waypoints.len();
+        let times = unsafe { std::slice::from_raw_parts(times, n) };
+        let mut speeds = p.speeds.clone();
+        speeds.resize(n, 0.0);
+        let traj = crate::types::Trajectory {
+            poses: p.waypoints.clone(),
+            times: times.to_vec(),
+            speeds,
+        };
+        unsafe { (*h).tracker.set_trajectory(traj) };
+        true
+    })
 }
 
 /// Seconds elapsed on the installed trajectory.
@@ -1065,22 +1097,29 @@ pub extern "C" fn ondrive_world_set_grid(
     height: usize,
     occupied: *const u8,
 ) -> bool {
-    if h.is_null() || (occupied.is_null() && width * height > 0) {
-        set_last_error("null pointer");
-        return false;
-    }
-    if resolution <= 0.0 || !resolution.is_finite() {
-        set_last_error("grid resolution must be positive");
-        return false;
-    }
-    let cells = unsafe { std::slice::from_raw_parts(occupied, width * height) };
-    let occ: Vec<bool> = cells.iter().map(|c| *c != 0).collect();
-    unsafe {
-        (*h).world.grid = Some(crate::types::OccupancyGrid::new(
-            origin_x, origin_y, resolution, width, height, occ,
-        ));
-    }
-    true
+    guarded(false, || {
+        let Some(count) = width.checked_mul(height) else {
+            return fail("grid width * height overflows");
+        };
+        if h.is_null() || (occupied.is_null() && count > 0) {
+            return fail("null pointer");
+        }
+        if resolution <= 0.0 || !resolution.is_finite() {
+            return fail("grid resolution must be positive");
+        }
+        let cells: &[u8] = if count == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(occupied, count) }
+        };
+        let occ: Vec<bool> = cells.iter().map(|c| *c != 0).collect();
+        unsafe {
+            (*h).world.grid = Some(crate::types::OccupancyGrid::new(
+                origin_x, origin_y, resolution, width, height, occ,
+            ));
+        }
+        ok()
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1091,4 +1130,22 @@ pub extern "C" fn ondrive_world_clear_grid(h: *mut OndriveWorld) -> bool {
     }
     unsafe { (*h).world.grid = None };
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_becomes_the_fallback_and_the_last_error() {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let out = guarded(false, || -> bool { panic!("boom") });
+        std::panic::set_hook(prev);
+        assert!(!out);
+        let msg = unsafe { CStr::from_ptr(ondrive_last_error_message()) }
+            .to_string_lossy()
+            .into_owned();
+        assert!(msg.contains("boom"), "{msg}");
+    }
 }

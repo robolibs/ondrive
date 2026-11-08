@@ -24,7 +24,7 @@ pub use crate::core::math::{
 };
 pub use crate::tracker::{Tracker, TrackerKind, smoothen_path};
 pub use crate::types::{
-    ControllerConfig, ControllerStatus, GaussianMode, Goal, Obstacle, OutputType, OutputUnits,
+    ControllerConfig, ControllerStatus, GaussianMode, Goal, Obstacle, OutputUnits,
     Footprint, OccupancyGrid, Path, RobotConstraints, RobotState, SteeringType, Trajectory,
     TrajectorySample, Velocity, VelocityCommand, WorldConstraints, Zone,
 };

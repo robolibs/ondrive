@@ -32,14 +32,15 @@ pub struct RobotState {
     pub allow_reverse: bool,
     pub turn_first: bool,
     pub allow_move: bool,
-    pub has_trailer: bool,
-    pub trailer_pose: Pose,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Path {
     pub waypoints: Vec<Pose>,
     pub speeds: Vec<f64>,
+    /// A loop: `Tracker` drives it lap after lap, closing it from the last
+    /// waypoint back to the first, and it never completes. A controller used
+    /// directly follows it as an open path.
     pub is_closed: bool,
 }
 
@@ -47,8 +48,10 @@ pub struct Path {
 pub struct RobotConstraints {
     pub steering_type: SteeringType,
     pub wheelbase: f64,
+    /// Distance between the left and right wheels. On a differential or
+    /// skid-steer platform the command is scaled so neither wheel exceeds
+    /// `max_linear_velocity`; 0 disables the limit.
     pub track_width: f64,
-    pub wheel_radius: f64,
 
     pub max_linear_velocity: f64,
     pub min_linear_velocity: f64,
@@ -57,11 +60,12 @@ pub struct RobotConstraints {
     pub max_angular_acceleration: f64,
 
     pub max_steering_angle: f64,
+    /// Fastest change of the Ackermann steering angle (rad/s) that
+    /// `Tracker` commands; 0 disables the limit.
     pub max_steering_rate: f64,
     pub min_turning_radius: f64,
 
     pub rear_wheelbase: f64,
-    pub max_rear_steering_angle: f64,
 
     pub robot_width: f64,
     pub robot_length: f64,
@@ -74,18 +78,16 @@ impl Default for RobotConstraints {
         Self {
             steering_type: SteeringType::Ackermann,
             wheelbase: 1.0,
-            track_width: 0.5,
-            wheel_radius: 0.1,
+            track_width: 0.0,
             max_linear_velocity: 1.0,
             min_linear_velocity: -0.5,
             max_angular_velocity: 1.0,
             max_linear_acceleration: 1.0,
             max_angular_acceleration: 1.0,
             max_steering_angle: 0.5,
-            max_steering_rate: 1.0,
+            max_steering_rate: 0.0,
             min_turning_radius: 1.0,
             rear_wheelbase: 0.0,
-            max_rear_steering_angle: 0.0,
             robot_width: 0.0,
             robot_length: 0.0,
             footprint: Footprint::default(),
@@ -93,10 +95,32 @@ impl Default for RobotConstraints {
     }
 }
 
+/// Area with a speed limit: while the robot is inside `boundary` (a polygon,
+/// vertices in order), `Tracker` caps its speed to `max_speed` (m/s).
 #[derive(Clone, Debug, Default)]
 pub struct Zone {
     pub boundary: Vec<Point>,
     pub max_speed: f64,
+}
+
+impl Zone {
+    /// True when `p` lies inside the boundary polygon (even-odd rule).
+    pub fn contains(&self, p: Point) -> bool {
+        let b = &self.boundary;
+        if b.len() < 3 {
+            return false;
+        }
+        let mut inside = false;
+        let mut j = b.len() - 1;
+        for i in 0..b.len() {
+            let (a, c) = (b[i], b[j]);
+            if (a.y > p.y) != (c.y > p.y) && p.x < (c.x - a.x) * (p.y - a.y) / (c.y - a.y) + a.x {
+                inside = !inside;
+            }
+            j = i;
+        }
+        inside
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -122,23 +146,19 @@ pub struct WorldConstraints {
     pub grid: Option<OccupancyGrid>,
 }
 
+impl WorldConstraints {
+    /// Lowest `max_speed` of the zones containing `p`, if any contain it.
+    pub fn speed_limit_at(&self, p: Point) -> Option<f64> {
+        self.zones.iter().filter(|z| z.contains(p)).map(|z| z.max_speed.max(0.0)).reduce(f64::min)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Goal {
     pub target_pose: Pose,
     pub target_velocity: Option<Velocity>,
     pub tolerance_position: f64,
     pub tolerance_orientation: f64,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum OutputType {
-    VelocityCommand,
-}
-
-impl Default for OutputType {
-    fn default() -> Self {
-        OutputType::VelocityCommand
-    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -157,7 +177,6 @@ impl Default for OutputUnits {
 pub struct VelocityCommand {
     pub valid: bool,
     pub status_message: String,
-    pub output_type: OutputType,
 
     pub linear_velocity: f64,
     pub angular_velocity: f64,
@@ -287,7 +306,7 @@ impl Trajectory {
 
     /// Interpolated reference at time `t` (clamped to the trajectory span).
     pub fn sample(&self, t: f64) -> TrajectorySample {
-        let n = self.poses.len();
+        let n = self.poses.len().min(self.times.len());
         if n == 0 {
             return TrajectorySample::default();
         }

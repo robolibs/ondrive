@@ -1,7 +1,7 @@
 use crate::controller::{Controller, check_goal};
-use crate::core::kinematics::stop;
+use crate::core::kinematics::{curvature_to_steering, is_ackermann, is_holonomic, stop, wheelbase};
 use crate::core::obstacles::CollisionChecker;
-use crate::core::path::{PathCursor, end_heading, segment_heading};
+use crate::core::path::{PathCursor, cumulative_lengths, end_heading, next_cusp, segment_heading};
 use crate::fuzzy::FlcFollower;
 use crate::path::{
     IlcFollower, KanayamaFollower, LqrFollower, PurePursuitFollower, RegulatedPursuitFollower,
@@ -14,7 +14,7 @@ use crate::pred::{
     DwaFollower, IlqrFollower, McaFollower, MpcFollower, MppiFollower, SocFollower, TebFollower,
 };
 use crate::types::{
-    ControllerConfig, ControllerStatus, Goal, Path, RobotConstraints, RobotState, Trajectory,
+    ControllerConfig, ControllerStatus, Goal, OutputUnits, Path, RobotConstraints, RobotState, Trajectory,
     VelocityCommand, WorldConstraints,
 };
 use datapod::{Euler, Point, Pose, Quaternion};
@@ -64,6 +64,9 @@ pub struct Tracker {
     trajectory: Option<Trajectory>,
     clock: f64,
     clock_origin: Option<f64>,
+    path_error: Option<&'static str>,
+    lap: Option<Lap>,
+    last_steering: Option<f64>,
 }
 
 impl Tracker {
@@ -82,6 +85,9 @@ impl Tracker {
             trajectory: None,
             clock: 0.0,
             clock_origin: None,
+            path_error: None,
+            lap: None,
+            last_steering: None,
         }
     }
 
@@ -115,10 +121,20 @@ impl Tracker {
         self.goal = None;
     }
 
+    /// Install a path. A closed path (`Path::is_closed`) is driven lap after
+    /// lap and never completes.
     pub fn set_path(&mut self, path: Path) {
         self.trajectory = None;
         self.clock = 0.0;
         self.clock_origin = None;
+        self.path_error = path_error(&path.waypoints, &path.speeds, None);
+        self.lap = Lap::of(&path);
+        let driven = self.lap.as_ref().map_or(path, |lap| lap.unrolled.clone());
+        self.drive(driven);
+    }
+
+    /// Hand `path` to the cursor and the controller, with progress at its start.
+    fn drive(&mut self, path: Path) {
         self.cursor.set_path(&path.waypoints);
         self.path = Some(path.clone());
         self.waypoint_index = 0;
@@ -128,7 +144,7 @@ impl Tracker {
     }
 
     pub fn path(&self) -> Option<&Path> {
-        self.path.as_ref()
+        self.lap.as_ref().map(|lap| &lap.source).or(self.path.as_ref())
     }
 
     /// Install a timed trajectory. Its poses become the path; the tracker
@@ -136,6 +152,8 @@ impl Tracker {
     /// `RobotState::timestamp` when that is provided and increasing).
     pub fn set_trajectory(&mut self, trajectory: Trajectory) {
         self.cursor.set_path(&trajectory.poses);
+        self.path_error = path_error(&trajectory.poses, &trajectory.speeds, Some(&trajectory.times));
+        self.lap = None;
         self.path = Some(trajectory.to_path());
         self.waypoint_index = 0;
         self.projection_segment = 0;
@@ -157,6 +175,8 @@ impl Tracker {
 
     pub fn clear_path(&mut self) {
         self.path = None;
+        self.path_error = None;
+        self.lap = None;
         self.trajectory = None;
         self.clock = 0.0;
         self.clock_origin = None;
@@ -186,19 +206,29 @@ impl Tracker {
         self.controller.as_mut()
     }
 
+    /// Clear the controller's internal state and restart progress on the
+    /// installed path or trajectory, which stays installed.
     pub fn reset(&mut self) {
         self.controller.reset();
+        if let Some(trajectory) = self.trajectory.clone() {
+            self.set_trajectory(trajectory);
+        } else if let Some(path) = self.path().cloned() {
+            self.set_path(path);
+        }
         self.waypoint_index = 0;
         self.path_completed = false;
+        self.last_steering = None;
     }
 
     /// One control period. Order of precedence:
     /// 1. `dt` must be positive and finite;
-    /// 2. `allow_move == false` yields a valid zero command;
-    /// 3. an explicit goal is used as-is; otherwise a goal is derived from
+    /// 2. the state, goal, path, constraints and config must be free of
+    ///    NaN (and the state, goal and path of infinities);
+    /// 3. `allow_move == false` yields a valid zero command;
+    /// 4. an explicit goal is used as-is; otherwise a goal is derived from
     ///    the path (the current waypoint for point controllers, the path
     ///    end for path followers);
-    /// 4. with neither goal nor path the command is invalid.
+    /// 5. with neither goal nor path the command is invalid.
     pub fn tick(
         &mut self,
         state: &RobotState,
@@ -207,6 +237,14 @@ impl Tracker {
     ) -> VelocityCommand {
         if !(dt.is_finite() && dt > 0.0) {
             return VelocityCommand::invalid("dt must be positive and finite");
+        }
+        let input_error = state_error(state)
+            .or_else(|| self.goal.as_ref().and_then(goal_error))
+            .or(self.path_error)
+            .or_else(|| constraints_error(&self.constraints))
+            .or_else(|| config_error(&self.controller.get_config()));
+        if let Some(msg) = input_error {
+            return VelocityCommand::invalid(msg);
         }
         if !state.allow_move {
             return stop("Movement disabled");
@@ -221,6 +259,7 @@ impl Tracker {
             self.controller.set_time(self.clock);
         }
 
+        self.next_lap(state);
         let goal = match self.resolve_goal(state, world) {
             Ok(Some(g)) => g,
             Ok(None) => return stop("Path completed"),
@@ -235,7 +274,66 @@ impl Tracker {
         {
             self.path_completed = true;
         }
+        self.limit(cmd, state, dt, world)
+    }
+
+    /// The command held to the speed limit of the zones the robot is in, and
+    /// its Ackermann steering angle to `max_steering_rate`.
+    fn limit(
+        &mut self,
+        mut cmd: VelocityCommand,
+        state: &RobotState,
+        dt: f64,
+        world: Option<&WorldConstraints>,
+    ) -> VelocityCommand {
+        if !cmd.valid {
+            return cmd;
+        }
+        let c = &self.constraints;
+        let (linear_unit, angular_unit) = match self.controller.get_config().output_units {
+            OutputUnits::Physical => (1.0, 1.0),
+            OutputUnits::Normalized => (c.max_linear_velocity.max(0.0), c.max_angular_velocity.max(0.0)),
+        };
+        if let Some(cap) = world.and_then(|w| w.speed_limit_at(state.pose.point)) {
+            let speed = cmd.linear_velocity.hypot(cmd.lateral_velocity) * linear_unit;
+            if speed > cap {
+                let scale = cap / speed;
+                cmd.linear_velocity *= scale;
+                cmd.lateral_velocity *= scale;
+                if !is_holonomic(c.steering_type) {
+                    cmd.angular_velocity *= scale;
+                }
+            }
+        }
+        let v = cmd.linear_velocity * linear_unit;
+        if is_ackermann(c.steering_type) && c.max_steering_rate > 0.0 && v.abs() > 1e-6 {
+            if let Some(prev) = self.last_steering {
+                let step = c.max_steering_rate * dt;
+                let delta = cmd.steering_angle.clamp(prev - step, prev + step);
+                let w_max = c.max_angular_velocity.max(0.0);
+                let omega = (v * delta.tan() / wheelbase(c)).clamp(-w_max, w_max);
+                cmd.steering_angle = curvature_to_steering(omega / v, c);
+                cmd.angular_velocity = if angular_unit > 0.0 { omega / angular_unit } else { 0.0 };
+            }
+            self.last_steering = Some(cmd.steering_angle);
+        }
         cmd
+    }
+
+    /// On a closed path, restart the unrolled laps once the robot is into
+    /// the second.
+    fn next_lap(&mut self, state: &RobotState) {
+        let (Some(lap), Some(path)) = (&self.lap, &self.path) else {
+            return;
+        };
+        let Some(proj) = self.cursor.project(&path.waypoints, state.pose.point, self.projection_segment) else {
+            return;
+        };
+        self.projection_segment = proj.segment;
+        if proj.arc_length >= lap.length {
+            let unrolled = lap.unrolled.clone();
+            self.drive(unrolled);
+        }
     }
 
     fn resolve_goal(
@@ -263,20 +361,25 @@ impl Tracker {
             let Some(proj) = self.cursor.project(&path.waypoints, state.pose.point, hint) else {
                 return Err("path is empty");
             };
-            self.projection_segment = proj.segment;
             let cum = &self.cursor.cum;
             let tol = cfg.goal_tolerance;
             let ahead = cfg.lookahead_distance.max(2.0 * tol);
-            let s_target = proj.arc_length + ahead;
-            let mut idx = cum
-                .iter()
-                .position(|s| *s >= s_target - 1e-9)
-                .unwrap_or(n - 1)
-                .max(proj.segment + 1)
-                .min(n - 1);
+            let target = |segment: usize, s: f64| {
+                let idx = cum.iter().position(|c| *c >= s - 1e-9).unwrap_or(n - 1).max(segment + 1).min(n - 1);
+                let cap = next_cusp(&path.waypoints, segment).unwrap_or(n - 1);
+                (idx.min(cap), cap)
+            };
+            // The robot drives to a cusp, then on along the leg that leaves it.
+            let mut segment = proj.segment;
+            let (mut idx, mut cap) = target(segment, proj.arc_length + ahead);
+            if cap < n - 1 && idx == cap && path.waypoints[cap].point.distance_to_2d(state.pose.point) < tol {
+                segment = cap;
+                (idx, cap) = target(segment, cum[segment] + ahead);
+            }
+            self.projection_segment = segment;
             if world.is_some() {
                 let checker = CollisionChecker::new(world, &self.constraints, WAYPOINT_MARGIN);
-                while idx + 1 < n && blocked(&path.waypoints, idx, &checker) {
+                while idx < cap && blocked(&path.waypoints, idx, &checker) {
                     idx += 1;
                 }
             }
@@ -284,6 +387,8 @@ impl Tracker {
             let wp = path.waypoints[idx];
             let yaw = if last {
                 end_heading(&path.waypoints)
+            } else if idx == cap {
+                segment_heading(&path.waypoints, idx - 1)
             } else {
                 segment_heading(&path.waypoints, idx)
             };
@@ -367,6 +472,12 @@ impl Tracker {
     /// positions, slerp for orientations. The controller receives the
     /// updated path and its path index is reset to 0.
     pub fn smoothen(&mut self, max_segment_m: f64) {
+        if let Some(lap) = &self.lap {
+            let mut ring = lap.ring.clone();
+            smoothen_path(&mut ring, max_segment_m);
+            self.set_path(ring);
+            return;
+        }
         let Some(path) = self.path.as_mut() else {
             return;
         };
@@ -375,6 +486,7 @@ impl Tracker {
         }
         smoothen_path(path, max_segment_m);
         self.cursor.set_path(&path.waypoints);
+        self.path_error = path_error(&path.waypoints, &path.speeds, None);
         self.waypoint_index = 0;
         self.projection_segment = 0;
         self.controller.set_path(path.clone());
@@ -503,4 +615,115 @@ fn blocked(waypoints: &[Pose], idx: usize, checker: &CollisionChecker) -> bool {
     let p = waypoints[idx].point;
     let heading = segment_heading(waypoints, idx.min(waypoints.len().saturating_sub(2)));
     checker.collides(0, p.x, p.y, heading)
+}
+
+fn finite_pose(p: &Pose) -> bool {
+    let (t, q) = (p.point, p.rotation);
+    [t.x, t.y, t.z, q.w, q.x, q.y, q.z].iter().all(|v| v.is_finite())
+}
+
+fn state_error(s: &RobotState) -> Option<&'static str> {
+    let v = s.velocity;
+    let ok = finite_pose(&s.pose) && [v.linear, v.angular, v.lateral, s.timestamp].iter().all(|x| x.is_finite());
+    (!ok).then_some("robot state must be finite")
+}
+
+fn goal_error(g: &Goal) -> Option<&'static str> {
+    let velocity_ok = g
+        .target_velocity
+        .is_none_or(|v| [v.linear, v.angular, v.lateral].iter().all(|x| x.is_finite()));
+    let ok = finite_pose(&g.target_pose)
+        && velocity_ok
+        && !g.tolerance_position.is_nan()
+        && !g.tolerance_orientation.is_nan();
+    (!ok).then_some("goal must be finite")
+}
+
+fn path_error(poses: &[Pose], speeds: &[f64], times: Option<&[f64]>) -> Option<&'static str> {
+    if !poses.iter().all(finite_pose) || !speeds.iter().all(|v| v.is_finite()) {
+        return Some("path must be finite");
+    }
+    let times = times?;
+    let ordered = times.windows(2).all(|w| w[0] <= w[1]);
+    if times.len() != poses.len() || !times.iter().all(|t| t.is_finite()) || !ordered {
+        return Some("trajectory needs one finite time per pose, in increasing order");
+    }
+    None
+}
+
+fn constraints_error(c: &RobotConstraints) -> Option<&'static str> {
+    let magnitudes = [
+        c.wheelbase,
+        c.track_width,
+        c.max_linear_velocity,
+        c.max_angular_velocity,
+        c.max_linear_acceleration,
+        c.max_angular_acceleration,
+        c.max_steering_angle,
+        c.max_steering_rate,
+        c.min_turning_radius,
+        c.rear_wheelbase,
+        c.robot_width,
+        c.robot_length,
+    ];
+    let ok = !c.min_linear_velocity.is_nan() && magnitudes.iter().all(|m| *m >= 0.0);
+    (!ok).then_some("robot constraints must be non-negative and not NaN")
+}
+
+fn config_error(c: &ControllerConfig) -> Option<&'static str> {
+    let values = [
+        c.kp_linear,
+        c.ki_linear,
+        c.kd_linear,
+        c.kp_angular,
+        c.ki_angular,
+        c.kd_angular,
+        c.k_cross_track,
+        c.k_heading,
+    ];
+    let magnitudes = [c.lookahead_distance, c.lookahead_time, c.goal_tolerance, c.angular_tolerance];
+    let ok = values.iter().all(|v| !v.is_nan()) && magnitudes.iter().all(|m| *m >= 0.0);
+    (!ok).then_some("controller config must be non-negative where it is a distance, time or tolerance, and not NaN")
+}
+
+/// A closed path driven lap after lap. Controllers get it unrolled to two
+/// laps, and get them again each time the robot starts the second.
+#[derive(Clone, Debug)]
+struct Lap {
+    source: Path,
+    ring: Path,
+    length: f64,
+    unrolled: Path,
+}
+
+impl Lap {
+    fn of(path: &Path) -> Option<Self> {
+        if !path.is_closed || path.waypoints.len() < 2 {
+            return None;
+        }
+        let with_speeds = path.speeds.len() == path.waypoints.len();
+        let mut ring = Path {
+            waypoints: path.waypoints.clone(),
+            speeds: if with_speeds { path.speeds.clone() } else { Vec::new() },
+            is_closed: true,
+        };
+        let (first, last) = (ring.waypoints[0], *ring.waypoints.last().unwrap());
+        if first.point.distance_to_2d(last.point) > 1e-9 {
+            ring.waypoints.push(first);
+            if with_speeds {
+                ring.speeds.push(ring.speeds[0]);
+            }
+        }
+        let length = cumulative_lengths(&ring.waypoints).last().copied().unwrap_or(0.0);
+        if length.is_nan() || length <= 1e-6 {
+            return None;
+        }
+        let mut unrolled = ring.clone();
+        unrolled.is_closed = false;
+        unrolled.waypoints.extend_from_slice(&ring.waypoints[1..]);
+        if with_speeds {
+            unrolled.speeds.extend_from_slice(&ring.speeds[1..]);
+        }
+        Some(Self { source: path.clone(), ring, length, unrolled })
+    }
 }

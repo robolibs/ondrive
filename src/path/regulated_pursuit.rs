@@ -178,8 +178,8 @@ impl Controller for RegulatedPursuitFollower {
         self.base.path_index = proj.segment;
 
         let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
-        let passed_end = proj.beyond_end && proj.distance < 2.0 * pos_tol;
-        if let Some(cmd) = self.base.arrival(state, goal, constraints, passed_end) {
+        let length = self.cursor.total_length();
+        if let Some(cmd) = self.base.arrival_on_path(state, goal, constraints, &proj, length) {
             self.lookahead_point = None;
             return cmd;
         }

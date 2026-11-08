@@ -357,20 +357,19 @@ impl PyRobotConstraints {
     #[new]
     #[pyo3(signature = (
         steering_type = "ackermann",
-        wheelbase = 1.0, track_width = 0.5, wheel_radius = 0.1,
+        wheelbase = 1.0, track_width = 0.0,
         max_linear_velocity = 1.0, min_linear_velocity = -0.5,
         max_angular_velocity = 1.0,
         max_linear_acceleration = 1.0, max_angular_acceleration = 1.0,
-        max_steering_angle = 0.5, max_steering_rate = 1.0,
+        max_steering_angle = 0.5, max_steering_rate = 0.0,
         min_turning_radius = 1.0,
-        rear_wheelbase = 0.0, max_rear_steering_angle = 0.0,
+        rear_wheelbase = 0.0,
         robot_width = 0.0, robot_length = 0.0,
     ))]
     fn new(
         steering_type: &str,
         wheelbase: f64,
         track_width: f64,
-        wheel_radius: f64,
         max_linear_velocity: f64,
         min_linear_velocity: f64,
         max_angular_velocity: f64,
@@ -380,7 +379,6 @@ impl PyRobotConstraints {
         max_steering_rate: f64,
         min_turning_radius: f64,
         rear_wheelbase: f64,
-        max_rear_steering_angle: f64,
         robot_width: f64,
         robot_length: f64,
     ) -> PyResult<Self> {
@@ -390,7 +388,6 @@ impl PyRobotConstraints {
                 steering_type: steering_from_str(steering_type)?,
                 wheelbase,
                 track_width,
-                wheel_radius,
                 max_linear_velocity,
                 min_linear_velocity,
                 max_angular_velocity,
@@ -400,7 +397,6 @@ impl PyRobotConstraints {
                 max_steering_rate,
                 min_turning_radius,
                 rear_wheelbase,
-                max_rear_steering_angle,
                 robot_width,
                 robot_length,
             },
@@ -439,14 +435,6 @@ impl PyRobotConstraints {
     #[setter]
     fn set_track_width(&mut self, v: f64) {
         self.inner.track_width = v;
-    }
-    #[getter]
-    fn wheel_radius(&self) -> f64 {
-        self.inner.wheel_radius
-    }
-    #[setter]
-    fn set_wheel_radius(&mut self, v: f64) {
-        self.inner.wheel_radius = v;
     }
 
     #[getter]
@@ -523,14 +511,6 @@ impl PyRobotConstraints {
     fn set_rear_wheelbase(&mut self, v: f64) {
         self.inner.rear_wheelbase = v;
     }
-    #[getter]
-    fn max_rear_steering_angle(&self) -> f64 {
-        self.inner.max_rear_steering_angle
-    }
-    #[setter]
-    fn set_max_rear_steering_angle(&mut self, v: f64) {
-        self.inner.max_rear_steering_angle = v;
-    }
 
     #[getter]
     fn robot_width(&self) -> f64 {
@@ -576,8 +556,6 @@ impl PyRobotState {
         allow_reverse = false,
         turn_first = false,
         allow_move = true,
-        has_trailer = false,
-        trailer_pose = ((0.0, 0.0, 0.0), 0.0),
     ))]
     fn new(
         pose: PoseTuple,
@@ -586,8 +564,6 @@ impl PyRobotState {
         allow_reverse: bool,
         turn_first: bool,
         allow_move: bool,
-        has_trailer: bool,
-        trailer_pose: PoseTuple,
     ) -> Self {
         Self {
             inner: RsRobotState {
@@ -597,8 +573,6 @@ impl PyRobotState {
                 allow_reverse,
                 turn_first,
                 allow_move,
-                has_trailer,
-                trailer_pose: pose_from_tuple(trailer_pose),
             },
         }
     }

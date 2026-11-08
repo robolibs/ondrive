@@ -88,7 +88,6 @@ typedef struct {
   uint32_t steering_type;
   double wheelbase;
   double track_width;
-  double wheel_radius;
   double max_linear_velocity;
   double min_linear_velocity;
   double max_angular_velocity;
@@ -98,7 +97,6 @@ typedef struct {
   double max_steering_rate;
   double min_turning_radius;
   double rear_wheelbase;
-  double max_rear_steering_angle;
   double robot_width;
   double robot_length;
 } OndriveRobotConstraints;
@@ -142,8 +140,6 @@ typedef struct {
   bool allow_reverse;
   bool turn_first;
   bool allow_move;
-  bool has_trailer;
-  OndrivePose trailer_pose;
 } OndriveRobotState;
 
 typedef struct {
@@ -155,7 +151,6 @@ typedef struct {
    * Ackermann steering angle (rad) consistent with `angular_velocity`.
    */
   double steering_angle;
-  uint32_t output_type;
 } OndriveVelocityCommand;
 
 typedef struct {

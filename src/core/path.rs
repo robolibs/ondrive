@@ -75,8 +75,19 @@ pub fn end_heading(waypoints: &[Pose]) -> f64 {
     }
 }
 
+/// Furthest a projection with a finite search window may land past the end
+/// of its hint segment, in metres. Progress that falls further behind the
+/// robot catches up over the following calls.
+const MAX_ADVANCE: f64 = 2.0;
+
+/// Distances closer than this are a tie.
+const TIE: f64 = 1e-9;
+
 /// Project `p` onto the polyline, searching segments in
-/// `[start.saturating_sub(lookback), start + window)`. Returns `None` for an
+/// `[start.saturating_sub(lookback), start + window)` and, for a finite
+/// `window`, starting no more than `MAX_ADVANCE` past the end of segment
+/// `start`. Among equally near points the one closest in arc length to the
+/// start of segment `start` wins, then the later one. Returns `None` for an
 /// empty path. A single-waypoint path projects onto that point.
 pub fn project(
     waypoints: &[Pose],
@@ -110,9 +121,14 @@ pub fn project(
     let end = waypoints[n - 1].point;
     let first = start.min(seg_count - 1).saturating_sub(lookback);
     let last = start.saturating_add(window).min(seg_count);
+    let s_ref = cum[start.min(seg_count - 1)];
+    let reach = if window == usize::MAX { f64::INFINITY } else { cum[start.min(seg_count - 1) + 1] + MAX_ADVANCE };
 
-    let mut best: Option<PathProjection> = None;
+    let mut best: Option<(PathProjection, f64)> = None;
     for s in first..last {
+        if cum[s] > reach {
+            break;
+        }
         let a = waypoints[s].point;
         let b = waypoints[s + 1].point;
         let dx = b.x - a.x;
@@ -125,29 +141,49 @@ pub fn project(
         };
         let q = Point::new(a.x + t * dx, a.y + t * dy, 0.0);
         let d = p.distance_to_2d(q);
+        let arc_length = cum[s] + t * (cum[s + 1] - cum[s]);
+        let jump = (arc_length - s_ref).abs();
         let better = match &best {
             None => true,
-            Some(b) => d <= b.distance + 1e-9,
+            Some((b, b_jump)) => d < b.distance - TIE || (d <= b.distance + TIE && jump <= b_jump + TIE),
         };
         if better {
             let heading = segment_heading(waypoints, s);
             let (lat, along) = frame_offsets(q, heading, p);
-            let seg_len = cum[s + 1] - cum[s];
-            best = Some(PathProjection {
+            let proj = PathProjection {
                 segment: s,
                 t,
                 point: q,
                 heading,
                 lateral_error: lat,
                 distance: d,
-                arc_length: cum[s] + t * seg_len,
+                arc_length,
                 beyond_end: (s + 1 == seg_count || q.distance_to_2d(end) < 1e-9)
                     && t >= 1.0 - 1e-9
                     && along > 0.0,
-            });
+            };
+            best = Some((proj, jump));
         }
     }
-    best
+    best.map(|(proj, _)| proj)
+}
+
+/// First waypoint after segment `segment` where the path turns back on
+/// itself (consecutive segments more than 90° apart), if any.
+pub fn next_cusp(waypoints: &[Pose], segment: usize) -> Option<usize> {
+    let mut prev: Option<(f64, f64)> = None;
+    for s in segment..waypoints.len().saturating_sub(1) {
+        let (a, b) = (waypoints[s].point, waypoints[s + 1].point);
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        if dx.hypot(dy) < 1e-9 {
+            continue;
+        }
+        if prev.is_some_and(|(px, py)| px * dx + py * dy < 0.0) {
+            return Some(s);
+        }
+        prev = Some((dx, dy));
+    }
+    None
 }
 
 /// Signed (lateral, along-track) offsets of `p` relative to the frame at
@@ -174,10 +210,7 @@ pub fn sample(waypoints: &[Pose], cum: &[f64], s: f64) -> (Point, f64) {
     if s >= total {
         return (waypoints[n - 1].point, end_heading(waypoints));
     }
-    let seg = match cum.binary_search_by(|c| c.partial_cmp(&s).unwrap()) {
-        Ok(i) => i.min(n - 2),
-        Err(i) => i.saturating_sub(1).min(n - 2),
-    };
+    let seg = cum.partition_point(|c| *c <= s).saturating_sub(1).min(n - 2);
     let seg_len = cum[seg + 1] - cum[seg];
     let t = if seg_len > 1e-12 {
         ((s - cum[seg]) / seg_len).clamp(0.0, 1.0)

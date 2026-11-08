@@ -36,10 +36,12 @@ Three families of motion model back them:
 - **Ackermann** — the true bicycle model. A single virtual front wheel,
   curvature `= tan(steer) / wheelbase`, integrated at the rear axle
   (offset by `rear_wheelbase`), steering and turning-radius limits enforced
-  by `finalize`.
+  by `finalize`. Through `Tracker`, `max_steering_rate` (rad/s, 0 = off)
+  limits how fast the commanded steering angle changes.
 - **Differential / SkidSteer** — the unicycle model. `v` and `omega` are
   commanded independently with no wheelbase constraint; the platform can
-  turn in place.
+  turn in place. With `track_width` set (0 = off), `finalize` scales `v`
+  and `omega` together so neither wheel exceeds `max_linear_velocity`.
 - **Holonomic** — full `(vx, vy, omega)` body-frame control, translation and
   rotation fully decoupled, output through `finalize_holonomic` /
   `VelocityCommand::lateral_velocity`. Supported end to end by every
@@ -53,6 +55,8 @@ Three families of motion model back them:
 Obstacle-aware controllers (MCA, SOC, DWA, TEB, RegulatedPursuit, PoseReach,
 APF) consume `WorldConstraints`: Gaussian-mode obstacle predictions and/or
 an occupancy grid, through one footprint-aware collision checker.
+`Tracker` also caps the speed to `Zone::max_speed` while the robot is
+inside a zone's boundary (the slowest zone wins when they overlap).
 
 ## Command contract
 
@@ -73,8 +77,13 @@ regardless of algorithm or steering type:
   divides by `max_linear_velocity` and `max_angular_velocity`.
 - Reverse motion is only commanded when `ControllerConfig::allow_reverse`
   or `RobotState::allow_reverse` is set.
-- A non-positive or non-finite `dt` yields an invalid command; the tracker
-  also returns a valid zero command when `RobotState::allow_move` is false.
+- A non-positive or non-finite `dt` yields an invalid command. Through
+  `Tracker`, so does a NaN or infinite state, goal, path or trajectory
+  time, a trajectory whose times are missing or out of order, and NaN or
+  negative limits in the constraints or config. The tracker also returns
+  a valid zero command when `RobotState::allow_move` is false. The C API
+  turns a panic into a `false` return with the message in
+  `ondrive_last_error_message()`.
 
 Errors use one convention: lateral error is positive when the robot is to
 the left of the path, heading error is positive when the path heading is
@@ -109,6 +118,14 @@ path within twice the position tolerance.
 negative speed marks a segment driven in reverse; pursuit followers never
 look ahead across such a cusp and taper speed into it. `smoothen_path`
 densifies a path (linear + slerp, speeds interpolated).
+
+Progress along a path is continuous: where two parts of a path are
+equally near (a reversing cusp, a self-crossing), the projection stays on
+the part progress is on, and it moves at most 2 m past its last segment
+per tick. A path counts as finished only once that progress has reached
+its end, so a path that passes near its own end earlier is driven to the
+end. Through `Tracker`, a path with `is_closed` is driven lap after lap,
+closed from its last waypoint back to its first, and never completes.
 
 `Trajectory` adds a time per pose. `Tracker::set_trajectory` installs it,
 restarts the tracker clock (advanced by `dt`, or by `RobotState::timestamp`
@@ -196,8 +213,14 @@ Tracker semantics when no explicit goal is set:
   aimed at the waypoint one `lookahead_distance` ahead of the robot's
   projection on the path (passed waypoints are skipped, and waypoints whose
   footprint collides with `WorldConstraints` are skipped too); only the last
-  waypoint uses `goal_tolerance`. `is_path_completed()` turns true after it
-  and further ticks return a zero command.
+  waypoint uses `goal_tolerance`. They drive to a cusp (where the path
+  turns back on itself) before taking the leg that leaves it.
+  `is_path_completed()` turns true after the last waypoint and further
+  ticks return a zero command.
+
+`reset()` clears the controller's internal state (integrators, warm
+starts) and restarts progress on the installed path or trajectory, which
+stays installed.
 
 Specialised configs (`MpcConfig`, `IlqrConfig`, `MppiConfig`, `McaConfig`,
 `SocConfig`, `DwaConfig`, `TebConfig`, `FlcConfig`,
