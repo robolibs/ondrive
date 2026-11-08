@@ -71,6 +71,9 @@ impl Default for RegulatedPursuitConfig {
 const DETOUR_DT: f64 = 0.2;
 /// Share of the top speed that detour takes the robot at.
 const DETOUR_SPEED_SHARE: f64 = 0.8;
+/// Room, metres, the detour keeps beyond the robot's radius on top of the
+/// shared detour margin.
+const DETOUR_ROOM: f64 = 0.2;
 /// Shares of the regulated speed tried, fastest first, until the arc is clear.
 const YIELD_SHARES: [f64; 4] = [1.0, 0.75, 0.5, 0.25];
 /// Seconds at least that the yield check watches the arc for traffic.
@@ -302,7 +305,7 @@ impl Controller for RegulatedPursuitFollower {
             let speed = (DETOUR_SPEED_SHARE * constraints.max_linear_velocity).max(0.1);
             let ahead = (lookahead.min(stop_at - proj.arc_length).max(0.0) / (speed * DETOUR_DT)).round() as usize;
             let reference = build_reference(&self.base.path, &self.cursor.cum, proj.arc_length, ahead + 6, DETOUR_DT, speed, 0.0);
-            if let Some(g) = pick_detour(&reference, obstacles, robot_radius(constraints), DETOUR_DT, &mut self.side) {
+            if let Some(g) = pick_detour(&reference, obstacles, robot_radius(constraints) + DETOUR_ROOM, DETOUR_DT, &mut self.side) {
                 let k = ahead.min(g.x.len() - 1);
                 target = Point::new(g.x[k], g.y[k], 0.0);
             }
