@@ -13,9 +13,9 @@ and all emitting the same body-frame twist.
 |                     | **Carrot**               | Proportional bearing control with distance / heading speed scaling    |
 |                     | **PoseRegulator**        | Astolfi polar law `(rho, alpha, beta)`; converges to position and yaw |
 |                     | **PoseReach**            | Reeds-Shepp / Dubins curve to a goal pose, tracked run by run         |
-|                     | **APF**                  | Potential field fallback; reports local minima instead of hiding them |
+|                     | **APF**                  | Potential field, circulation round obstacles, predicted repulsion     |
 | Path following      | **Pure Pursuit**         | Rear-axle arc-length lookahead, `κ = 2 sin α / L_d`, reverse, cusps   |
-|                     | **RegulatedPursuit**     | Nav2-style: curvature / proximity speed regulation, arc collision check|
+|                     | **RegulatedPursuit**     | Nav2-style regulation; goes round blocks, slows to give way to traffic|
 |                     | **VectorPursuit**        | Screw-theory pursuit using the lookahead point's orientation          |
 |                     | **Stanley**              | Front-axle segment projection, `δ = θ_e + atan(k e / (k_soft + v))`   |
 |                     | **LQR**                  | Kinematic `[e, θ_e]` error model, DARE solved every tick, curvature FF|
@@ -26,7 +26,7 @@ and all emitting the same body-frame twist.
 |                     | **MPPI**                 | Contouring corridor, correlated noise, adaptive λ, Nav2-style critics |
 |                     | **MCA** (DRA-MPPI)       | MPPI + Monte Carlo collision probability over Gaussian-mixture modes  |
 |                     | **SOC** (SVG-MPPI)       | Stein Variational Gradient Descent guides + adaptive-variance MPPI    |
-|                     | **DWA**                  | Fox 1997 window, braking admissibility, recovery rotation            |
+|                     | **DWA**                  | Fox 1997 window, inevitable-collision check, evasion, recovery       |
 |                     | **TEB**                  | Timed Elastic Band, common-arc residual (skipped if holonomic), GD on Δt_i|
 | Fuzzy               | **FLC**                  | Mamdani, 7 triangular terms, 49-rule additive base, curvature FF      |
 
@@ -67,7 +67,11 @@ On an Ackermann machine with `max_steering_rate` set, the steering takes
 time to act. MPC, iLQR, MPPI, MCA and SOC model it in their rollouts; for
 every other controller `Tracker` hands over the state predicted through
 that delay (half a lock-to-lock swing) and caps the speed where the path's
-curvature changes faster than the steering can follow.
+curvature changes faster than the steering can follow. The predictive
+controllers also lengthen their horizon on such a machine to span two of
+its tightest turning radii plus two half swings of its steering (at most
+12 s, in steps of at most 0.25 s), so a tractor sees an obstacle soon
+enough to get round it.
 
 ## Command contract
 
