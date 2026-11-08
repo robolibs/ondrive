@@ -53,12 +53,25 @@ fn pose_at(x: f64, y: f64, yaw: f64) -> Pose {
     }
 }
 
+/// Angle wrapped to `[0, 2π)`, the range of the Dubins formulas.
 fn mod2pi(a: f64) -> f64 {
     let mut v = a % (2.0 * PI);
     if v < 0.0 {
         v += 2.0 * PI;
     }
     v
+}
+
+/// Angle wrapped to `[-π, π]`, the range of the Reeds-Shepp formulas.
+fn pify(a: f64) -> f64 {
+    let v = a % (2.0 * PI);
+    if v < -PI {
+        v + 2.0 * PI
+    } else if v > PI {
+        v - 2.0 * PI
+    } else {
+        v
+    }
 }
 
 fn polar(x: f64, y: f64) -> (f64, f64) {
@@ -146,10 +159,14 @@ fn dubins_words(x: f64, y: f64, phi: f64) -> Vec<Word> {
 
 type Triple = Option<(f64, f64, f64)>;
 
-fn lp_sp_lp(x: f64, y: f64, phi: f64) -> Triple {
+/// Angle wrap the Reeds-Shepp formulas solve in: `pify` gives the optimal
+/// form of each word, `mod2pi` the same words with arcs the long way round.
+type Wrap = fn(f64) -> f64;
+
+fn lp_sp_lp(x: f64, y: f64, phi: f64, wrap: Wrap) -> Triple {
     let (u, t) = polar(x - phi.sin(), y - 1.0 + phi.cos());
     if t >= -ZERO {
-        let v = mod2pi(phi - t);
+        let v = wrap(phi - t);
         if v >= -ZERO {
             return Some((t, u, v));
         }
@@ -157,14 +174,14 @@ fn lp_sp_lp(x: f64, y: f64, phi: f64) -> Triple {
     None
 }
 
-fn lp_sp_rp(x: f64, y: f64, phi: f64) -> Triple {
+fn lp_sp_rp(x: f64, y: f64, phi: f64, wrap: Wrap) -> Triple {
     let (u1, t1) = polar(x + phi.sin(), y - 1.0 - phi.cos());
     let u1 = u1 * u1;
     if u1 >= 4.0 {
         let u = (u1 - 4.0).sqrt();
         let theta = (2.0f64).atan2(u);
-        let t = mod2pi(t1 + theta);
-        let v = mod2pi(t - phi);
+        let t = wrap(t1 + theta);
+        let v = wrap(t - phi);
         if t >= -ZERO && v >= -ZERO {
             return Some((t, u, v));
         }
@@ -172,14 +189,14 @@ fn lp_sp_rp(x: f64, y: f64, phi: f64) -> Triple {
     None
 }
 
-fn lp_rm_l(x: f64, y: f64, phi: f64) -> Triple {
+fn lp_rm_l(x: f64, y: f64, phi: f64, wrap: Wrap) -> Triple {
     let xi = x - phi.sin();
     let eta = y - 1.0 + phi.cos();
     let (u1, theta) = polar(xi, eta);
     if u1 <= 4.0 {
         let u = -2.0 * (0.25 * u1).asin();
-        let t = mod2pi(theta + 0.5 * u + PI);
-        let v = mod2pi(phi - t + u);
+        let t = wrap(theta + 0.5 * u + PI);
+        let v = wrap(phi - t + u);
         if t >= -ZERO && u <= ZERO {
             return Some((t, u, v));
         }
@@ -187,24 +204,24 @@ fn lp_rm_l(x: f64, y: f64, phi: f64) -> Triple {
     None
 }
 
-fn tau_omega(u: f64, v: f64, xi: f64, eta: f64, phi: f64) -> (f64, f64) {
-    let delta = mod2pi(u - v);
+fn tau_omega(u: f64, v: f64, xi: f64, eta: f64, phi: f64, wrap: Wrap) -> (f64, f64) {
+    let delta = wrap(u - v);
     let a = u.sin() - delta.sin();
     let b = u.cos() - delta.cos() - 1.0;
     let t1 = (eta * a - xi * b).atan2(xi * a + eta * b);
     let t2 = 2.0 * (delta.cos() - v.cos() - u.cos()) + 3.0;
-    let tau = if t2 < 0.0 { mod2pi(t1 + PI) } else { mod2pi(t1) };
-    let omega = mod2pi(tau - u + v - phi);
+    let tau = if t2 < 0.0 { wrap(t1 + PI) } else { wrap(t1) };
+    let omega = wrap(tau - u + v - phi);
     (tau, omega)
 }
 
-fn lp_rup_lum_rm(x: f64, y: f64, phi: f64) -> Triple {
+fn lp_rup_lum_rm(x: f64, y: f64, phi: f64, wrap: Wrap) -> Triple {
     let xi = x + phi.sin();
     let eta = y - 1.0 - phi.cos();
     let rho = 0.25 * (2.0 + (xi * xi + eta * eta).sqrt());
     if rho <= 1.0 {
         let u = rho.acos();
-        let (t, v) = tau_omega(u, -u, xi, eta, phi);
+        let (t, v) = tau_omega(u, -u, xi, eta, phi, wrap);
         if t >= -ZERO && v <= ZERO {
             return Some((t, u, v));
         }
@@ -212,14 +229,14 @@ fn lp_rup_lum_rm(x: f64, y: f64, phi: f64) -> Triple {
     None
 }
 
-fn lp_rum_lum_rp(x: f64, y: f64, phi: f64) -> Triple {
+fn lp_rum_lum_rp(x: f64, y: f64, phi: f64, wrap: Wrap) -> Triple {
     let xi = x + phi.sin();
     let eta = y - 1.0 - phi.cos();
     let rho = (20.0 - xi * xi - eta * eta) / 16.0;
     if (0.0..=1.0).contains(&rho) {
         let u = -rho.acos();
         if u >= -0.5 * PI {
-            let (t, v) = tau_omega(u, u, xi, eta, phi);
+            let (t, v) = tau_omega(u, u, xi, eta, phi, wrap);
             if t >= -ZERO && v >= -ZERO {
                 return Some((t, u, v));
             }
@@ -228,15 +245,15 @@ fn lp_rum_lum_rp(x: f64, y: f64, phi: f64) -> Triple {
     None
 }
 
-fn lp_rm_sm_lm(x: f64, y: f64, phi: f64) -> Triple {
+fn lp_rm_sm_lm(x: f64, y: f64, phi: f64, wrap: Wrap) -> Triple {
     let xi = x - phi.sin();
     let eta = y - 1.0 + phi.cos();
     let (rho, theta) = polar(xi, eta);
     if rho >= 2.0 {
         let r = (rho * rho - 4.0).sqrt();
         let u = 2.0 - r;
-        let t = mod2pi(theta + r.atan2(-2.0));
-        let v = mod2pi(phi - 0.5 * PI - t);
+        let t = wrap(theta + r.atan2(-2.0));
+        let v = wrap(phi - 0.5 * PI - t);
         if t >= -ZERO && u <= ZERO && v <= ZERO {
             return Some((t, u, v));
         }
@@ -244,14 +261,14 @@ fn lp_rm_sm_lm(x: f64, y: f64, phi: f64) -> Triple {
     None
 }
 
-fn lp_rm_sm_rm(x: f64, y: f64, phi: f64) -> Triple {
+fn lp_rm_sm_rm(x: f64, y: f64, phi: f64, wrap: Wrap) -> Triple {
     let xi = x + phi.sin();
     let eta = y - 1.0 - phi.cos();
     let (rho, theta) = polar(-eta, xi);
     if rho >= 2.0 {
         let t = theta;
         let u = 2.0 - rho;
-        let v = mod2pi(t + 0.5 * PI - phi);
+        let v = wrap(t + 0.5 * PI - phi);
         if t >= -ZERO && u <= ZERO && v <= ZERO {
             return Some((t, u, v));
         }
@@ -259,15 +276,15 @@ fn lp_rm_sm_rm(x: f64, y: f64, phi: f64) -> Triple {
     None
 }
 
-fn lp_rm_s_lm_rp(x: f64, y: f64, phi: f64) -> Triple {
+fn lp_rm_s_lm_rp(x: f64, y: f64, phi: f64, wrap: Wrap) -> Triple {
     let xi = x + phi.sin();
     let eta = y - 1.0 - phi.cos();
     let (rho, _) = polar(xi, eta);
     if rho >= 2.0 {
         let u = 4.0 - (rho * rho - 4.0).sqrt();
         if u <= ZERO {
-            let t = mod2pi(((4.0 - u) * xi - 2.0 * eta).atan2(-2.0 * xi + (u - 4.0) * eta));
-            let v = mod2pi(t - phi);
+            let t = wrap(((4.0 - u) * xi - 2.0 * eta).atan2(-2.0 * xi + (u - 4.0) * eta));
+            let v = wrap(t - phi);
             if t >= -ZERO && v >= -ZERO {
                 return Some((t, u, v));
             }
@@ -288,62 +305,61 @@ fn flip(seg: Segment) -> Segment {
 /// (reverse driving), reflection (mirror steering), and both.
 fn variants(
     out: &mut Vec<Word>,
-    x: f64,
-    y: f64,
-    phi: f64,
-    f: fn(f64, f64, f64) -> Triple,
+    (x, y, phi): (f64, f64, f64),
+    f: fn(f64, f64, f64, Wrap) -> Triple,
+    wrap: Wrap,
     segs: [Segment; 5],
     build: fn((f64, f64, f64)) -> [f64; 5],
 ) {
     let mirrored = [flip(segs[0]), flip(segs[1]), flip(segs[2]), flip(segs[3]), flip(segs[4])];
-    if let Some(r) = f(x, y, phi) {
+    if let Some(r) = f(x, y, phi, wrap) {
         out.push(Word::new(build(r), segs));
     }
-    if let Some(r) = f(-x, y, -phi) {
+    if let Some(r) = f(-x, y, -phi, wrap) {
         let l = build(r);
         out.push(Word::new([-l[0], -l[1], -l[2], -l[3], -l[4]], segs));
     }
-    if let Some(r) = f(x, -y, -phi) {
+    if let Some(r) = f(x, -y, -phi, wrap) {
         out.push(Word::new(build(r), mirrored));
     }
-    if let Some(r) = f(-x, -y, phi) {
+    if let Some(r) = f(-x, -y, phi, wrap) {
         let l = build(r);
         out.push(Word::new([-l[0], -l[1], -l[2], -l[3], -l[4]], mirrored));
     }
 }
 
-fn reeds_shepp_words(x: f64, y: f64, phi: f64) -> Vec<Word> {
+fn reeds_shepp_words(x: f64, y: f64, phi: f64, wrap: Wrap) -> Vec<Word> {
     use Segment::*;
     let mut out = Vec::new();
     let tuv = |(t, u, v): (f64, f64, f64)| [t, u, v, 0.0, 0.0];
-    variants(&mut out, x, y, phi, lp_sp_lp, [Left, Straight, Left, None, None], tuv);
-    variants(&mut out, x, y, phi, lp_sp_rp, [Left, Straight, Right, None, None], tuv);
-    variants(&mut out, x, y, phi, lp_rm_l, [Left, Right, Left, None, None], tuv);
+    variants(&mut out, (x, y, phi), lp_sp_lp, wrap, [Left, Straight, Left, None, None], tuv);
+    variants(&mut out, (x, y, phi), lp_sp_rp, wrap, [Left, Straight, Right, None, None], tuv);
+    variants(&mut out, (x, y, phi), lp_rm_l, wrap, [Left, Right, Left, None, None], tuv);
     // Backward CCC: swap start and goal.
     let xb = x * phi.cos() + y * phi.sin();
     let yb = x * phi.sin() - y * phi.cos();
-    variants(&mut out, xb, yb, phi, lp_rm_l, [Left, Right, Left, None, None], |(t, u, v)| {
+    variants(&mut out, (xb, yb, phi), lp_rm_l, wrap, [Left, Right, Left, None, None], |(t, u, v)| {
         [v, u, t, 0.0, 0.0]
     });
-    variants(&mut out, x, y, phi, lp_rup_lum_rm, [Left, Right, Left, Right, None], |(t, u, v)| {
+    variants(&mut out, (x, y, phi), lp_rup_lum_rm, wrap, [Left, Right, Left, Right, None], |(t, u, v)| {
         [t, u, -u, v, 0.0]
     });
-    variants(&mut out, x, y, phi, lp_rum_lum_rp, [Left, Right, Left, Right, None], |(t, u, v)| {
+    variants(&mut out, (x, y, phi), lp_rum_lum_rp, wrap, [Left, Right, Left, Right, None], |(t, u, v)| {
         [t, u, u, v, 0.0]
     });
-    variants(&mut out, x, y, phi, lp_rm_sm_lm, [Left, Right, Straight, Left, None], |(t, u, v)| {
+    variants(&mut out, (x, y, phi), lp_rm_sm_lm, wrap, [Left, Right, Straight, Left, None], |(t, u, v)| {
         [t, -0.5 * PI, u, v, 0.0]
     });
-    variants(&mut out, x, y, phi, lp_rm_sm_rm, [Left, Right, Straight, Right, None], |(t, u, v)| {
+    variants(&mut out, (x, y, phi), lp_rm_sm_rm, wrap, [Left, Right, Straight, Right, None], |(t, u, v)| {
         [t, -0.5 * PI, u, v, 0.0]
     });
-    variants(&mut out, xb, yb, phi, lp_rm_sm_lm, [Left, Straight, Right, Left, None], |(t, u, v)| {
+    variants(&mut out, (xb, yb, phi), lp_rm_sm_lm, wrap, [Left, Straight, Right, Left, None], |(t, u, v)| {
         [v, u, -0.5 * PI, t, 0.0]
     });
-    variants(&mut out, xb, yb, phi, lp_rm_sm_rm, [Right, Straight, Right, Left, None], |(t, u, v)| {
+    variants(&mut out, (xb, yb, phi), lp_rm_sm_rm, wrap, [Right, Straight, Right, Left, None], |(t, u, v)| {
         [v, u, -0.5 * PI, t, 0.0]
     });
-    variants(&mut out, x, y, phi, lp_rm_s_lm_rp, [Left, Right, Straight, Left, Right], |(t, u, v)| {
+    variants(&mut out, (x, y, phi), lp_rm_s_lm_rp, wrap, [Left, Right, Straight, Left, Right], |(t, u, v)| {
         [t, -0.5 * PI, u, -0.5 * PI, v]
     });
     out
@@ -418,7 +434,7 @@ pub fn dubins(start: &Pose, goal: &Pose, radius: f64, spacing: f64) -> Option<Cu
 pub fn reeds_shepp(start: &Pose, goal: &Pose, radius: f64, spacing: f64) -> Option<CurvePath> {
     let radius = radius.max(1e-3);
     let (x, y, phi) = relative(start, goal, radius);
-    let word = shortest(reeds_shepp_words(x, y, phi))?;
+    let word = shortest(reeds_shepp_words(x, y, phi, pify))?;
     Some(sample_word(&word, start, radius, spacing))
 }
 
@@ -429,11 +445,14 @@ pub fn dubins_all(start: &Pose, goal: &Pose, radius: f64, spacing: f64) -> Vec<C
     sorted(dubins_words(x, y, phi)).iter().map(|w| sample_word(w, start, radius, spacing)).collect()
 }
 
-/// Every Reeds-Shepp curve from `start` to `goal`, shortest first.
+/// Every Reeds-Shepp curve from `start` to `goal`, shortest first: each word
+/// in its optimal form, then again with arcs taken the long way round.
 pub fn reeds_shepp_all(start: &Pose, goal: &Pose, radius: f64, spacing: f64) -> Vec<CurvePath> {
     let radius = radius.max(1e-3);
     let (x, y, phi) = relative(start, goal, radius);
-    sorted(reeds_shepp_words(x, y, phi)).iter().map(|w| sample_word(w, start, radius, spacing)).collect()
+    let mut words = reeds_shepp_words(x, y, phi, pify);
+    words.extend(reeds_shepp_words(x, y, phi, mod2pi));
+    sorted(words).iter().map(|w| sample_word(w, start, radius, spacing)).collect()
 }
 
 #[cfg(test)]
@@ -480,6 +499,96 @@ mod tests {
             assert!(d < 0.05 && a < 0.05, "goal ({gx},{gy},{gth}): d={d:.3} a={a:.3}");
             let du = dubins(&start, &goal, 1.0, 0.05).unwrap();
             assert!(rs.length <= du.length + 1e-6, "goal ({gx},{gy},{gth}): rs {:.3} > dubins {:.3}", rs.length, du.length);
+        }
+    }
+
+    fn goal_grid() -> Vec<Pose> {
+        let mut out = Vec::new();
+        for i in -4..=4 {
+            for j in -4..=4 {
+                for k in -3..=3 {
+                    out.push(pose_at(i as f64 * 0.75, j as f64 * 0.75, k as f64 * 0.9));
+                }
+            }
+        }
+        out
+    }
+
+    fn turned_around(p: &Pose) -> Pose {
+        pose_at(p.point.x, p.point.y, normalize_angle(yaw_of(p) + PI))
+    }
+
+    #[test]
+    fn reeds_shepp_finds_the_short_reverse_manoeuvre() {
+        let start = pose_at(0.0, 0.0, 0.0);
+        let goal = pose_at(-0.277, -0.387, 0.883);
+        let rs = reeds_shepp(&start, &goal, 1.0, 0.01).unwrap();
+        let (d, a) = end_error(&rs, &goal);
+        assert!(d < 0.01 && a < 0.01, "d={d:.3} a={a:.3}");
+        // Turning 0.883 rad at radius 1 alone takes 0.883 m.
+        assert!(rs.length < 1.05, "length {:.3}", rs.length);
+    }
+
+    #[test]
+    fn reeds_shepp_is_symmetric_and_never_longer_than_dubins_either_way() {
+        let start = pose_at(0.0, 0.0, 0.0);
+        for goal in goal_grid() {
+            let ab = reeds_shepp(&start, &goal, 1.0, 0.05).unwrap();
+            let ba = reeds_shepp(&goal, &start, 1.0, 0.05).unwrap();
+            let (d, a) = end_error(&ab, &goal);
+            let g = (goal.point.x, goal.point.y, yaw_of(&goal));
+            assert!(d < 0.05 && a < 0.05, "goal {g:?}: d={d:.3} a={a:.3}");
+            assert!((ab.length - ba.length).abs() < 1e-6, "goal {g:?}: {:.4} there, {:.4} back", ab.length, ba.length);
+            let forward = dubins(&start, &goal, 1.0, 0.05).unwrap().length;
+            let backward = dubins(&turned_around(&start), &turned_around(&goal), 1.0, 0.05).unwrap().length;
+            assert!(ab.length <= forward.min(backward) + 1e-6, "goal {g:?}: rs {:.4}, dubins {forward:.4} / {backward:.4}", ab.length);
+        }
+    }
+
+    fn rs_length(a: &Pose, b: &Pose) -> f64 {
+        let (x, y, phi) = relative(a, b, 1.0);
+        shortest(reeds_shepp_words(x, y, phi, pify)).unwrap().length()
+    }
+
+    #[test]
+    fn every_reeds_shepp_candidate_ends_on_the_goal_and_the_first_is_the_shortest() {
+        let start = pose_at(0.0, 0.0, 0.0);
+        for goal in goal_grid() {
+            let all = reeds_shepp_all(&start, &goal, 1.0, 0.05);
+            let best = reeds_shepp(&start, &goal, 1.0, 0.05).unwrap();
+            assert!((all[0].length - best.length).abs() < 1e-9);
+            for c in &all {
+                let (d, a) = end_error(c, &goal);
+                assert!(d < 0.05 && a < 0.05, "goal ({:.2},{:.2}): d={d:.3} a={a:.3}", goal.point.x, goal.point.y);
+            }
+        }
+    }
+
+    #[test]
+    fn reeds_shepp_obeys_the_triangle_inequality() {
+        let start = pose_at(0.0, 0.0, 0.0);
+        let coarse = |n: i32, step: f64, turns: i32| {
+            let mut out = Vec::new();
+            for i in -n..=n {
+                for j in -n..=n {
+                    for k in 0..turns {
+                        out.push(pose_at(i as f64 * step, j as f64 * step, -PI + k as f64 * 2.0 * PI / turns as f64));
+                    }
+                }
+            }
+            out
+        };
+        let via = coarse(2, 0.6, 4);
+        for goal in coarse(2, 1.1, 5) {
+            let direct = rs_length(&start, &goal);
+            for mid in &via {
+                let split = rs_length(&start, mid) + rs_length(mid, &goal);
+                assert!(
+                    direct <= split + 1e-9,
+                    "goal ({:.2},{:.2},{:.2}): direct {direct:.4} > {split:.4} via ({:.2},{:.2},{:.2})",
+                    goal.point.x, goal.point.y, yaw_of(&goal), mid.point.x, mid.point.y, yaw_of(mid)
+                );
+            }
         }
     }
 
