@@ -10,7 +10,6 @@ use crate::core::kinematics::planning;
 use crate::core::obstacles::{CollisionChecker, footprint_discs, obstacle_barrier};
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
-    command_base,
     CostWeights, Model, Reference, build_reference, build_timed_reference, command_from_controls,
     current_lateral_speed, current_speed, prepare, rollout, speed_at_arc_length,
     update_turn_in_place,
@@ -135,6 +134,9 @@ pub(crate) fn measures_steering(state: &RobotState) -> bool {
 /// Speed, m/s, above which the steering read from yaw rate and speed is
 /// taken over the commanded steering's model.
 const MEASURED_STEERING_SPEED: f64 = 0.3;
+
+/// Share of the reference speed the command never exceeds.
+pub(crate) const REF_SPEED_HEADROOM: f64 = 1.25;
 
 /// The steering reached `dt` after commanding `command` from `previous`
 /// (the model's starting steering before any command), through the
@@ -501,11 +503,11 @@ impl Controller for MpcFollower {
 
         let dt_apply = dt.min(cfg.dt);
         let v_cap = speed_at_arc_length(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length)
-            .unwrap_or(f64::INFINITY);
+            .unwrap_or(f64::INFINITY)
+            .min(REF_SPEED_HEADROOM * cfg.ref_velocity.max(0.1));
         self.base.status.mode = "mpc_tracking".into();
-        let base = command_base(v_now, self.last_v, accel0);
         let cmd = command_from_controls(
-            base,
+            v_now,
             vy_now,
             steer0,
             accel0,
@@ -519,7 +521,7 @@ impl Controller for MpcFollower {
             prep.epsi,
             "MPC tracking",
         );
-        self.last_v = (base + accel0 * dt_apply).clamp(-v_cap, v_cap);
+        self.last_v = (v_now + accel0 * dt_apply).clamp(-v_cap, v_cap);
         self.last_vy = vy_now + accel_lat0 * dt_apply;
         cmd
     }

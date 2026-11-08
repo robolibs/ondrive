@@ -19,7 +19,6 @@ use crate::core::kinematics::planning;
 use crate::core::obstacles::{CollisionChecker, robot_radius};
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
-    command_base,
     CostWeights, Model, Track, build_reference, build_timed_reference, command_from_controls, current_lateral_speed,
     correlated_noise, current_speed, detour_relax, effective_sample_size, guide_paths, left_by, pick_detour, pursue, savitzky_golay,
     importance_weights, prepare, speed_at_arc_length, update_turn_in_place,
@@ -643,9 +642,8 @@ impl Controller for SocFollower {
         let v_cap = speed_at_arc_length(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length)
             .unwrap_or(f64::INFINITY);
         self.base.status.mode = "soc_tracking".into();
-        let base = command_base(v_now, self.last_v, accel0);
         let cmd = command_from_controls(
-            base,
+            v_now,
             vy_now,
             steer0,
             accel0,
@@ -659,7 +657,7 @@ impl Controller for SocFollower {
             prep.epsi,
             "SOC tracking",
         );
-        self.last_v = (base + accel0 * dt_apply).clamp(-v_cap, v_cap);
+        self.last_v = (v_now + accel0 * dt_apply).clamp(-v_cap, v_cap);
         self.last_vy = vy_now + accel_lat0 * dt_apply;
         cmd
     }

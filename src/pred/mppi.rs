@@ -673,21 +673,6 @@ pub(crate) fn command_from_controls(
     finalize(v, omega, constraints, cfg, allow_reverse, message)
 }
 
-/// The speed a command integrates its acceleration `accel` from: the
-/// measured `v_meas`, or, while accelerating the way the last command `last`
-/// already leads it, the last command, no more than `COMMAND_LEAD` ahead.
-pub(crate) fn command_base(v_meas: f64, last: f64, accel: f64) -> f64 {
-    let lead = last - v_meas;
-    if accel * lead > 0.0 && last * v_meas >= 0.0 {
-        v_meas + lead.clamp(-COMMAND_LEAD, COMMAND_LEAD)
-    } else {
-        v_meas
-    }
-}
-
-/// Metres per second a command may lead the measured speed it starts from.
-const COMMAND_LEAD: f64 = 0.3;
-
 /// Importance weights `exp(-(S - min S) / lambda)`, normalised.
 pub(crate) fn importance_weights(costs: &[f64], temperature: f64) -> Vec<f64> {
     let lambda = temperature.max(1e-6);
@@ -1092,9 +1077,8 @@ impl MppiFollower {
             .unwrap_or(f64::INFINITY)
             .min(speed_scale * constraints.max_linear_velocity.max(0.0));
         self.base.status.mode = mode.into();
-        let base = command_base(v_now, self.last_v, accel0);
         let cmd = command_from_controls(
-            base,
+            v_now,
             vy_now,
             steer0,
             accel0,
@@ -1112,7 +1096,7 @@ impl MppiFollower {
         self.last_v = if cmd.valid && physical {
             cmd.linear_velocity
         } else {
-            (base + accel0 * dt_apply).clamp(-v_cap, v_cap)
+            (v_now + accel0 * dt_apply).clamp(-v_cap, v_cap)
         };
         self.last_vy = if cmd.valid && physical {
             cmd.lateral_velocity

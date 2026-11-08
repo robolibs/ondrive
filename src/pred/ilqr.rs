@@ -17,7 +17,6 @@ use crate::core::obstacles::{footprint_discs, obstacle_barrier};
 use crate::core::path::PathCursor;
 use crate::pred::mpc::{SIDE_SWITCH_COST, guided};
 use crate::pred::mppi::{
-    command_base,
     Model, Reference, build_reference, build_timed_reference, command_from_controls, eased_lateral,
     current_lateral_speed, current_speed, prepare, speed_at_arc_length, update_turn_in_place,
 };
@@ -573,11 +572,11 @@ impl Controller for IlqrFollower {
         );
         let dt_apply = dt.min(cfg.dt);
         let v_cap = speed_at_arc_length(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length)
-            .unwrap_or(f64::INFINITY);
+            .unwrap_or(f64::INFINITY)
+            .min(crate::pred::mpc::REF_SPEED_HEADROOM * cfg.ref_velocity.max(0.1));
         self.base.status.mode = "ilqr_tracking".into();
-        let base = command_base(v_now, self.last_v, accel0);
         let cmd = command_from_controls(
-            base,
+            v_now,
             vy_now,
             steer0,
             accel0,
@@ -591,7 +590,7 @@ impl Controller for IlqrFollower {
             prep.epsi,
             "iLQR tracking",
         );
-        self.last_v = (base + accel0 * dt_apply).clamp(-v_cap, v_cap);
+        self.last_v = (v_now + accel0 * dt_apply).clamp(-v_cap, v_cap);
         self.last_vy = vy_now + accel_lat0 * dt_apply;
         cmd
     }

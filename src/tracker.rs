@@ -82,6 +82,8 @@ pub struct Tracker {
     last_steering: Option<f64>,
     /// Last command sent, physical `(v, omega, vy)`.
     last_command: Option<(f64, f64, f64)>,
+    /// Seconds the machine has stood while commanded to move.
+    stalled_for: f64,
 }
 
 impl Tracker {
@@ -107,6 +109,7 @@ impl Tracker {
             lap: None,
             last_steering: None,
             last_command: None,
+            stalled_for: 0.0,
         }
     }
 
@@ -374,6 +377,24 @@ impl Tracker {
                     v = v.clamp(v_lo, v_hi);
                     w = (k * v).clamp(w_lo, w_hi);
                 }
+            }
+        }
+
+        // A machine standing while told to move is commanded more, at the
+        // acceleration limit, until it moves or reaches `BREAKAWAY_SPEED`.
+        let speed = v.hypot(vy);
+        let standing = state.velocity_valid && state.velocity.linear.hypot(state.velocity.lateral) < STANDING_SPEED;
+        self.stalled_for = if standing && speed > 1e-3 { self.stalled_for + dt } else { 0.0 };
+        if self.stalled_for > STALL_S
+            && let Some((pv, _, pvy)) = self.last_command
+        {
+            let a = c.max_linear_acceleration.abs() * dt;
+            let ramp = (pv.hypot(pvy) + a).min(BREAKAWAY_SPEED);
+            if ramp > speed {
+                let s = ramp / speed;
+                v *= s;
+                vy *= s;
+                w *= s;
             }
         }
 
@@ -857,6 +878,13 @@ const DETOUR_DT: f64 = 0.2;
 /// Share of the top speed below which a point controller's detour does not
 /// take the robot's speed to fall.
 const DETOUR_SPEED_FLOOR: f64 = 0.3;
+
+/// Measured speed, m/s, below which a machine counts as standing.
+const STANDING_SPEED: f64 = 0.05;
+/// Seconds a machine stands while told to move before its command is ramped.
+const STALL_S: f64 = 1.0;
+/// Speed, m/s, the stall ramp goes up to.
+const BREAKAWAY_SPEED: f64 = 0.3;
 
 /// Seconds of path at top speed checked for the steering-rate speed cap.
 const RATE_PREVIEW_S: f64 = 2.0;
