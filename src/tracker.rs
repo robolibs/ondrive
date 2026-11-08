@@ -70,6 +70,10 @@ pub struct Tracker {
     detour_side: f64,
     projection_segment: usize,
     path_completed: bool,
+    /// Whether the goal last handed to the controller is the path's end.
+    aiming_at_end: bool,
+    /// The goal point last handed to the controller.
+    aim: Option<Point>,
     trajectory: Option<Trajectory>,
     clock: f64,
     clock_origin: Option<f64>,
@@ -94,6 +98,8 @@ impl Tracker {
             detour_side: 0.0,
             projection_segment: 0,
             path_completed: false,
+            aiming_at_end: true,
+            aim: None,
             trajectory: None,
             clock: 0.0,
             clock_origin: None,
@@ -153,6 +159,7 @@ impl Tracker {
         self.waypoint_index = 0;
         self.projection_segment = 0;
         self.path_completed = false;
+        self.aim = None;
         self.controller.set_path(path);
     }
 
@@ -171,6 +178,7 @@ impl Tracker {
         self.waypoint_index = 0;
         self.projection_segment = 0;
         self.path_completed = false;
+        self.aim = None;
         self.clock = 0.0;
         self.clock_origin = None;
         self.controller.set_trajectory(trajectory.clone());
@@ -196,6 +204,7 @@ impl Tracker {
         self.waypoint_index = 0;
         self.projection_segment = 0;
         self.path_completed = false;
+        self.aim = None;
         self.controller.set_path(Path::default());
     }
 
@@ -249,6 +258,7 @@ impl Tracker {
         }
         self.waypoint_index = 0;
         self.path_completed = false;
+        self.aim = None;
         self.last_steering = None;
         self.last_command = None;
     }
@@ -298,6 +308,7 @@ impl Tracker {
             Ok(None) => return stop("Path completed"),
             Err(msg) => return VelocityCommand::invalid(msg),
         };
+        self.aim = Some(goal.target_pose.point);
 
         let ahead = (!self.kind.models_actuation())
             .then(|| predicted_through_actuation(state, &self.constraints, self.last_command))
@@ -306,8 +317,7 @@ impl Tracker {
             .controller
             .compute_control(ahead.as_ref().unwrap_or(state), &goal, &self.constraints, dt, world);
 
-        if self.goal.is_none() && self.path.is_some() && self.controller.get_status().goal_reached
-        {
+        if self.goal.is_none() && self.path.is_some() && self.aiming_at_end && self.controller.get_status().goal_reached {
             self.path_completed = true;
         }
         self.limit(cmd, state, dt, world)
@@ -469,6 +479,7 @@ impl Tracker {
             return Ok(None);
         }
         let cfg = self.controller.get_config();
+        self.aiming_at_end = true;
 
         if self.kind.is_point_controller() {
             let n = path.waypoints.len();
@@ -478,6 +489,7 @@ impl Tracker {
             };
             let cum = &self.cursor.cum;
             let tol = cfg.goal_tolerance;
+            let speed_now = if state.velocity_valid { state.velocity.linear } else { self.last_command.map_or(0.0, |c| c.0) };
             let ahead = cfg.lookahead_distance.max(2.0 * tol);
             let target = |segment: usize, s: f64| {
                 let idx = cum.iter().position(|c| *c >= s - 1e-9).unwrap_or(n - 1).max(segment + 1).min(n - 1);
@@ -495,9 +507,10 @@ impl Tracker {
             let detour = world
                 .filter(|w| !w.obstacles.is_empty())
                 .and_then(|w| {
-                    detour_target(path, cum, proj.arc_length, cum[idx], state.pose.point, tol, &w.obstacles, &self.constraints, &mut self.detour_side)
+                    detour_target(path, cum, proj.arc_length, cum[idx], state.pose.point, tol, &w.obstacles, &self.constraints, speed_now, &mut self.detour_side)
                 });
             if let Some(point) = detour {
+                self.aiming_at_end = false;
                 let heading = segment_heading(&path.waypoints, idx.min(n.saturating_sub(2)));
                 return Ok(Some(Goal {
                     target_pose: Pose { point, rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, heading)) },
@@ -513,6 +526,7 @@ impl Tracker {
                 }
             }
             let last = idx + 1 >= n;
+            self.aiming_at_end = last;
             let wp = path.waypoints[idx];
             let yaw = if last {
                 end_heading(&path.waypoints)
@@ -576,11 +590,15 @@ impl Tracker {
     }
 
     /// The point the tracker is currently aiming at: the active goal's
-    /// target point if a goal is set, otherwise the current path waypoint,
-    /// otherwise `None`.
+    /// target point if a goal is set, otherwise the point the last tick
+    /// handed the controller (a waypoint or a detour round an obstacle),
+    /// otherwise the current path waypoint, otherwise `None`.
     pub fn current_target(&self) -> Option<Point> {
         if let Some(g) = &self.goal {
             return Some(g.target_pose.point);
+        }
+        if let Some(p) = self.aim.filter(|_| !self.path_completed) {
+            return Some(p);
         }
         let path = self.path.as_ref()?;
         let idx = if self.kind.is_point_controller() {
@@ -762,7 +780,8 @@ fn blocked(waypoints: &[Pose], idx: usize, checker: &CollisionChecker) -> bool {
 /// Where a point controller heads while obstacles block the path between
 /// arc lengths `from` (the robot) and `to` (its target): the target moved
 /// onto the cheaper detour round the obstacles' predictions, the robot
-/// taken to drive the path at a share of its top speed, or the detour's
+/// taken to drive the path at `speed_now` (no slower than a share of its
+/// top speed), or the detour's
 /// widest point when that comes first and is still ahead of `robot` by
 /// more than `tol`. `side` (+1 left, −1 right, 0 none) is the side last
 /// taken, kept unless the other is cheaper by `SIDE_SWITCH_COST`; `None`
@@ -777,10 +796,12 @@ fn detour_target(
     tol: f64,
     obstacles: &[crate::types::Obstacle],
     constraints: &RobotConstraints,
+    speed_now: f64,
     side: &mut f64,
 ) -> Option<Point> {
     use crate::pred::mpc::{DETOUR_MARGIN, DETOUR_RAMP, SIDE_SWITCH_COST};
-    let speed = (DETOUR_SPEED_SHARE * constraints.max_linear_velocity).max(0.1);
+    let top = constraints.max_linear_velocity.abs();
+    let speed = speed_now.abs().clamp(DETOUR_SPEED_FLOOR * top, top).max(0.1);
     let target_step = ((to - from).max(0.0) / (speed * DETOUR_DT)).round() as usize;
     let n = (target_step + DETOUR_RAMP).clamp(2, 80);
     let reference = crate::pred::mppi::build_reference(path, cum, from, n, DETOUR_DT, speed, 0.0);
@@ -802,7 +823,7 @@ fn detour_target(
         };
         let shift: Vec<f64> = (0..g.x.len()).map(|i| (g.x[i] - reference.x[i]).hypot(g.y[i] - reference.y[i])).collect();
         let kt = target_step.min(shift.len() - 1);
-        let widest = (0..=kt).max_by(|a, b| shift[*a].total_cmp(&shift[*b])).unwrap_or(kt);
+        let widest = (kt / 2..=kt).max_by(|a, b| shift[*a].total_cmp(&shift[*b])).unwrap_or(kt);
         let ahead = |k: usize| Point::new(g.x[k], g.y[k], 0.0).distance_to_2d(robot) > 2.0 * tol;
         let k = if shift[widest] > shift[kt] + 1e-3 && ahead(widest) { widest } else { kt };
         if shift[k] <= 1e-3 {
@@ -819,8 +840,9 @@ fn detour_target(
 
 /// Seconds between the points of a point controller's detour.
 const DETOUR_DT: f64 = 0.2;
-/// Share of the top speed a point controller's detour takes the robot at.
-const DETOUR_SPEED_SHARE: f64 = 0.8;
+/// Share of the top speed below which a point controller's detour does not
+/// take the robot's speed to fall.
+const DETOUR_SPEED_FLOOR: f64 = 0.3;
 
 /// Seconds of path at top speed checked for the steering-rate speed cap.
 const RATE_PREVIEW_S: f64 = 2.0;
