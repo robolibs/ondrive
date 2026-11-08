@@ -489,6 +489,10 @@ impl Tracker {
             };
             let cum = &self.cursor.cum;
             let tol = cfg.goal_tolerance;
+            if self.lap.is_none() && proj.beyond_end && proj.distance < 2.0 * tol {
+                self.path_completed = true;
+                return Ok(None);
+            }
             let speed_now = if state.velocity_valid { state.velocity.linear } else { self.last_command.map_or(0.0, |c| c.0) };
             let ahead = cfg.lookahead_distance.max(2.0 * tol);
             let target = |segment: usize, s: f64| {
