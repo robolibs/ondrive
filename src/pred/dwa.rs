@@ -158,6 +158,8 @@ impl Controller for DwaFollower {
         }
 
         let (v_lo, v_hi) = speed_bounds(constraints, allow_reverse);
+        let cruise = crate::pred::mpc::REF_SPEED_HEADROOM * dwa.target_velocity.abs().max(0.1);
+        let (v_lo, v_hi) = (v_lo.max(-cruise), v_hi.min(cruise));
         let w_lim = constraints.max_angular_velocity.abs();
         let v_now = if state.velocity_valid {
             state.velocity.linear
