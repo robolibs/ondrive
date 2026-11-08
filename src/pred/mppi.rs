@@ -169,10 +169,10 @@ impl Reference {
     }
 
     /// This reference moved sideways round every obstacle mode it meets at
-    /// its own time, passing them on `side` (+1 left, −1 right) with
-    /// `reach` plus two spreads of room, ramped in and out over `ramp`
-    /// points: the guidance that keeps a solve in one homotopy class.
-    /// `None` when no obstacle comes near it.
+    /// its own time (passes within the mode's radius plus `reach` plus two
+    /// spreads of), passing them on `side` (+1 left, −1 right), ramped in
+    /// and out over `ramp` points: the guidance that keeps a solve in one
+    /// homotopy class. `None` when it meets no obstacle.
     pub fn detour(&self, obstacles: &[Obstacle], reach: f64, dt: f64, side: f64, ramp: usize) -> Option<Reference> {
         let n = self.x.len();
         let mut need = vec![0.0_f64; n];
@@ -183,7 +183,7 @@ impl Reference {
                 let (dx, dy) = (m.x - self.x[i], m.y - self.y[i]);
                 let along = dx * c + dy * s;
                 let lateral = -dx * s + dy * c;
-                if along.abs() < room {
+                if along * along + lateral * lateral < room * room {
                     let edge = lateral + side * (room * room - along * along).sqrt();
                     *need = need.max(side * edge);
                 }
@@ -774,7 +774,11 @@ impl MppiFollower {
         if self.debug_level >= DebugLevel::Basic {
             self.debug.guides = guide_paths(&reference, obstacles, reach, step);
         }
-        detoured(&reference, obstacles, reach, step, &mut self.side)
+        let Some(g) = pick_detour(&reference, obstacles, reach, step, &mut self.side) else {
+            return Vec::new();
+        };
+        self.guide = (0..g.x.len()).map(|i| (g.x[i], g.y[i])).collect();
+        left_by(&reference, &g)
     }
 
     pub fn with_mppi_config(cfg: MppiConfig) -> Self {
@@ -1394,11 +1398,32 @@ pub(crate) fn correlated_noise(out: &mut [f64], sigma: f64, rho: f64, rng: &mut 
     }
 }
 
-/// Whether `o` moves across the path (more across than along it, at the
-/// point of `reference` nearest it) rather than stands on it or moves along
-/// it: traffic to give way to, not to go round. Its velocity is read over
-/// the first second of its prediction, in steps of `step`.
+/// Whether `o` is about to cross the path: it moves across it (more across
+/// than along, at the point of `reference` nearest it) rather than stands
+/// on it or moves along it, and its prediction comes within `CROSSING_REACH`
+/// of the stretch of path `reference` covers: traffic to give way to, not
+/// to go round. Its velocity is read over the first second of its
+/// prediction, in steps of `step`.
 pub(crate) fn crosses(o: &Obstacle, reference: &Reference, step: f64) -> bool {
+    moves_across(o, reference, step) && comes_near(o, reference, step)
+}
+
+/// Whether any point of `o`'s prediction over the reference's span comes
+/// within its radius plus `CROSSING_REACH` of any point of `reference`.
+fn comes_near(o: &Obstacle, reference: &Reference, step: f64) -> bool {
+    (0..reference.x.len()).any(|k| {
+        modes_at(o, k as f64 * step, step).any(|m| {
+            (0..reference.x.len())
+                .any(|i| (m.x - reference.x[i]).hypot(m.y - reference.y[i]) < m.radius + CROSSING_REACH)
+        })
+    })
+}
+
+/// Distance, metres beyond an obstacle's radius, within which its predicted
+/// track counts as reaching the path.
+const CROSSING_REACH: f64 = 2.0;
+
+fn moves_across(o: &Obstacle, reference: &Reference, step: f64) -> bool {
     let (Some(now), Some(soon)) = (modes_at(o, 0.0, step).next(), modes_at(o, 1.0, step).next()) else {
         return false;
     };
@@ -1436,10 +1461,12 @@ pub(crate) fn detoured(
     step: f64,
     side: &mut f64,
 ) -> Vec<(f64, f64, f64)> {
-    let Some(g) = pick_detour(reference, obstacles, reach, step, side) else {
-        return Vec::new();
-    };
-    (0..reference.x.len())
+    pick_detour(reference, obstacles, reach, step, side).map_or_else(Vec::new, |g| left_by(reference, &g))
+}
+
+/// Points of `reference` that the detour `g` leaves, each with its offset.
+fn left_by(reference: &Reference, g: &Reference) -> Vec<(f64, f64, f64)> {
+    (0..reference.x.len().min(g.x.len()))
         .filter_map(|i| {
             let offset = (g.x[i] - reference.x[i]).hypot(g.y[i] - reference.y[i]);
             (offset > 1e-3).then_some((reference.x[i], reference.y[i], offset))

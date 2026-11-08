@@ -76,7 +76,7 @@ impl Default for McaConfig {
             weight_vel: 50.0,
             weight_steering: 5.0,
             weight_acceleration: 5.0,
-            weight_progress: 30.0,
+            weight_progress: 80.0,
             weight_soft_risk: 2000.0,
             weight_hard_risk: 2e4,
             risk_threshold: 0.05,
