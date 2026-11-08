@@ -70,8 +70,8 @@ impl Default for IlqrConfig {
             turn_first_activation_deg: 60.0,
             turn_first_release_deg: 15.0,
             approach_taper_distance: 2.0,
-            weight_obstacle: 300.0,
-            obstacle_scale: 0.3,
+            weight_obstacle: 3000.0,
+            obstacle_scale: 0.2,
         }
     }
 }
@@ -522,7 +522,7 @@ impl Controller for IlqrFollower {
             if self.debug_level == DebugLevel::Full {
                 tried.push((xs.iter().map(|x| { let (ox, oy) = model.origin(x[0], x[1], x[2]); Point::new(ox, oy, 0.0) }).collect(), rolled));
             }
-            let c = rolled * guide.pace_factor() * if switch { SIDE_SWITCH_COST } else { 1.0 };
+            let c = rolled * if switch { SIDE_SWITCH_COST } else { 1.0 } + guide.pace_cost();
             if c.is_finite() && best.as_ref().is_none_or(|b| c < b.0) {
                 best = Some((c, *side, us, iterations));
             }

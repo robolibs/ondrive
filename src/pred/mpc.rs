@@ -69,8 +69,8 @@ impl Default for MpcConfig {
             turn_first_activation_deg: 60.0,
             turn_first_release_deg: 15.0,
             approach_taper_distance: 2.0,
-            weight_obstacle: 300.0,
-            obstacle_scale: 0.3,
+            weight_obstacle: 3000.0,
+            obstacle_scale: 0.2,
         }
     }
 }
@@ -167,18 +167,18 @@ pub(crate) struct Guide {
 }
 
 impl Guide {
-    /// Factor on a solve's cost for the pace it gives up: a give-way solve,
-    /// scored against its own slower reference, wins only once keeping
-    /// pace costs more.
-    pub fn pace_factor(&self) -> f64 {
-        1.0 + GIVE_WAY_PENALTY * (1.0 - self.pace)
+    /// Cost added to a solve for the pace it gives up: a give-way solve,
+    /// scored against its own slower reference, wins only while keeping
+    /// pace costs that much more, so the robot resumes once the way is clear.
+    pub fn pace_cost(&self) -> f64 {
+        GIVE_WAY_COST * (1.0 - self.pace)
     }
 }
 
 /// Shares of the reference's pace offered to give way to crossing traffic.
-const GIVE_WAY_SHARES: [f64; 2] = [0.6, 0.3];
-/// Cost factor per unit of pace given up.
-const GIVE_WAY_PENALTY: f64 = 0.5;
+const GIVE_WAY_SHARES: [f64; 3] = [0.6, 0.3, 0.0];
+/// Cost of giving up the whole pace, in the units of the solves' costs.
+const GIVE_WAY_COST: f64 = 60.0;
 
 #[allow(clippy::too_many_arguments)]
 fn total_cost(
@@ -451,8 +451,8 @@ impl Controller for MpcFollower {
             let switch = *side != 0.0 && self.side != 0.0 && *side != self.side;
             let scored = if guide.pace < 1.0 { &guide.reference } else { &reference };
             let c = total_cost(&model, scored, &w, &cfg, &barrier, &steer, &accel, &accel_lat)
-                * guide.pace_factor()
-                * if switch { SIDE_SWITCH_COST } else { 1.0 };
+                * if switch { SIDE_SWITCH_COST } else { 1.0 }
+                + guide.pace_cost();
             if self.debug_level == DebugLevel::Full {
                 let (_, path) = rollout(&model, &steer, &accel, &accel_lat, &reference, &w, &barrier, true);
                 tried.push((path, c));
