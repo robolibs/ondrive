@@ -18,14 +18,21 @@ use crate::core::kinematics::{
     world_to_body,
 };
 use crate::core::math::{normalize_angle, yaw_of};
-use crate::core::obstacles::{CollisionChecker, robot_radius};
+use crate::core::obstacles::{CollisionChecker, robot_radius, yield_share};
 use crate::core::path::{PathCursor, cumulative_lengths, project, sample};
-use crate::pred::mppi::{build_reference, current_lateral_speed, current_speed, pick_detour, prepare};
+use crate::pred::mppi::{build_reference, crosses, current_lateral_speed, current_speed, pick_detour, prepare};
 use crate::types::{Goal, Obstacle, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::{Euler, Point, Pose, Quaternion};
 
 /// Seconds of band the command is read over.
 const CONTROL_LOOKAHEAD_S: f64 = 0.4;
+/// Shares of the command tried, fastest first, until its arc keeps clear of
+/// crossing traffic.
+const GIVE_WAY_SHARES: [f64; 4] = [1.0, 0.75, 0.5, 0.25];
+/// Seconds the give-way check watches the arc for crossing traffic.
+const GIVE_WAY_LOOKOUT_S: f64 = 2.0;
+/// Room, metres, the give-way check keeps beyond the footprint.
+const GIVE_WAY_MARGIN: f64 = 0.1;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TebConfig {
@@ -249,6 +256,37 @@ impl TebFollower {
     /// The way round the obstacles blocking the stretch of path ahead of
     /// arc length `from`, as poses for the band to follow, on the cheaper
     /// side with hysteresis; `None` when nothing blocks it.
+    /// Share of the command `(v, w)` from `state` that gives way to traffic
+    /// crossing the path ahead of arc length `from`: `yield_share` against
+    /// the crossing obstacles only.
+    fn give_way(
+        &self,
+        state: &RobotState,
+        from: f64,
+        constraints: &RobotConstraints,
+        world: Option<&WorldConstraints>,
+        command: (f64, f64),
+    ) -> f64 {
+        let Some(world) = world.filter(|w| !w.obstacles.is_empty()) else {
+            return 1.0;
+        };
+        let step = self.teb_config.dt_nominal.max(0.05);
+        let n = 2 * self.teb_config.n_poses.max(3);
+        let speed = (0.8 * constraints.max_linear_velocity).max(0.1);
+        let reference = build_reference(&self.base.path, &self.cursor.cum, from, n, step, speed, 0.0);
+        let crossing = WorldConstraints {
+            obstacles: world.obstacles.iter().filter(|o| crosses(o, &reference, step)).cloned().collect(),
+            ..Default::default()
+        };
+        if crossing.obstacles.is_empty() {
+            return 1.0;
+        }
+        let checker = CollisionChecker::new(Some(&crossing), constraints, GIVE_WAY_MARGIN).with_spread(1.0);
+        let pose = (state.pose.point.x, state.pose.point.y, state.pose.rotation.to_euler().yaw);
+        let decel = constraints.max_linear_acceleration.abs();
+        yield_share(&checker, pose, command, GIVE_WAY_LOOKOUT_S, decel, &GIVE_WAY_SHARES)
+    }
+
     fn detour_guide(&mut self, from: f64, constraints: &RobotConstraints, obstacles: &[Obstacle]) -> Option<Vec<Pose>> {
         if obstacles.is_empty() {
             self.side = 0.0;
@@ -576,6 +614,8 @@ impl Controller for TebFollower {
 
         let forward = (dx * yaw0.cos() + dy * yaw0.sin()).signum();
         let v = (forward * length / span).clamp(v_now - a_max * dt, v_now + a_max * dt);
+        let share = self.give_way(state, prep.proj.arc_length, constraints, world, (v, w));
+        let (v, w) = (v * share, w * share);
 
         self.base.status.mode = "teb".into();
         let cmd = finalize(v, w, constraints, &self.base.config, prep.allow_reverse, "TEB tracking");

@@ -319,3 +319,40 @@ pub fn footprint_discs(constraints: &RobotConstraints) -> Vec<(f64, f64)> {
     let radius = half_width.hypot(half_step);
     (0..n).map(|i| (back + half_step * (2 * i + 1) as f64, radius)).collect()
 }
+
+/// The fastest of `shares` of the command `(v, omega)` whose arc from
+/// `(x, y, yaw)`, held for `lookout` seconds plus the time to stop from it at
+/// `decel`, stays clear of `checker`'s obstacles as they move. When none
+/// does, the share (standing still included) keeping the most room.
+pub fn yield_share(
+    checker: &CollisionChecker,
+    (x, y, yaw): (f64, f64, f64),
+    (v, omega): (f64, f64),
+    lookout: f64,
+    decel: f64,
+    shares: &[f64],
+) -> f64 {
+    if !checker.has_obstacles() {
+        return 1.0;
+    }
+    let room = |s: f64| {
+        let (u, w) = (v * s, omega * s);
+        let horizon = lookout + u.abs() / decel.max(1e-3);
+        let step = 0.05;
+        let (mut px, mut py, mut th, mut t) = (x, y, yaw, 0.0);
+        let mut worst = f64::INFINITY;
+        while t <= horizon {
+            worst = worst.min(checker.clearance_at(t, px, py, th));
+            px += u * step * th.cos();
+            py += u * step * th.sin();
+            th += w * step;
+            t += step;
+        }
+        worst
+    };
+    shares
+        .iter()
+        .copied()
+        .find(|s| room(*s) >= 0.0)
+        .unwrap_or_else(|| shares.iter().copied().chain([0.0]).max_by(|a, b| room(*a).total_cmp(&room(*b))).unwrap_or(0.0))
+}
