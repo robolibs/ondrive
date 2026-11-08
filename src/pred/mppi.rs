@@ -16,7 +16,7 @@ use crate::core::kinematics::{
     planning, steering_limit, wheelbase,
 };
 use crate::core::math::normalize_angle;
-use crate::core::obstacles::{CollisionChecker, modes_at, robot_radius};
+use crate::core::obstacles::{CollisionChecker, modes_at, robot_radius, yield_share};
 use crate::core::path::{PathCursor, PathProjection, sample};
 use crate::pred::mpc::{DETOUR_MARGIN, DETOUR_RAMP, DETOURED_WEIGHT};
 use crate::types::{
@@ -741,6 +741,36 @@ impl MppiFollower {
         planning(constraints, c.ref_velocity.min(constraints.max_linear_velocity), c.horizon_steps, c.dt)
     }
 
+    /// Share of `speed` that gives way to traffic crossing the path ahead
+    /// (`n` steps of `step`): `give_way_share` for driving on at `speed` on
+    /// the present curvature.
+    pub(crate) fn give_way(
+        &mut self,
+        state: &RobotState,
+        constraints: &RobotConstraints,
+        obstacles: &[Obstacle],
+        n: usize,
+        step: f64,
+        speed: f64,
+    ) -> f64 {
+        if obstacles.is_empty() {
+            return 1.0;
+        }
+        let reference = match &self.trajectory {
+            Some(traj) => build_timed_reference(traj, self.clock, n, step),
+            None => {
+                let Some(p) = self.cursor.project(&self.base.path.waypoints, state.pose.point, self.base.path_index) else {
+                    return 1.0;
+                };
+                build_reference(&self.base.path, &self.cursor.cum, p.arc_length, n, step, speed, 0.0)
+            }
+        };
+        let (v, w) = if state.velocity_valid { (state.velocity.linear, state.velocity.angular) } else { (self.last_v, 0.0) };
+        let kappa = w / v.abs().max(0.1);
+        let pose = (state.pose.point.x, state.pose.point.y, state.pose.rotation.to_euler().yaw);
+        give_way_share(&reference, obstacles, constraints, pose, (speed, speed * kappa), step)
+    }
+
     /// Forgets the guides recorded for display.
     pub(crate) fn clear_guides(&mut self) {
         self.debug.guides.clear();
@@ -1133,7 +1163,8 @@ impl Controller for MppiFollower {
         let speed = cfg.ref_velocity.min(constraints.max_linear_velocity);
         let detoured = self.detoured_points(state, obstacles, robot_radius(constraints), n, step, speed);
         let relax = detour_relax(&detoured, (speed * step).max(0.3));
-        self.step_with(state, goal, constraints, dt, &critic, &relax, 1.0, "MPPI tracking", "mppi_tracking")
+        let share = self.give_way(state, constraints, obstacles, n, step, speed);
+        self.step_with(state, goal, constraints, dt, &critic, &relax, share, "MPPI tracking", "mppi_tracking")
     }
 
     fn set_trajectory(&mut self, trajectory: Trajectory) {
@@ -1397,6 +1428,36 @@ pub(crate) fn correlated_noise(out: &mut [f64], sigma: f64, rho: f64, rng: &mut 
         *e = sigma * prev;
     }
 }
+
+/// Share of `command` from `pose` that gives way to the obstacles crossing
+/// `reference` (one point per `step`): `yield_share` against those alone.
+pub(crate) fn give_way_share(
+    reference: &Reference,
+    obstacles: &[Obstacle],
+    constraints: &RobotConstraints,
+    pose: (f64, f64, f64),
+    command: (f64, f64),
+    step: f64,
+) -> f64 {
+    let crossing = WorldConstraints {
+        obstacles: obstacles.iter().filter(|o| crosses(o, reference, step)).cloned().collect(),
+        ..Default::default()
+    };
+    if crossing.obstacles.is_empty() {
+        return 1.0;
+    }
+    let checker = CollisionChecker::new(Some(&crossing), constraints, GIVE_WAY_MARGIN).with_spread(1.0);
+    let decel = constraints.max_linear_acceleration.abs();
+    yield_share(&checker, pose, command, GIVE_WAY_LOOKOUT_S, decel, &GIVE_WAY_SHARES)
+}
+
+/// Shares of the command tried, fastest first, until its arc keeps clear of
+/// crossing traffic.
+const GIVE_WAY_SHARES: [f64; 4] = [1.0, 0.75, 0.5, 0.25];
+/// Seconds the give-way check watches the arc for crossing traffic.
+const GIVE_WAY_LOOKOUT_S: f64 = 2.0;
+/// Room, metres, the give-way check keeps beyond the footprint.
+const GIVE_WAY_MARGIN: f64 = 0.1;
 
 /// Whether `o` is about to cross the path: it moves across it (more across
 /// than along, at the point of `reference` nearest it) rather than stands
