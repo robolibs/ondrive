@@ -21,9 +21,9 @@ and all emitting the same body-frame twist.
 |                     | **LQR**                  | Kinematic `[e, θ_e]` error model, DARE solved every tick, curvature FF|
 |                     | **Kanayama**             | Robot-frame error law against a moving (timed or previewed) reference |
 |                     | **ILC**                  | Wraps any follower; shifts the reference to cancel learned error      |
-| Predictive / optimal| **MPC**                  | Projected gradient descent with line search, warm start, decel taper  |
-|                     | **iLQR**                 | Analytic-Jacobian iterative LQR with regularised backward pass        |
-|                     | **MPPI**                 | Williams-style weights incl. control cost term, warm start            |
+| Predictive / optimal| **MPC**                  | Projected gradient descent, obstacle barrier, left/right guided solves|
+|                     | **iLQR**                 | Box-DDP, rate-limited steering state, constrained-iLQR barrier        |
+|                     | **MPPI**                 | Contouring corridor, correlated noise, adaptive λ, Nav2-style critics |
 |                     | **MCA** (DRA-MPPI)       | MPPI + Monte Carlo collision probability over Gaussian-mixture modes  |
 |                     | **SOC** (SVG-MPPI)       | Stein Variational Gradient Descent guides + adaptive-variance MPPI    |
 |                     | **DWA**                  | Fox 1997 window, braking admissibility, recovery rotation            |
@@ -52,11 +52,22 @@ Three families of motion model back them:
   PoseReach, which bypasses its Reeds-Shepp/Dubins planner entirely on a
   holonomic platform and translates/rotates straight to the goal.
 
-Obstacle-aware controllers (MCA, SOC, DWA, TEB, RegulatedPursuit, PoseReach,
-APF) consume `WorldConstraints`: Gaussian-mode obstacle predictions and/or
-an occupancy grid, through one footprint-aware collision checker.
+Obstacle-aware controllers (MPC, iLQR, MPPI, MCA, SOC, DWA, TEB,
+RegulatedPursuit, PoseReach, APF) consume `WorldConstraints`: Gaussian-mode
+obstacle predictions, each step read at its own time, and/or an occupancy
+grid, through one footprint-aware collision checker. The predictive ones
+go round an obstacle on the path instead of stopping before it: a detour
+of the reference round each side guides the solve (topology-guided MPC),
+and the path's lateral and heading weights ease where a detour leaves it,
+only as far as the detour goes.
 `Tracker` also caps the speed to `Zone::max_speed` while the robot is
 inside a zone's boundary (the slowest zone wins when they overlap).
+
+On an Ackermann machine with `max_steering_rate` set, the steering takes
+time to act. MPC, iLQR, MPPI, MCA and SOC model it in their rollouts; for
+every other controller `Tracker` hands over the state predicted through
+that delay (half a lock-to-lock swing) and caps the speed where the path's
+curvature changes faster than the steering can follow.
 
 ## Command contract
 
@@ -248,6 +259,7 @@ let world = WorldConstraints {
     obstacles: vec![Obstacle {
         id: 0,
         radius: 0.3,
+        dt: 0.2,
         modes: vec![GaussianMode {
             weight: 1.0,
             mean_x: vec![6.0; 10],
@@ -262,9 +274,27 @@ let world = WorldConstraints {
 let cmd = tracker.tick(&state, 0.05, Some(&world));
 ```
 
-Mode vectors are indexed by horizon step; a prediction shorter than the
-horizon holds its last entry. `OccupancyGrid::new` precomputes a
-continuous distance-to-occupied field. `RobotConstraints::footprint` is a
+Mode vectors hold one mean and spread per prediction step, `dt` seconds
+apart (0 takes each controller's own planning step); controllers read
+them at the time each of their steps is reached, interpolated, and past
+the end carry on at the last velocity with the spread still growing.
+`OccupancyGrid::new` precomputes an exact distance-to-occupied field.
+
+How the obstacle-aware controllers treat what they meet:
+
+- **Standing, or moving along the path** (blocked lane, slower traffic
+  ahead, a robot coming the other way): gone round. A detour of the path
+  round each side, timed against the obstacle's prediction, guides the
+  solve, and the side is kept unless the other becomes clearly cheaper.
+- **Crossing the path**: given way to. No detour is offered; the
+  controller slows or stops until it has passed.
+- **Approaching a robot that cannot get clear by stopping**: DWA picks the
+  arc that keeps the most clearance instead of stopping.
+
+`Tracker::set_debug(DebugLevel::Full)` makes MPPI, MCA, SOC, MPC, iLQR
+and DWA record what they sampled or solved, with costs, and the detours
+they steered by; `Tracker::debug_frame()` returns them (`debug_frame()`
+in Python). `RobotConstraints::footprint` is a
 disc by default (radius `hypot(width, length) / 2`, 0.3 m when unset) or a
 `Footprint::Polygon`; the shared `CollisionChecker` in `core::obstacles`
 evaluates clearance for both against both obstacle kinds.
@@ -277,7 +307,7 @@ handles, `#[repr(C)]` POD structs, `ondrive_tracker_set_trajectory`,
 `ondrive_world_set_grid`, and one `ONDRIVE_KIND_*` value per controller.
 
 ```bash
-make -C examples/c_abi run
+make -C examples/c run
 ```
 
 Boolean-returning functions signal failure with `false`, and
@@ -292,25 +322,25 @@ Built with `pyo3` + `maturin` (`python` feature). Wrappers cover `Tracker`
 `ControllerStatus`; `tracker_kinds()` lists the kind names.
 
 ```bash
-make -C examples/python_binding basic     # PID point-goal demo
-make -C examples/python_binding main      # Pure Pursuit sine-path demo
+make -C examples/python basic     # PID point-goal demo
+make -C examples/python main      # Pure Pursuit sine-path demo
 ```
 
 ## Examples and verification
 
 Every controller has a demo under `examples/` built on the shared scaffold
-in `examples/common/demo.rs` (rerun is a dev-dependency only). Each one
+in `examples/rust/common/demo.rs` (rerun is a dev-dependency only). Each one
 streams the path, current target, robot, predicted plan, obstacles and
 status to a running rerun viewer at real-time speed.
 
 ```bash
-make run EXAMPLE=pid      # pid, carrot, pure, rpp, vector, stan, lqr,
+make run --example pid    # pid, carrot, pure, rpp, vector, stan, lqr,
                           # kanayama, flc, mpc, ilqr, mppi, mca, soc, dwa,
                           # teb, ilc, pose_reach, pose_regulator, apf
 ONDRIVE_NO_VIZ=1 cargo run --release --example teb   # headless
 ```
 
-`examples/verify.rs` is a headless check of every controller on both
+`examples/rust/verify.rs` is a headless check of every controller on both
 steering models across straight, offset, heading-offset, sine, 90-degree
 corner, circle, hairpin, reverse and obstacle scenarios, plus pose-goal
 manoeuvres (parallel park, 90-degree offset, goal behind) and timed
@@ -336,6 +366,7 @@ nix develop             # provisions rustc, cargo, maturin, python3
 make build              # cargo build --lib
 make test               # cargo test --all-targets
 make bind               # regenerate the C header + build the Python wheel
+make test-py            # Python binding tests against a fresh wheel
 ```
 
 ## Status
