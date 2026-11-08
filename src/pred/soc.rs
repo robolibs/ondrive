@@ -20,7 +20,7 @@ use crate::core::obstacles::{CollisionChecker, robot_radius};
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
     CostWeights, Model, Track, build_reference, build_timed_reference, command_from_controls, current_lateral_speed,
-    current_speed, detour_relax, detoured, guide_paths, savitzky_golay,
+    correlated_noise, current_speed, detour_relax, detoured, effective_sample_size, guide_paths, savitzky_golay,
     importance_weights, prepare, speed_at_arc_length, update_turn_in_place,
 };
 use crate::types::{
@@ -28,7 +28,6 @@ use crate::types::{
 };
 use datapod::Point;
 use rand::{SeedableRng, rngs::StdRng};
-use rand_distr::{Distribution, Normal};
 
 /// Clearance below which obstacles start contributing cost.
 const OBSTACLE_INFLUENCE: f64 = 1.0;
@@ -38,6 +37,9 @@ const OBSTACLE_SAFETY_MARGIN: f64 = 0.2;
 /// Share of the gap to the best guide that the final samples are pulled
 /// through, `1 - alpha` of SVG-MPPI with alpha 0.1.
 const GUIDE_PULL: f64 = 0.9;
+/// Index of the guide that starts as the previous plan braked to a stop,
+/// followed whenever it is the cheapest.
+const BRAKE_GUIDE: usize = 1;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SocConfig {
@@ -46,6 +48,9 @@ pub struct SocConfig {
 
     pub guide_samples: usize,
     pub num_samples: usize,
+    /// Share of the previous plan's cost a guide must come under to pull
+    /// the final samples toward it instead of the previous plan.
+    pub guide_switch: f64,
 
     pub temperature: f64,
     pub guide_temperature: f64,
@@ -73,6 +78,13 @@ pub struct SocConfig {
 
     pub use_covariance_adaptation: bool,
 
+    /// Share of each step's sampling noise carried over from the step before.
+    pub noise_correlation: f64,
+    /// Effective-sample-size shares below and above which the temperature
+    /// rises and falls.
+    pub ess_low: f64,
+    pub ess_high: f64,
+
     pub turn_first_activation_deg: f64,
     pub turn_first_release_deg: f64,
 
@@ -86,6 +98,7 @@ impl Default for SocConfig {
             dt: 0.1,
             guide_samples: 32,
             num_samples: 512,
+            guide_switch: 0.95,
             temperature: 1.0,
             guide_temperature: 1.0,
             steering_noise: 0.5,
@@ -105,6 +118,9 @@ impl Default for SocConfig {
             svgd_step_size: 0.1,
             kernel_bandwidth: 1.0,
             use_covariance_adaptation: true,
+            noise_correlation: 0.7,
+            ess_low: 0.01,
+            ess_high: 0.05,
             turn_first_activation_deg: 60.0,
             turn_first_release_deg: 15.0,
             decel_distance: 2.0,
@@ -132,6 +148,7 @@ pub struct SocFollower {
     trajectory: Option<Trajectory>,
     clock: f64,
     rng: StdRng,
+    lambda: f64,
 }
 
 impl Default for SocFollower {
@@ -214,6 +231,7 @@ impl SocFollower {
             trajectory: None,
             clock: 0.0,
             rng,
+            lambda: cfg.temperature.max(1e-6),
             soc_config: cfg,
         }
     }
@@ -223,6 +241,7 @@ impl SocFollower {
         self.mean_steering = vec![0.0; n];
         self.mean_acceleration = vec![0.0; n];
         self.mean_accel_lateral = vec![0.0; n];
+        self.lambda = cfg.temperature.max(1e-6);
         self.soc_config = cfg;
     }
 
@@ -447,17 +466,19 @@ impl Controller for SocFollower {
         let k_guide = cfg.guide_samples.max(1);
         let guide_std_s = cfg.initial_steer_variance.max(1e-12).sqrt();
         let guide_std_a = cfg.acceleration_noise.max(1e-6);
-        let ds = Normal::new(0.0, guide_std_s).unwrap();
-        let da = Normal::new(0.0, guide_std_a).unwrap();
-        let dal = Normal::new(0.0, guide_std_a).unwrap();
+        let rho = cfg.noise_correlation;
+        let (mut unit_s, mut unit_a, mut unit_al) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
         let mut guides_s = vec![self.mean_steering.clone(); k_guide];
         let mut guides_a = vec![self.mean_acceleration.clone(); k_guide];
         let mut guides_al = vec![self.mean_accel_lateral.clone(); k_guide];
         for i in 1..k_guide {
+            correlated_noise(&mut unit_s, guide_std_s, rho, &mut self.rng);
+            correlated_noise(&mut unit_a, guide_std_a, rho, &mut self.rng);
+            correlated_noise(&mut unit_al, guide_std_a, rho, &mut self.rng);
             for t in 0..n {
-                guides_s[i][t] += ds.sample(&mut self.rng);
-                guides_a[i][t] += da.sample(&mut self.rng);
-                guides_al[i][t] += dal.sample(&mut self.rng);
+                guides_s[i][t] += unit_s[t];
+                guides_a[i][t] += unit_a[t];
+                guides_al[i][t] += unit_al[t];
             }
             model.clamp_controls(&mut guides_s[i], &mut guides_a[i], &mut guides_al[i]);
         }
@@ -466,9 +487,9 @@ impl Controller for SocFollower {
         // among the modes the guides explore.
         if k_guide >= 3 {
             let brake = -model.accel_bound() * v_now.signum();
-            guides_s[1] = self.mean_steering.clone();
-            guides_a[1] = vec![brake; n];
-            guides_al[1] = vec![0.0; n];
+            guides_s[BRAKE_GUIDE] = self.mean_steering.clone();
+            guides_a[BRAKE_GUIDE] = vec![brake; n];
+            guides_al[BRAKE_GUIDE] = vec![0.0; n];
             guides_s[2] = vec![0.0; n];
             guides_a[2] = self.mean_acceleration.clone();
             guides_al[2] = self.mean_accel_lateral.clone();
@@ -494,6 +515,7 @@ impl Controller for SocFollower {
             .enumerate()
             .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i)
+            .filter(|&i| (i == BRAKE_GUIDE && k_guide >= 3) || guide_costs[i] < cfg.guide_switch * guide_costs[0])
             .unwrap_or(0);
 
         let mut std_s = vec![cfg.steering_noise.max(1e-6); n];
@@ -519,7 +541,7 @@ impl Controller for SocFollower {
         }
 
         let k = cfg.num_samples.max(1);
-        let lambda = cfg.temperature.max(1e-6);
+        let lambda = self.lambda.max(1e-6);
         // Final samples centre on the previous solution; the best guide pulls
         // through the control term only (SVG-MPPI, Honda et al.).
         let base_s = self.mean_steering.clone();
@@ -536,10 +558,13 @@ impl Controller for SocFollower {
         let mut accel_lat = vec![0.0; n];
         for j in 0..k {
             let mut control_cost = 0.0;
+            correlated_noise(&mut unit_s, 1.0, rho, &mut self.rng);
+            correlated_noise(&mut unit_a, 1.0, rho, &mut self.rng);
+            correlated_noise(&mut unit_al, 1.0, rho, &mut self.rng);
             for t in 0..n {
-                steer[t] = (base_s[t] + Normal::new(0.0, std_s[t]).unwrap().sample(&mut self.rng)).clamp(-sb, sb);
-                accel[t] = (base_a[t] + Normal::new(0.0, std_a[t]).unwrap().sample(&mut self.rng)).clamp(-ab, ab);
-                accel_lat[t] = (base_al[t] + Normal::new(0.0, std_al[t]).unwrap().sample(&mut self.rng)).clamp(-lb, lb);
+                steer[t] = (base_s[t] + std_s[t] * unit_s[t]).clamp(-sb, sb);
+                accel[t] = (base_a[t] + std_a[t] * unit_a[t]).clamp(-ab, ab);
+                accel_lat[t] = (base_al[t] + std_al[t] * unit_al[t]).clamp(-lb, lb);
                 let (es, ea, eal) = (steer[t] - base_s[t], accel[t] - base_a[t], accel_lat[t] - base_al[t]);
                 noise_s[j][t] = es;
                 noise_a[j][t] = ea;
@@ -552,6 +577,12 @@ impl Controller for SocFollower {
             costs[j] = c + lambda * control_cost;
         }
         let weights = importance_weights(&costs, lambda);
+        let ess = effective_sample_size(&weights);
+        if ess < (cfg.ess_low * k as f64).max(2.0) {
+            self.lambda = (lambda * 1.2).min(1e6);
+        } else if ess > (cfg.ess_high * k as f64).max(3.0) {
+            self.lambda = (lambda * 0.9).max(1e-6);
+        }
         for t in 0..n {
             let mut s = base_s[t];
             let mut a = base_a[t];
@@ -648,6 +679,7 @@ impl Controller for SocFollower {
         self.set_path(Path::default());
         self.last_v = 0.0;
         self.last_vy = 0.0;
+        self.lambda = self.soc_config.temperature.max(1e-6);
     }
 
     fn get_type(&self) -> &'static str {
