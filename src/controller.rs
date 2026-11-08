@@ -2,13 +2,13 @@ use crate::core::kinematics::{can_turn_in_place, finalize, stop};
 use crate::core::math::{distance_2d, normalize_angle, yaw_of};
 use crate::core::path::PathProjection;
 use crate::types::{
-    ControllerConfig, ControllerStatus, Goal, Path, RobotConstraints, RobotState, Trajectory,
+    ControllerConfig, ControllerStatus, DebugFrame, DebugLevel, Goal, Path, RobotConstraints, RobotState, Trajectory,
     VelocityCommand, WorldConstraints,
 };
 use datapod::{Point, Pose};
 use std::f64::consts::PI;
 
-pub trait Controller {
+pub trait Controller: Send + Sync {
     fn compute_control(
         &mut self,
         state: &RobotState,
@@ -65,8 +65,52 @@ pub trait Controller {
         Vec::new()
     }
 
+    /// The controller's own parameters (its `*Config`) as a JSON object;
+    /// empty for a controller that has none.
+    fn params(&self) -> serde_json::Value {
+        serde_json::Value::Object(serde_json::Map::new())
+    }
+
+    /// Update some of the controller's own parameters from a JSON object.
+    /// An unknown name or a wrong type is an error and changes nothing.
+    fn set_params(&mut self, params: &serde_json::Value) -> Result<(), String> {
+        merged(&serde_json::Map::new(), params).map(|_| ())
+    }
+
+    /// Seed the random sampling of a sampling controller; others ignore it.
+    fn set_seed(&mut self, _seed: u64) {}
+
+    /// How much of its internals the controller records each tick.
+    fn set_debug(&mut self, _level: DebugLevel) {}
+
+    /// Internals recorded on the last tick; empty unless `set_debug` asked.
+    fn debug_frame(&self) -> DebugFrame {
+        DebugFrame::default()
+    }
+
     fn base(&self) -> &ControllerBase;
     fn base_mut(&mut self) -> &mut ControllerBase;
+}
+
+/// `current` with the fields named in the JSON object `params` replaced.
+pub fn merged<T: serde::Serialize + serde::de::DeserializeOwned>(
+    current: &T,
+    params: &serde_json::Value,
+) -> Result<T, String> {
+    let serde_json::Value::Object(updates) = params else {
+        return Err("parameters must be a JSON object".into());
+    };
+    let mut value = serde_json::to_value(current).map_err(|e| e.to_string())?;
+    let serde_json::Value::Object(fields) = &mut value else {
+        return Err("parameters are not a JSON object".into());
+    };
+    for (name, v) in updates {
+        if !fields.contains_key(name) {
+            return Err(format!("unknown parameter `{name}`"));
+        }
+        fields.insert(name.clone(), v.clone());
+    }
+    serde_json::from_value(value).map_err(|e| e.to_string())
 }
 
 #[derive(Clone, Debug, Default)]

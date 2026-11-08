@@ -1,14 +1,17 @@
 //! Kanayama trajectory tracker (Kanayama et al. 1990):
 //! `v = v_r cos(e_theta) + k_x e_x`,
-//! `omega = omega_r + v_r (k_y e_y + k_theta sin(e_theta))`, with the pose
-//! error expressed in the robot frame against a moving reference. The
-//! reference comes from the installed timed trajectory, or, without one,
-//! from a point a short preview ahead of the projection on the path.
+//! `omega = omega_r + v_r k_y e_y + |v_r| k_theta sin(e_theta)` (the lateral
+//! term keeps the sign of `v_r` so reversing corrects the right way), with
+//! the pose error expressed in the robot frame against a moving reference.
+//! The reference comes from the installed timed trajectory, or, without one,
+//! from a point a short preview ahead of the projection on the path. Once a
+//! trajectory has ended short of its final pose a pose regulator finishes.
 
 use crate::controller::{Controller, ControllerBase};
-use crate::core::kinematics::{finalize, finalize_holonomic, is_holonomic, path_speed};
+use crate::core::kinematics::{actuation_delay, finalize, finalize_holonomic, is_holonomic, path_speed};
 use crate::core::math::{normalize_angle, yaw_of};
 use crate::core::path::{PathCursor, curvature_at_projection, sample, speed_cap};
+use crate::point::PoseRegulatorFollower;
 use crate::pred::mppi::prepare;
 use crate::types::{
     Goal, Path, RobotConstraints, RobotState, Trajectory, VelocityCommand, WorldConstraints,
@@ -23,6 +26,7 @@ pub struct KanayamaFollower {
     cursor: PathCursor,
     trajectory: Option<Trajectory>,
     clock: f64,
+    settle: PoseRegulatorFollower,
 }
 
 impl KanayamaFollower {
@@ -31,11 +35,25 @@ impl KanayamaFollower {
     }
 
     /// Gains from the generic config: `k_x = kp_linear`,
-    /// `k_y = 3 k_cross_track`, `k_theta = 2 sqrt(k_y)`.
+    /// `k_y = 3 k_cross_track`, `k_theta = 2 sqrt(k_y)` (critically damped).
     pub fn gains(&self) -> (f64, f64, f64) {
         let cfg = &self.base.config;
         let k_x = cfg.kp_linear.max(0.1);
         let k_y = 3.0 * cfg.k_cross_track.max(0.05);
+        (k_x, k_y, 2.0 * k_y.sqrt())
+    }
+
+    /// `gains` with `k_y` held so the error dynamics at `speed`, whose
+    /// natural frequency is `|speed| sqrt(k_y)`, stay below two thirds of
+    /// the actuator's bandwidth `1 / delay`.
+    pub fn gains_for(&self, constraints: &RobotConstraints, speed: f64) -> (f64, f64, f64) {
+        let (k_x, k_y, _) = self.gains();
+        let delay = actuation_delay(constraints);
+        let k_y = if delay > 0.0 && speed.abs() > 1e-3 {
+            k_y.min((1.0 / (1.5 * delay * speed.abs())).powi(2))
+        } else {
+            k_y
+        };
         (k_x, k_y, 2.0 * k_y.sqrt())
     }
 }
@@ -59,6 +77,16 @@ impl Controller for KanayamaFollower {
         let (x_r, y_r, yaw_r, v_r, omega_r) = match &self.trajectory {
             Some(traj) => {
                 let s = traj.sample(self.clock);
+                if s.finished && !is_holonomic(constraints.steering_type) {
+                    self.settle.set_config(cfg.clone());
+                    let end = Goal { target_pose: s.pose, ..goal.clone() };
+                    let cmd = self.settle.compute_control(state, &end, constraints, dt, None);
+                    if cmd.valid {
+                        self.base.status.goal_reached = self.settle.get_status().goal_reached;
+                        self.base.status.mode = "kanayama_settling".into();
+                        return cmd;
+                    }
+                }
                 let v_r = if s.finished { 0.0 } else { s.speed };
                 (s.pose.point.x, s.pose.point.y, yaw_of(&s.pose), v_r, if s.finished { 0.0 } else { s.yaw_rate })
             }
@@ -78,14 +106,14 @@ impl Controller for KanayamaFollower {
         let e_x = c * dx + s * dy;
         let e_y = -s * dx + c * dy;
         let e_theta = normalize_angle(yaw_r - yaw);
-        let (k_x, k_y, k_theta) = self.gains();
+        let (k_x, k_y, k_theta) = self.gains_for(constraints, v_r);
 
         if is_holonomic(constraints.steering_type) {
             // e_x, e_y, e_theta are already body-frame errors against the
             // moving reference, so translation and rotation correct
             // independently with no coupling term needed.
             let vx = v_r * e_theta.cos() + k_x * e_x;
-            let vy = k_y * e_y;
+            let vy = v_r * e_theta.sin() + k_y * e_y;
             let omega = omega_r + k_theta * e_theta.sin();
             self.base.status.mode = if self.trajectory.is_some() {
                 "kanayama_timed_holonomic".into()
@@ -96,7 +124,7 @@ impl Controller for KanayamaFollower {
         }
 
         let v = v_r * e_theta.cos() + k_x * e_x;
-        let omega = omega_r + v_r.abs() * (k_y * e_y + k_theta * e_theta.sin());
+        let omega = omega_r + v_r * k_y * e_y + v_r.abs() * k_theta * e_theta.sin();
         self.base.status.mode = if self.trajectory.is_some() { "kanayama_timed".into() } else { "kanayama".into() };
         finalize(v, omega, constraints, &cfg, prep.allow_reverse, "Kanayama tracking")
     }

@@ -263,18 +263,18 @@ pub fn speed_cap(speeds: &[f64], proj: &PathProjection) -> Option<f64> {
     speeds.get(i).copied().filter(|v| v.abs() > 0.0).map(f64::abs)
 }
 
-/// Driving direction (+1 / -1) requested by the path at the projection,
-/// from the sign of `Path::speeds`; `None` without speeds.
+/// Driving direction (+1 / -1) along the projection's segment: the sign of
+/// `Path::speeds` at the waypoint it leads to; `None` without speeds.
 pub fn direction_at(speeds: &[f64], proj: &PathProjection) -> Option<i8> {
     if speeds.is_empty() {
         return None;
     }
-    let i = if proj.t < 0.5 { proj.segment } else { proj.segment + 1 };
+    let i = (proj.segment + 1).min(speeds.len() - 1);
     speeds.get(i).map(|v| if *v < 0.0 { -1 } else { 1 })
 }
 
-/// Arc length of the first waypoint after `s` where the sign of
-/// `Path::speeds` flips (a cusp), if any.
+/// Arc length of the first cusp after `s`: the last waypoint before the
+/// sign of `Path::speeds` flips.
 pub fn cusp_after(speeds: &[f64], cum: &[f64], s: f64) -> Option<f64> {
     if speeds.len() != cum.len() || speeds.len() < 2 {
         return None;
@@ -282,8 +282,8 @@ pub fn cusp_after(speeds: &[f64], cum: &[f64], s: f64) -> Option<f64> {
     let start = cum.iter().position(|c| *c > s + 1e-9).unwrap_or(cum.len());
     let mut i = start.saturating_sub(1);
     while i + 1 < speeds.len() {
-        if (speeds[i] < 0.0) != (speeds[i + 1] < 0.0) {
-            return Some(cum[i + 1]);
+        if (speeds[i] < 0.0) != (speeds[i + 1] < 0.0) && cum[i] > s + 1e-9 {
+            return Some(cum[i]);
         }
         i += 1;
     }
@@ -296,15 +296,23 @@ pub fn cusp_after(speeds: &[f64], cum: &[f64], s: f64) -> Option<f64> {
 pub struct PathCursor {
     pub cum: Vec<f64>,
     pub started: bool,
+    /// First segment projections may land on: progress committed past a
+    /// cusp does not slide back over it.
+    pub floor: usize,
 }
 
 const CURSOR_WINDOW: usize = 64;
 
 impl PathCursor {
-
     pub fn set_path(&mut self, waypoints: &[Pose]) {
         self.cum = cumulative_lengths(waypoints);
         self.started = false;
+        self.floor = 0;
+    }
+
+    /// Commit progress to segment `segment` and beyond.
+    pub fn commit(&mut self, segment: usize) {
+        self.floor = self.floor.max(segment);
     }
 
     pub fn total_length(&self) -> f64 {
@@ -322,7 +330,9 @@ impl PathCursor {
         } else {
             usize::MAX
         };
-        let proj = project(waypoints, &self.cum, p, hint, 2, window)?;
+        let hint = hint.max(self.floor);
+        let lookback = 2.min(hint - self.floor);
+        let proj = project(waypoints, &self.cum, p, hint, lookback, window)?;
         self.started = true;
         Some(proj)
     }

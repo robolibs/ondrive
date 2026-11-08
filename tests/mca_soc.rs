@@ -125,6 +125,7 @@ fn mca_avoids_static_gaussian_obstacle() {
     let obstacle = Obstacle {
         id: 0,
         radius: 0.3,
+        dt: 0.0,
         modes: vec![GaussianMode {
             weight: 1.0,
             mean_x: vec![6.0; horizon],

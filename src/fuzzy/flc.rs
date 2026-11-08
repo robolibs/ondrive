@@ -6,6 +6,7 @@
 
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::{
+    path_to_body,
     can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, is_ackermann,
     is_holonomic, path_speed, steering_to_curvature,
 };
@@ -38,7 +39,7 @@ impl Term {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FlcConfig {
     /// Cross-track error mapped onto the full `[-1, 1]` input range.
     pub cte_range: f64,
@@ -146,6 +147,16 @@ impl FlcFollower {
 }
 
 impl Controller for FlcFollower {
+    fn params(&self) -> serde_json::Value {
+        serde_json::to_value(&self.flc_config).unwrap_or_default()
+    }
+
+    fn set_params(&mut self, params: &serde_json::Value) -> Result<(), String> {
+        let cfg = crate::controller::merged(&self.flc_config, params)?;
+        self.set_flc_config(cfg);
+        Ok(())
+    }
+
     fn compute_control(
         &mut self,
         state: &RobotState,
@@ -180,7 +191,7 @@ impl Controller for FlcFollower {
         let nominal = speed_cap(&self.base.path.speeds, &prep.proj)
             .map_or(flc.base_velocity, |s| s.min(flc.base_velocity))
             .min(constraints.max_linear_velocity);
-        let v = path_speed(
+        let v_path = path_speed(
             nominal * (1.0 - 0.5 * steer_ratio),
             kappa_path,
             self.base.status.distance_to_goal,
@@ -188,8 +199,17 @@ impl Controller for FlcFollower {
             cfg.kp_linear,
             constraints,
         )
-        .max(flc.min_velocity.min(nominal))
-            * heading_speed_scale(theta_e, constraints);
+        .max(flc.min_velocity.min(nominal));
+
+        if is_holonomic(constraints.steering_type) {
+            self.base.status.mode = "flc_holonomic".into();
+            let yaw = state.pose.rotation.to_euler().yaw;
+            let (vx, vy) = path_to_body(v_path, -cfg.k_cross_track.max(1e-6) * e_lat, prep.proj.heading, yaw);
+            let omega = cfg.kp_angular.max(0.1) * theta_e;
+            return finalize_holonomic(vx, vy, omega, constraints, &cfg, "FLC tracking");
+        }
+
+        let v = v_path * heading_speed_scale(theta_e, constraints);
 
         let omega = if is_ackermann(constraints.steering_type) {
             let delta_fb = (u * flc.max_steering).clamp(
@@ -201,12 +221,6 @@ impl Controller for FlcFollower {
         } else {
             u * flc.max_steering + v * kappa_path
         };
-
-        if is_holonomic(constraints.steering_type) {
-            self.base.status.mode = "flc_holonomic".into();
-            let lateral = -cfg.k_cross_track.max(1e-6) * e_lat;
-            return finalize_holonomic(v, lateral, omega, constraints, &cfg, "FLC tracking");
-        }
 
         self.base.status.mode = "flc".into();
         finalize(v, omega, constraints, &cfg, prep.allow_reverse, "FLC tracking")

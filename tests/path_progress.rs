@@ -52,6 +52,8 @@ fn tracker(kind: TrackerKind, reverse: bool, tolerance: f64) -> Tracker {
     t.init(RobotConstraints {
         steering_type: SteeringType::Differential,
         max_angular_velocity: 2.0,
+        max_linear_acceleration: 3.0,
+        max_angular_acceleration: 8.0,
         ..Default::default()
     });
     t
@@ -237,5 +239,36 @@ fn a_closed_path_is_driven_lap_after_lap() {
             corner_visits >= 2,
             "{kind:?}: far corner visited {corner_visits} times"
         );
+    }
+}
+
+/// Forward along x to 8 m, then reversing along a quarter circle to (5, 3).
+fn reversing_arc() -> Path {
+    let mut path = Path::default();
+    for i in 0..=16 {
+        path.waypoints.push(pose(i as f64 * 0.5, 0.0, 0.0));
+        path.speeds.push(1.0);
+    }
+    for i in 1..=16 {
+        let a = i as f64 * std::f64::consts::FRAC_PI_2 / 16.0;
+        path.waypoints.push(pose(8.0 - 3.0 * a.sin(), 3.0 * (1.0 - a.cos()), -a));
+        path.speeds.push(-1.0);
+    }
+    smoothen_path(&mut path, 0.2);
+    path
+}
+
+#[test]
+fn predictive_controllers_reverse_through_a_cusp() {
+    for kind in [TrackerKind::Mppi, TrackerKind::Mca, TrackerKind::Mpc, TrackerKind::Ilqr, TrackerKind::Soc] {
+        let mut t = tracker(kind, true, 0.25);
+        t.set_seed(3);
+        t.set_path(reversing_arc());
+        let visited = drive(&mut t, pose(0.0, 0.0, 0.0), 1600);
+        assert!(t.is_path_completed(), "{kind:?}: not completed, at {:?}", visited.last().unwrap());
+        let furthest = visited.iter().map(|p| p.x).fold(f64::MIN, f64::max);
+        assert!(furthest > 7.7, "{kind:?}: turned back at x = {furthest:.2}, before the cusp");
+        let end = visited.last().unwrap();
+        assert!(end.distance_to_2d(Point::new(5.0, 3.0, 0.0)) < 0.5, "{kind:?}: ended at {end:?}");
     }
 }

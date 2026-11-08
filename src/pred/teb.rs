@@ -18,13 +18,16 @@ use crate::core::kinematics::{
     world_to_body,
 };
 use crate::core::math::{normalize_angle, yaw_of};
-use crate::core::obstacles::CollisionChecker;
-use crate::core::path::{PathCursor, project, sample};
-use crate::pred::mppi::{current_lateral_speed, current_speed, prepare};
-use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
-use datapod::{Point, Pose};
+use crate::core::obstacles::{CollisionChecker, robot_radius};
+use crate::core::path::{PathCursor, cumulative_lengths, project, sample};
+use crate::pred::mppi::{build_reference, current_lateral_speed, current_speed, pick_detour, prepare};
+use crate::types::{Goal, Obstacle, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
+use datapod::{Euler, Point, Pose, Quaternion};
 
-#[derive(Clone, Debug)]
+/// Seconds of band the command is read over.
+const CONTROL_LOOKAHEAD_S: f64 = 0.4;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TebConfig {
     pub n_poses: usize,
     pub dt_nominal: f64,
@@ -48,7 +51,7 @@ pub struct TebConfig {
 impl Default for TebConfig {
     fn default() -> Self {
         Self {
-            n_poses: 6,
+            n_poses: 12,
             dt_nominal: 0.3,
             iterations: 30,
             step_size: 0.05,
@@ -76,6 +79,8 @@ pub struct TebFollower {
     band_initialised: bool,
     last_v: f64,
     last_vy: f64,
+    /// Side the band last went round obstacles on: +1 left, −1 right, 0 none.
+    side: f64,
     auto_path_goal: Option<(f64, f64, f64)>,
 }
 
@@ -102,15 +107,19 @@ struct Problem<'a> {
     v_start: f64,
     ackermann: bool,
     holonomic: bool,
+    /// Path segment the robot projects onto, where projections start.
+    start_segment: usize,
 }
 
 impl Problem<'_> {
-    fn obstacle_cost(&self, step: usize, x: f64, y: f64, yaw: f64) -> f64 {
+    /// Penalty for coming within `obstacle_margin` of an obstacle as it is
+    /// predicted `t` seconds from now.
+    fn obstacle_cost(&self, t: f64, x: f64, y: f64, yaw: f64) -> f64 {
         let c = self.cfg;
         if !self.checker.has_obstacles() {
             return 0.0;
         }
-        let d = self.checker.clearance(step, x, y, yaw);
+        let d = self.checker.clearance_at(t, x, y, yaw);
         if d < c.obstacle_margin {
             let s = c.obstacle_margin - d;
             c.weight_obstacle * s * s
@@ -126,6 +135,10 @@ impl Problem<'_> {
         let mut cost = 0.0;
         let mut prev_v: Option<(f64, f64)> = None;
         let mut last_v = 0.0;
+        let mut times = vec![0.0; n];
+        for i in 0..n - 1 {
+            times[i + 1] = times[i] + b.dt[i].max(1e-4);
+        }
 
         for i in 0..n - 1 {
             let dt = b.dt[i].max(1e-4);
@@ -165,7 +178,7 @@ impl Problem<'_> {
                 cost += c.weight_kinematic * r * r;
             }
 
-            cost += self.obstacle_cost(i, 0.5 * (b.x[i] + b.x[i + 1]), 0.5 * (b.y[i] + b.y[i + 1]), b.yaw[i]);
+            cost += self.obstacle_cost(times[i] + 0.5 * dt, 0.5 * (b.x[i] + b.x[i + 1]), 0.5 * (b.y[i] + b.y[i + 1]), b.yaw[i]);
         }
         if let Some((_, pdt)) = prev_v {
             let a_goal = last_v / pdt.max(1e-4);
@@ -174,7 +187,7 @@ impl Problem<'_> {
         }
 
         if !self.waypoints.is_empty() {
-            let mut hint = 0;
+            let mut hint = self.start_segment;
             for i in 1..n {
                 if let Some(p) = project(
                     self.waypoints,
@@ -182,7 +195,7 @@ impl Problem<'_> {
                     Point::new(b.x[i], b.y[i], 0.0),
                     hint,
                     2,
-                    usize::MAX,
+                    64,
                 ) {
                     cost += c.weight_path_deviation * p.distance * p.distance;
                     hint = p.segment;
@@ -191,7 +204,7 @@ impl Problem<'_> {
         }
 
         for i in 0..n {
-            cost += self.obstacle_cost(i, b.x[i], b.y[i], b.yaw[i]);
+            cost += self.obstacle_cost(times[i], b.x[i], b.y[i], b.yaw[i]);
         }
 
         let (tp, th) = self.target;
@@ -208,14 +221,14 @@ impl Problem<'_> {
 fn push_off_obstacles(
     p: Point,
     heading: f64,
-    step: usize,
+    t: f64,
     checker: &CollisionChecker,
     margin: f64,
 ) -> Point {
     if !checker.has_obstacles() {
         return p;
     }
-    let c = checker.clearance(step, p.x, p.y, heading);
+    let c = checker.clearance_at(t, p.x, p.y, heading);
     if c >= margin {
         return p;
     }
@@ -223,14 +236,39 @@ fn push_off_obstacles(
     let shift = margin - c;
     let left = Point::new(p.x - shift * s, p.y + shift * co, 0.0);
     let right = Point::new(p.x + shift * s, p.y - shift * co, 0.0);
-    let cl = checker.clearance(step, left.x, left.y, heading);
-    let cr = checker.clearance(step, right.x, right.y, heading);
+    let cl = checker.clearance_at(t, left.x, left.y, heading);
+    let cr = checker.clearance_at(t, right.x, right.y, heading);
     if cr > cl { right } else { left }
 }
 
 impl TebFollower {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The way round the obstacles blocking the stretch of path ahead of
+    /// arc length `from`, as poses for the band to follow, on the cheaper
+    /// side with hysteresis; `None` when nothing blocks it.
+    fn detour_guide(&mut self, from: f64, constraints: &RobotConstraints, obstacles: &[Obstacle]) -> Option<Vec<Pose>> {
+        if obstacles.is_empty() {
+            self.side = 0.0;
+            return None;
+        }
+        let step = self.teb_config.dt_nominal.max(0.05);
+        let n = 2 * self.teb_config.n_poses.max(3);
+        let speed = (0.8 * constraints.max_linear_velocity).max(0.1);
+        let reference = build_reference(&self.base.path, &self.cursor.cum, from, n, step, speed, 0.0);
+        let g = pick_detour(&reference, obstacles, robot_radius(constraints), step, &mut self.side)?;
+        let k = g.x.len();
+        Some(
+            (0..k)
+                .map(|i| {
+                    let (a, b) = (i.saturating_sub(1), (i + 1).min(k - 1));
+                    let yaw = (g.y[b] - g.y[a]).atan2(g.x[b] - g.x[a]);
+                    Pose { point: Point::new(g.x[i], g.y[i], 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, yaw)) }
+                })
+                .collect(),
+        )
     }
 
     pub fn with_teb_config(cfg: TebConfig) -> Self {
@@ -260,7 +298,8 @@ impl TebFollower {
 
     fn sample_band_pose(&self, s: f64, step: usize, checker: &CollisionChecker) -> (Point, f64) {
         let (p, h) = sample(&self.base.path.waypoints, &self.cursor.cum, s);
-        let p = push_off_obstacles(p, h, step, checker, self.teb_config.obstacle_margin);
+        let t = step as f64 * self.teb_config.dt_nominal;
+        let p = push_off_obstacles(p, h, t, checker, self.teb_config.obstacle_margin);
         (p, h)
     }
 
@@ -425,6 +464,16 @@ impl TebFollower {
 }
 
 impl Controller for TebFollower {
+    fn params(&self) -> serde_json::Value {
+        serde_json::to_value(&self.teb_config).unwrap_or_default()
+    }
+
+    fn set_params(&mut self, params: &serde_json::Value) -> Result<(), String> {
+        let cfg = crate::controller::merged(&self.teb_config, params)?;
+        self.set_teb_config(cfg);
+        Ok(())
+    }
+
     fn compute_control(
         &mut self,
         state: &RobotState,
@@ -456,7 +505,7 @@ impl Controller for TebFollower {
                 return cmd;
             }
         };
-        let checker = CollisionChecker::new(world, constraints, 0.0);
+        let checker = CollisionChecker::new(world, constraints, 0.0).with_spread(1.0);
         let holonomic = is_holonomic(constraints.steering_type);
         let v_now = current_speed(state, self.last_v);
         let vy_now = if holonomic { current_lateral_speed(state, self.last_vy) } else { 0.0 };
@@ -469,9 +518,17 @@ impl Controller for TebFollower {
 
         let (v_lo, v_hi) = speed_bounds(constraints, prep.allow_reverse);
         let total = self.cursor.total_length();
-        let target = sample(&self.base.path.waypoints, &self.cursor.cum, self.band.tail_s.min(total));
-        let waypoints = self.base.path.waypoints.clone();
-        let cum = self.cursor.cum.clone();
+        let mut target = sample(&self.base.path.waypoints, &self.cursor.cum, self.band.tail_s.min(total));
+        let mut waypoints = self.base.path.waypoints.clone();
+        let mut cum = self.cursor.cum.clone();
+        let mut start_segment = prep.proj.segment;
+        let obstacles: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
+        if let Some(guide) = self.detour_guide(prep.proj.arc_length, constraints, obstacles) {
+            cum = cumulative_lengths(&guide);
+            target = guide.last().map(|p| (p.point, yaw_of(p))).unwrap_or(target);
+            waypoints = guide;
+            start_segment = 0;
+        }
         let cfg = self.teb_config.clone();
         let problem = Problem {
             cfg: &cfg,
@@ -486,6 +543,7 @@ impl Controller for TebFollower {
             v_start: v_now,
             ackermann: is_ackermann(constraints.steering_type),
             holonomic,
+            start_segment,
         };
         self.optimise(&problem);
 
@@ -493,7 +551,16 @@ impl Controller for TebFollower {
         let dx = self.band.x[1] - self.band.x[0];
         let dy = self.band.y[1] - self.band.y[0];
         let yaw0 = self.band.yaw[0];
-        let w = normalize_angle(self.band.yaw[1] - self.band.yaw[0]) / dt0;
+        // The turn and speed are read over the first poses spanning
+        // `CONTROL_LOOKAHEAD_S` (teb_local_planner's control look-ahead poses),
+        // not one segment, which the last iterations of the solve jostle.
+        let (mut k, mut span, mut length) = (1, dt0, dx.hypot(dy));
+        while k + 1 < self.band.x.len() && span < CONTROL_LOOKAHEAD_S {
+            span += self.band.dt[k].max(1e-3);
+            length += (self.band.x[k + 1] - self.band.x[k]).hypot(self.band.y[k + 1] - self.band.y[k]);
+            k += 1;
+        }
+        let w = normalize_angle(self.band.yaw[k] - self.band.yaw[0]) / span;
         let a_max = constraints.max_linear_acceleration.abs().max(1e-6);
 
         if holonomic {
@@ -507,9 +574,8 @@ impl Controller for TebFollower {
             return cmd;
         }
 
-        let ds = dx.hypot(dy);
         let forward = (dx * yaw0.cos() + dy * yaw0.sin()).signum();
-        let v = (forward * ds / dt0).clamp(v_now - a_max * dt, v_now + a_max * dt);
+        let v = (forward * length / span).clamp(v_now - a_max * dt, v_now + a_max * dt);
 
         self.base.status.mode = "teb".into();
         let cmd = finalize(v, w, constraints, &self.base.config, prep.allow_reverse, "TEB tracking");

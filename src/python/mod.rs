@@ -15,7 +15,7 @@ use pyo3::wrap_pyfunction;
 use datapod::{Euler, Pose as DPose, Quaternion};
 
 use crate::types::{
-    ControllerConfig, ControllerStatus, GaussianMode as RsGaussianMode, Goal as RsGoal,
+    ControllerConfig, ControllerStatus, DebugLevel, GaussianMode as RsGaussianMode, Goal as RsGoal,
     Obstacle as RsObstacle, OutputUnits, Path as RsPath, RobotConstraints as RsConstraints,
     RobotState as RsRobotState, SteeringType, Velocity as RsVelocity,
     VelocityCommand as RsVelocityCommand, WorldConstraints as RsWorld,
@@ -410,6 +410,18 @@ impl PyRobotConstraints {
         }
     }
 
+    /// Robot outline: a disc of `radius`, or a polygon of `(x, y)` body-frame
+    /// points (x forward, y left).
+    #[pyo3(signature = (radius = None, points = None))]
+    fn set_footprint(&mut self, radius: Option<f64>, points: Option<Vec<(f64, f64)>>) -> PyResult<()> {
+        self.inner.footprint = match (radius, points) {
+            (Some(radius), None) => crate::types::Footprint::Disc { radius },
+            (None, Some(points)) => crate::types::Footprint::Polygon { points },
+            _ => return Err(PyValueError::new_err("give either radius or points")),
+        };
+        Ok(())
+    }
+
     #[getter]
     fn steering_type(&self) -> &'static str {
         steering_to_str(self.inner.steering_type)
@@ -551,7 +563,7 @@ impl PyRobotState {
     #[new]
     #[pyo3(signature = (
         pose = ((0.0, 0.0, 0.0), 0.0),
-        velocity = (0.0, 0.0, 0.0),
+        velocity = None,
         timestamp = 0.0,
         allow_reverse = false,
         turn_first = false,
@@ -559,7 +571,7 @@ impl PyRobotState {
     ))]
     fn new(
         pose: PoseTuple,
-        velocity: VelocityTuple,
+        velocity: Option<VelocityTuple>,
         timestamp: f64,
         allow_reverse: bool,
         turn_first: bool,
@@ -568,7 +580,8 @@ impl PyRobotState {
         Self {
             inner: RsRobotState {
                 pose: pose_from_tuple(pose),
-                velocity: velocity_from_tuple(velocity),
+                velocity: velocity.map(velocity_from_tuple).unwrap_or_default(),
+                velocity_valid: velocity.is_some(),
                 timestamp,
                 allow_reverse,
                 turn_first,
@@ -586,12 +599,13 @@ impl PyRobotState {
         self.inner.pose = pose_from_tuple(v);
     }
     #[getter]
-    fn velocity(&self) -> VelocityTuple {
-        velocity_to_tuple(self.inner.velocity)
+    fn velocity(&self) -> Option<VelocityTuple> {
+        self.inner.velocity_valid.then(|| velocity_to_tuple(self.inner.velocity))
     }
     #[setter]
-    fn set_velocity(&mut self, v: VelocityTuple) {
-        self.inner.velocity = velocity_from_tuple(v);
+    fn set_velocity(&mut self, v: Option<VelocityTuple>) {
+        self.inner.velocity = v.map(velocity_from_tuple).unwrap_or_default();
+        self.inner.velocity_valid = v.is_some();
     }
     #[getter]
     fn timestamp(&self) -> f64 {
@@ -900,6 +914,7 @@ impl PyWorld {
         self.inner.obstacles.push(RsObstacle {
             id,
             radius,
+            dt: 0.0,
             modes: vec![RsGaussianMode {
                 weight: 1.0,
                 mean_x: vec![x; h],
@@ -943,6 +958,7 @@ impl PyWorld {
         self.inner.obstacles.push(RsObstacle {
             id,
             radius,
+            dt: 0.0,
             modes: vec![RsGaussianMode {
                 weight: 1.0,
                 mean_x,
@@ -959,6 +975,31 @@ impl PyWorld {
         self.inner.zones.clear();
     }
 
+    /// Add an obstacle predicted as a Gaussian mixture. Each mode is
+    /// `(weight, mean_x, mean_y, std_x, std_y)` with one entry per horizon
+    /// step, step 0 being now; `std_x` / `std_y` may also be single numbers.
+    /// `dt` is the time between steps (0: the controller's own step).
+    #[pyo3(signature = (id, radius, modes, dt = 0.0))]
+    fn add_obstacle(&mut self, id: u64, radius: f64, modes: Vec<(f64, Vec<f64>, Vec<f64>, Spread, Spread)>, dt: f64) -> PyResult<()> {
+        let mut out = Vec::with_capacity(modes.len());
+        for (weight, mean_x, mean_y, std_x, std_y) in modes {
+            let h = mean_x.len();
+            if h == 0 || mean_y.len() != h {
+                return Err(PyValueError::new_err("each mode needs non-empty mean_x and mean_y of the same length"));
+            }
+            out.push(RsGaussianMode { weight, mean_x, mean_y, std_x: std_x.steps(h)?, std_y: std_y.steps(h)? });
+        }
+        self.inner.obstacles.push(RsObstacle { id, radius, dt, modes: out });
+        Ok(())
+    }
+
+    /// Add a speed-limit zone: inside the polygon `boundary` the tracker
+    /// caps the speed to `max_speed`.
+    fn add_zone(&mut self, boundary: Vec<(f64, f64)>, max_speed: f64) {
+        let boundary = boundary.into_iter().map(|(x, y)| datapod::Point::new(x, y, 0.0)).collect();
+        self.inner.zones.push(crate::types::Zone { boundary, max_speed });
+    }
+
     fn obstacle_count(&self) -> usize {
         self.inner.obstacles.len()
     }
@@ -968,7 +1009,7 @@ impl PyWorld {
 // Tracker.
 // ---------------------------------------------------------------------------
 
-#[pyclass(name = "Tracker", unsendable)]
+#[pyclass(name = "Tracker")]
 pub struct PyTracker {
     inner: RsTracker,
 }
@@ -1042,10 +1083,57 @@ impl PyTracker {
     }
 
     #[pyo3(signature = (state, dt, world = None))]
-    fn tick(&mut self, state: PyRobotState, dt: f64, world: Option<PyWorld>) -> PyVelocityCommand {
-        let w = world.map(|w| w.inner);
-        let cmd = self.inner.tick(&state.inner, dt, w.as_ref());
-        PyVelocityCommand { inner: cmd }
+    fn tick(&mut self, py: Python<'_>, state: PyRef<'_, PyRobotState>, dt: f64, world: Option<PyRef<'_, PyWorld>>) -> PyResult<PyVelocityCommand> {
+        let w = world.as_ref().map(|w| &w.inner);
+        let s = &state.inner;
+        let tracker = &mut self.inner;
+        py.allow_threads(|| caught(|| Ok(PyVelocityCommand { inner: tracker.tick(s, dt, w) })))
+    }
+
+    /// The controller's own parameters as a dict (empty when it has none).
+    fn params(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let text = self.inner.params().to_string();
+        Ok(py.import("json")?.call_method1("loads", (text,))?.unbind())
+    }
+
+    /// Update some of the controller's own parameters, e.g.
+    /// `set_params({"horizon_steps": 30})`.
+    fn set_params(&mut self, py: Python<'_>, params: &Bound<'_, PyAny>) -> PyResult<()> {
+        let text: String = py.import("json")?.call_method1("dumps", (params,))?.extract()?;
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        self.inner.set_params(&value).map_err(PyValueError::new_err)
+    }
+
+    /// Seed the random sampling of MPPI, MCA and SOC.
+    fn set_seed(&mut self, seed: u64) {
+        self.inner.set_seed(seed);
+    }
+
+    /// The controller's planned trajectory from the last tick, as `(x, y, z)`.
+    fn predicted_trajectory(&self) -> Vec<(f64, f64, f64)> {
+        self.inner.predicted_trajectory().into_iter().map(|p| (p.x, p.y, p.z)).collect()
+    }
+
+    /// How much of its internals the controller records each tick: "off",
+    /// "basic" (guides round obstacles) or "full" (also sampled or solved
+    /// trajectories with their costs).
+    fn set_debug(&mut self, level: &str) -> PyResult<()> {
+        let level = DebugLevel::parse(level).ok_or_else(|| PyValueError::new_err(format!("unknown debug level `{level}`")))?;
+        self.inner.set_debug(level);
+        Ok(())
+    }
+
+    /// The controller's internals from the last tick as a dict:
+    /// `rollouts` (lists of `(x, y)`), `costs` (one per rollout, lower
+    /// better) and `guides` (lists of `(x, y)`).
+    fn debug_frame<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let frame = self.inner.debug_frame();
+        let path = |p: &Vec<datapod::Point>| p.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>();
+        let out = pyo3::types::PyDict::new(py);
+        out.set_item("rollouts", frame.rollouts.iter().map(path).collect::<Vec<_>>())?;
+        out.set_item("costs", frame.costs)?;
+        out.set_item("guides", frame.guides.iter().map(path).collect::<Vec<_>>())?;
+        Ok(out)
     }
 
     fn emergency_stop(&mut self) -> PyVelocityCommand {
@@ -1151,4 +1239,36 @@ pub fn register_python_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[pymodule]
 fn ondrive(m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_python_module(m)
+}
+
+/// A standard deviation given once for every step or per step.
+#[derive(FromPyObject)]
+enum Spread {
+    One(f64),
+    Steps(Vec<f64>),
+}
+
+impl Spread {
+    fn steps(self, h: usize) -> PyResult<Vec<f64>> {
+        match self {
+            Spread::One(s) => Ok(vec![s; h]),
+            Spread::Steps(v) if v.len() == h => Ok(v),
+            Spread::Steps(_) => Err(PyValueError::new_err("a per-step spread needs one entry per mean")),
+        }
+    }
+}
+
+/// Runs `f`, turning a panic into a `RuntimeError`.
+fn caught<T>(f: impl FnOnce() -> PyResult<T>) -> PyResult<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".into());
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!("ondrive panicked: {msg}")))
+        }
+    }
 }

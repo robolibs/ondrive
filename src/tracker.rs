@@ -1,7 +1,7 @@
 use crate::controller::{Controller, check_goal};
-use crate::core::kinematics::{curvature_to_steering, is_ackermann, is_holonomic, stop, wheelbase};
+use crate::core::kinematics::{actuation_delay, curvature_to_steering, is_ackermann, is_holonomic, stop, wheelbase};
 use crate::core::obstacles::CollisionChecker;
-use crate::core::path::{PathCursor, cumulative_lengths, end_heading, next_cusp, segment_heading};
+use crate::core::path::{PathCursor, cumulative_lengths, cusp_after, end_heading, next_cusp, sample, segment_heading};
 use crate::fuzzy::FlcFollower;
 use crate::path::{
     IlcFollower, KanayamaFollower, LqrFollower, PurePursuitFollower, RegulatedPursuitFollower,
@@ -49,6 +49,12 @@ impl TrackerKind {
     pub fn is_point_controller(self) -> bool {
         matches!(self, TrackerKind::Pid | TrackerKind::Carrot | TrackerKind::Dwa | TrackerKind::PoseReach | TrackerKind::PoseRegulator | TrackerKind::Apf)
     }
+
+    /// Whether the controller models the machine's actuation lag itself;
+    /// the tracker hands every other one the state predicted through it.
+    pub fn models_actuation(self) -> bool {
+        matches!(self, TrackerKind::Mpc | TrackerKind::Mppi | TrackerKind::Mca | TrackerKind::Soc | TrackerKind::Ilqr)
+    }
 }
 
 pub struct Tracker {
@@ -59,6 +65,9 @@ pub struct Tracker {
     path: Option<Path>,
     cursor: PathCursor,
     waypoint_index: usize,
+    /// Side a point controller last went round obstacles on: +1 left, −1
+    /// right, 0 none.
+    detour_side: f64,
     projection_segment: usize,
     path_completed: bool,
     trajectory: Option<Trajectory>,
@@ -67,6 +76,8 @@ pub struct Tracker {
     path_error: Option<&'static str>,
     lap: Option<Lap>,
     last_steering: Option<f64>,
+    /// Last command sent, physical `(v, omega, vy)`.
+    last_command: Option<(f64, f64, f64)>,
 }
 
 impl Tracker {
@@ -80,6 +91,7 @@ impl Tracker {
             path: None,
             cursor: PathCursor::default(),
             waypoint_index: 0,
+            detour_side: 0.0,
             projection_segment: 0,
             path_completed: false,
             trajectory: None,
@@ -88,6 +100,7 @@ impl Tracker {
             path_error: None,
             lap: None,
             last_steering: None,
+            last_command: None,
         }
     }
 
@@ -194,6 +207,25 @@ impl Tracker {
         self.controller.get_config()
     }
 
+    /// The controller's own parameters (`MpcConfig`, `McaConfig`, ...) as a
+    /// JSON object; empty for a controller that has none.
+    pub fn params(&self) -> serde_json::Value {
+        self.controller.params()
+    }
+
+    /// Update some of the controller's own parameters from a JSON object,
+    /// e.g. `{"horizon_steps": 30}`. An unknown name or a wrong type is an
+    /// error and changes nothing.
+    pub fn set_params(&mut self, params: &serde_json::Value) -> Result<(), String> {
+        self.controller.set_params(params)
+    }
+
+    /// Seed the random sampling of MPPI, MCA and SOC; other controllers
+    /// ignore it.
+    pub fn set_seed(&mut self, seed: u64) {
+        self.controller.set_seed(seed);
+    }
+
     pub fn get_status(&self) -> ControllerStatus {
         self.controller.get_status()
     }
@@ -218,6 +250,7 @@ impl Tracker {
         self.waypoint_index = 0;
         self.path_completed = false;
         self.last_steering = None;
+        self.last_command = None;
     }
 
     /// One control period. Order of precedence:
@@ -266,9 +299,12 @@ impl Tracker {
             Err(msg) => return VelocityCommand::invalid(msg),
         };
 
+        let ahead = (!self.kind.models_actuation())
+            .then(|| predicted_through_actuation(state, &self.constraints, self.last_command))
+            .flatten();
         let cmd = self
             .controller
-            .compute_control(state, &goal, &self.constraints, dt, world);
+            .compute_control(ahead.as_ref().unwrap_or(state), &goal, &self.constraints, dt, world);
 
         if self.goal.is_none() && self.path.is_some() && self.controller.get_status().goal_reached
         {
@@ -277,8 +313,12 @@ impl Tracker {
         self.limit(cmd, state, dt, world)
     }
 
-    /// The command held to the speed limit of the zones the robot is in, and
-    /// its Ackermann steering angle to `max_steering_rate`.
+    /// The command held to what the platform can do: `max_linear_acceleration`
+    /// and `max_angular_acceleration` around the last command, keeping the
+    /// commanded curvature where the window allows (dynamic-window pure
+    /// pursuit); then the speed limit of the zones the robot is in; then the
+    /// Ackermann steering angle to `max_steering_rate`, held while standing.
+    /// A full stop passes unchanged.
     fn limit(
         &mut self,
         mut cmd: VelocityCommand,
@@ -289,35 +329,110 @@ impl Tracker {
         if !cmd.valid {
             return cmd;
         }
+        let rate_cap = if self.kind.models_actuation() { None } else { self.steering_rate_speed(state) };
         let c = &self.constraints;
         let (linear_unit, angular_unit) = match self.controller.get_config().output_units {
             OutputUnits::Physical => (1.0, 1.0),
             OutputUnits::Normalized => (c.max_linear_velocity.max(0.0), c.max_angular_velocity.max(0.0)),
         };
-        if let Some(cap) = world.and_then(|w| w.speed_limit_at(state.pose.point)) {
-            let speed = cmd.linear_velocity.hypot(cmd.lateral_velocity) * linear_unit;
-            if speed > cap {
-                let scale = cap / speed;
-                cmd.linear_velocity *= scale;
-                cmd.lateral_velocity *= scale;
-                if !is_holonomic(c.steering_type) {
-                    cmd.angular_velocity *= scale;
+        let holonomic = is_holonomic(c.steering_type);
+        let mut v = cmd.linear_velocity * linear_unit;
+        let mut vy = cmd.lateral_velocity * linear_unit;
+        let mut w = cmd.angular_velocity * angular_unit;
+        let stopping = v == 0.0 && vy == 0.0 && w == 0.0;
+
+        if let Some((pv, pw, pvy)) = self.last_command.filter(|_| !stopping) {
+            let a = if c.max_linear_acceleration > 0.0 { c.max_linear_acceleration * dt } else { f64::INFINITY };
+            let alpha = if c.max_angular_acceleration > 0.0 { c.max_angular_acceleration * dt } else { f64::INFINITY };
+            let (v_lo, v_hi, w_lo, w_hi) = (pv - a, pv + a, pw - alpha, pw + alpha);
+            if holonomic || v.abs() < 1e-6 {
+                v = v.clamp(v_lo, v_hi);
+                vy = vy.clamp(pvy - a, pvy + a);
+                w = w.clamp(w_lo, w_hi);
+            } else {
+                let k = w / v;
+                let (mut lo, mut hi) = (v_lo, v_hi);
+                if k.abs() > 1e-9 {
+                    let (a1, a2) = (w_lo / k, w_hi / k);
+                    lo = lo.max(a1.min(a2));
+                    hi = hi.min(a1.max(a2));
+                }
+                if lo <= hi {
+                    v = v.clamp(lo, hi);
+                    w = k * v;
+                } else {
+                    v = v.clamp(v_lo, v_hi);
+                    w = (k * v).clamp(w_lo, w_hi);
                 }
             }
         }
-        let v = cmd.linear_velocity * linear_unit;
-        if is_ackermann(c.steering_type) && c.max_steering_rate > 0.0 && v.abs() > 1e-6 {
-            if let Some(prev) = self.last_steering {
-                let step = c.max_steering_rate * dt;
-                let delta = cmd.steering_angle.clamp(prev - step, prev + step);
-                let w_max = c.max_angular_velocity.max(0.0);
-                let omega = (v * delta.tan() / wheelbase(c)).clamp(-w_max, w_max);
-                cmd.steering_angle = curvature_to_steering(omega / v, c);
-                cmd.angular_velocity = if angular_unit > 0.0 { omega / angular_unit } else { 0.0 };
+
+        let zone_cap = world.and_then(|w| w.speed_limit_at(state.pose.point));
+        if let Some(cap) = rate_cap.into_iter().chain(zone_cap).reduce(f64::min) {
+            let speed = v.hypot(vy);
+            if speed > cap {
+                let scale = cap / speed;
+                v *= scale;
+                vy *= scale;
+                if !holonomic {
+                    w *= scale;
+                }
             }
-            self.last_steering = Some(cmd.steering_angle);
         }
+
+        if is_ackermann(c.steering_type) {
+            if v.abs() > 1e-6 {
+                let mut delta = curvature_to_steering(w / v, c);
+                if c.max_steering_rate > 0.0
+                    && let Some(prev) = self.last_steering
+                {
+                    let step = c.max_steering_rate * dt;
+                    delta = delta.clamp(prev - step, prev + step);
+                    let w_max = c.max_angular_velocity.max(0.0);
+                    w = (v * delta.tan() / wheelbase(c)).clamp(-w_max, w_max);
+                    delta = curvature_to_steering(w / v, c);
+                }
+                self.last_steering = Some(delta);
+                cmd.steering_angle = delta;
+            } else if let Some(prev) = self.last_steering {
+                cmd.steering_angle = prev;
+            }
+        }
+
+        self.last_command = Some((v, w, vy));
+        cmd.linear_velocity = if linear_unit > 0.0 { v / linear_unit } else { 0.0 };
+        cmd.lateral_velocity = if linear_unit > 0.0 { vy / linear_unit } else { 0.0 };
+        cmd.angular_velocity = if angular_unit > 0.0 { w / angular_unit } else { 0.0 };
         cmd
+    }
+
+    /// Highest speed at which a rate-limited Ackermann steering keeps up with
+    /// the path's change of curvature over the stretch ahead (up to the next
+    /// cusp): `rate / (L · max |dκ/ds|)`, curvature measured over a
+    /// wheelbase; never below a share of the top speed.
+    fn steering_rate_speed(&mut self, state: &RobotState) -> Option<f64> {
+        let c = &self.constraints;
+        if !is_ackermann(c.steering_type) || c.max_steering_rate <= 0.0 {
+            return None;
+        }
+        let path = self.path.as_ref()?;
+        let proj = self.cursor.project(&path.waypoints, state.pose.point, self.projection_segment)?;
+        let cum = &self.cursor.cum;
+        let total = cum.last().copied().unwrap_or(0.0);
+        let l = wheelbase(c);
+        let span = l.max(0.5);
+        let end = (proj.arc_length + (c.max_linear_velocity * RATE_PREVIEW_S).max(2.0 * l))
+            .min(cusp_after(&path.speeds, cum, proj.arc_length).unwrap_or(total))
+            .min(total);
+        let heading = |s: f64| sample(&path.waypoints, cum, s.clamp(0.0, total)).1;
+        let kappa = |s: f64| crate::core::math::normalize_angle(heading(s + 0.5 * span) - heading(s - 0.5 * span)) / span;
+        let mut worst = 0.0_f64;
+        let mut s = proj.arc_length;
+        while s + span <= end {
+            worst = worst.max(((kappa(s + span) - kappa(s)) / span).abs());
+            s += 0.5 * span;
+        }
+        (worst > 1e-9).then(|| (c.max_steering_rate / (l * worst)).max(RATE_FLOOR * c.max_linear_velocity))
     }
 
     /// On a closed path, restart the unrolled laps once the robot is into
@@ -377,6 +492,20 @@ impl Tracker {
                 (idx, cap) = target(segment, cum[segment] + ahead);
             }
             self.projection_segment = segment;
+            let detour = world
+                .filter(|w| !w.obstacles.is_empty())
+                .and_then(|w| {
+                    detour_target(path, cum, proj.arc_length, cum[idx], state.pose.point, tol, &w.obstacles, &self.constraints, &mut self.detour_side)
+                });
+            if let Some(point) = detour {
+                let heading = segment_heading(&path.waypoints, idx.min(n.saturating_sub(2)));
+                return Ok(Some(Goal {
+                    target_pose: Pose { point, rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, heading)) },
+                    target_velocity: None,
+                    tolerance_position: tol,
+                    tolerance_orientation: std::f64::consts::PI,
+                }));
+            }
             if world.is_some() {
                 let checker = CollisionChecker::new(world, &self.constraints, WAYPOINT_MARGIN);
                 while idx < cap && blocked(&path.waypoints, idx, &checker) {
@@ -433,6 +562,17 @@ impl Tracker {
     /// True once a path driven without an explicit goal has been consumed.
     pub fn is_path_completed(&self) -> bool {
         self.path_completed
+    }
+
+    /// How much of its internals the controller records each tick.
+    pub fn set_debug(&mut self, level: crate::types::DebugLevel) {
+        self.controller.set_debug(level);
+    }
+
+    /// The controller's internals from its last tick: sampled or solved
+    /// trajectories with their costs, and the guides it steered by.
+    pub fn debug_frame(&self) -> crate::types::DebugFrame {
+        self.controller.debug_frame()
     }
 
     /// The point the tracker is currently aiming at: the active goal's
@@ -523,7 +663,8 @@ fn densify_path(waypoints: &[Pose], speeds: &[f64], max_segment_m: f64) -> (Vec<
                 rotation: rot,
             });
             if has_speeds {
-                out_speeds.push(speeds[i] + t * (speeds[i + 1] - speeds[i]));
+                let magnitude = speeds[i].abs() + t * (speeds[i + 1].abs() - speeds[i].abs());
+                out_speeds.push(if speeds[i + 1] < 0.0 { -magnitude } else { magnitude });
             }
         }
         out.push(end);
@@ -570,7 +711,8 @@ fn slerp(a: Quaternion, b: Quaternion, t: f64) -> Quaternion {
 }
 
 /// Free-function path densification for callers that don't use `Tracker`.
-/// Per-waypoint speeds are interpolated when present.
+/// Per-waypoint speeds are interpolated when present: the magnitude
+/// linearly, the sign that of the waypoint each new point leads to.
 pub fn smoothen_path(path: &mut Path, max_segment_m: f64) {
     if path.waypoints.len() < 2 || max_segment_m <= 0.0 {
         return;
@@ -615,6 +757,107 @@ fn blocked(waypoints: &[Pose], idx: usize, checker: &CollisionChecker) -> bool {
     let p = waypoints[idx].point;
     let heading = segment_heading(waypoints, idx.min(waypoints.len().saturating_sub(2)));
     checker.collides(0, p.x, p.y, heading)
+}
+
+/// Where a point controller heads while obstacles block the path between
+/// arc lengths `from` (the robot) and `to` (its target): the target moved
+/// onto the cheaper detour round the obstacles' predictions, the robot
+/// taken to drive the path at a share of its top speed, or the detour's
+/// widest point when that comes first and is still ahead of `robot` by
+/// more than `tol`. `side` (+1 left, −1 right, 0 none) is the side last
+/// taken, kept unless the other is cheaper by `SIDE_SWITCH_COST`; `None`
+/// when no detour is needed.
+#[allow(clippy::too_many_arguments)]
+fn detour_target(
+    path: &Path,
+    cum: &[f64],
+    from: f64,
+    to: f64,
+    robot: Point,
+    tol: f64,
+    obstacles: &[crate::types::Obstacle],
+    constraints: &RobotConstraints,
+    side: &mut f64,
+) -> Option<Point> {
+    use crate::pred::mpc::{DETOUR_MARGIN, DETOUR_RAMP, SIDE_SWITCH_COST};
+    let speed = (DETOUR_SPEED_SHARE * constraints.max_linear_velocity).max(0.1);
+    let target_step = ((to - from).max(0.0) / (speed * DETOUR_DT)).round() as usize;
+    let n = (target_step + DETOUR_RAMP).clamp(2, 80);
+    let reference = crate::pred::mppi::build_reference(path, cum, from, n, DETOUR_DT, speed, 0.0);
+    let along: Vec<crate::types::Obstacle> = obstacles
+        .iter()
+        .filter(|o| !crate::pred::mppi::crosses(o, &reference, DETOUR_DT))
+        .cloned()
+        .collect();
+    if along.is_empty() {
+        *side = 0.0;
+        return None;
+    }
+    let obstacles = along.as_slice();
+    let reach = crate::core::obstacles::robot_radius(constraints);
+    let mut best: Option<(f64, f64, Point)> = None;
+    for s in [1.0, -1.0] {
+        let Some(g) = reference.detour(obstacles, reach + DETOUR_MARGIN, DETOUR_DT, s, DETOUR_RAMP) else {
+            continue;
+        };
+        let shift: Vec<f64> = (0..g.x.len()).map(|i| (g.x[i] - reference.x[i]).hypot(g.y[i] - reference.y[i])).collect();
+        let kt = target_step.min(shift.len() - 1);
+        let widest = (0..=kt).max_by(|a, b| shift[*a].total_cmp(&shift[*b])).unwrap_or(kt);
+        let ahead = |k: usize| Point::new(g.x[k], g.y[k], 0.0).distance_to_2d(robot) > 2.0 * tol;
+        let k = if shift[widest] > shift[kt] + 1e-3 && ahead(widest) { widest } else { kt };
+        if shift[k] <= 1e-3 {
+            continue;
+        }
+        let cost = shift.iter().sum::<f64>() * if *side != 0.0 && s != *side { SIDE_SWITCH_COST } else { 1.0 };
+        if best.as_ref().is_none_or(|b| cost < b.0) {
+            best = Some((cost, s, Point::new(g.x[k], g.y[k], 0.0)));
+        }
+    }
+    *side = best.as_ref().map_or(0.0, |b| b.1);
+    best.map(|b| b.2)
+}
+
+/// Seconds between the points of a point controller's detour.
+const DETOUR_DT: f64 = 0.2;
+/// Share of the top speed a point controller's detour takes the robot at.
+const DETOUR_SPEED_SHARE: f64 = 0.8;
+
+/// Seconds of path at top speed checked for the steering-rate speed cap.
+const RATE_PREVIEW_S: f64 = 2.0;
+/// Share of the top speed the steering-rate cap never goes below.
+const RATE_FLOOR: f64 = 0.2;
+
+/// `state` carried forward through the actuation delay on its current arc
+/// (delay compensation), from the measured velocity or else the last
+/// command; `None` when there is no delay.
+fn predicted_through_actuation(
+    state: &RobotState,
+    constraints: &RobotConstraints,
+    last: Option<(f64, f64, f64)>,
+) -> Option<RobotState> {
+    let delay = actuation_delay(constraints);
+    if delay <= 0.0 {
+        return None;
+    }
+    let (v, w) = if state.velocity_valid {
+        (state.velocity.linear, state.velocity.angular)
+    } else {
+        last.map_or((0.0, 0.0), |(v, w, _)| (v, w))
+    };
+    let steps = 10;
+    let h = delay / steps as f64;
+    let mut yaw = crate::core::math::yaw_of(&state.pose);
+    let (mut x, mut y) = (state.pose.point.x, state.pose.point.y);
+    for _ in 0..steps {
+        x += v * (yaw + 0.5 * w * h).cos() * h;
+        y += v * (yaw + 0.5 * w * h).sin() * h;
+        yaw += w * h;
+    }
+    let mut ahead = state.clone();
+    ahead.pose.point.x = x;
+    ahead.pose.point.y = y;
+    ahead.pose.rotation = datapod::Quaternion::from_euler(datapod::Euler::new(0.0, 0.0, yaw));
+    Some(ahead)
 }
 
 fn finite_pose(p: &Pose) -> bool {

@@ -395,6 +395,7 @@ fn first_yaw_rate(kind: TrackerKind, steering: SteeringType, start: Pose) -> f64
             linear: 0.5,
             ..Default::default()
         },
+        velocity_valid: true,
         allow_move: true,
         ..Default::default()
     };

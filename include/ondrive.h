@@ -140,6 +140,10 @@ typedef struct {
   bool allow_reverse;
   bool turn_first;
   bool allow_move;
+  /**
+   * True when `velocity` is a measurement; a measured 0 is a standstill.
+   */
+  bool velocity_valid;
 } OndriveRobotState;
 
 typedef struct {
@@ -215,7 +219,8 @@ bool ondrive_world_add_static_gaussian_obstacle(OndriveWorld *h,
 
 /**
  * Add an obstacle with a provided mean trajectory and fixed std across the
- * horizon. `mean_x` / `mean_y` must point to `horizon_steps` doubles.
+ * horizon. `mean_x` / `mean_y` must point to `horizon_steps` doubles, one
+ * every `dt` seconds from now (0: each controller's own planning step).
  */
 bool ondrive_world_add_trajectory_obstacle(OndriveWorld *h,
                                            uint64_t id,
@@ -224,7 +229,8 @@ bool ondrive_world_add_trajectory_obstacle(OndriveWorld *h,
                                            const double *mean_y,
                                            double std_x,
                                            double std_y,
-                                           uintptr_t horizon_steps);
+                                           uintptr_t horizon_steps,
+                                           double dt);
 
 OndriveTracker *ondrive_tracker_new(uint32_t kind);
 
@@ -304,6 +310,44 @@ bool ondrive_world_set_grid(OndriveWorld *h,
                             const uint8_t *occupied);
 
 bool ondrive_world_clear_grid(OndriveWorld *h);
+
+/**
+ * The controller's own parameters (`MpcConfig`, `McaConfig`, ...) as a
+ * JSON object, or NULL on error. Valid until the next call on this thread.
+ */
+const char *ondrive_tracker_params(const OndriveTracker *h);
+
+/**
+ * Update some of the controller's own parameters from a JSON object, e.g.
+ * `{"horizon_steps": 30}`. An unknown name or a wrong type fails and
+ * changes nothing.
+ */
+bool ondrive_tracker_set_params(OndriveTracker *h, const char *json);
+
+/**
+ * Seed the random sampling of MPPI, MCA and SOC.
+ */
+bool ondrive_tracker_set_seed(OndriveTracker *h, uint64_t seed);
+
+/**
+ * Robot outline as a disc of `radius` metres.
+ */
+bool ondrive_tracker_set_footprint_disc(OndriveTracker *h, double radius);
+
+/**
+ * Robot outline as a polygon of `count` body-frame points (x forward, y
+ * left), given as `count` interleaved `x, y` pairs.
+ */
+bool ondrive_tracker_set_footprint_polygon(OndriveTracker *h, const double *xy, uintptr_t count);
+
+/**
+ * Write up to `capacity` points of the controller's planned trajectory to
+ * `out`; returns how many points the plan has (which may exceed
+ * `capacity`). `out` may be NULL to ask for the count.
+ */
+uintptr_t ondrive_tracker_predicted_trajectory(const OndriveTracker *h,
+                                               OndriveVec3 *out,
+                                               uintptr_t capacity);
 
 #ifdef __cplusplus
 }  // extern "C"

@@ -204,6 +204,8 @@ pub struct OndriveRobotState {
     pub allow_reverse: bool,
     pub turn_first: bool,
     pub allow_move: bool,
+    /// True when `velocity` is a measurement; a measured 0 is a standstill.
+    pub velocity_valid: bool,
 }
 
 #[repr(C)]
@@ -343,6 +345,7 @@ fn state_to_rs(s: OndriveRobotState) -> RobotState {
         allow_reverse: s.allow_reverse,
         turn_first: s.turn_first,
         allow_move: s.allow_move,
+        velocity_valid: s.velocity_valid,
     }
 }
 
@@ -363,7 +366,7 @@ fn constraints_to_rs(c: OndriveRobotConstraints) -> Option<RobotConstraints> {
     let steering = steering_from_u32(c.steering_type)?;
     Some(RobotConstraints {
         steering_type: steering,
-        footprint: ondrive_footprint_placeholder(),
+        footprint: crate::types::Footprint::default(),
         wheelbase: c.wheelbase,
         track_width: c.track_width,
         max_linear_velocity: c.max_linear_velocity,
@@ -378,10 +381,6 @@ fn constraints_to_rs(c: OndriveRobotConstraints) -> Option<RobotConstraints> {
         robot_width: c.robot_width,
         robot_length: c.robot_length,
     })
-}
-
-fn ondrive_footprint_placeholder() -> crate::types::Footprint {
-    crate::types::Footprint::default()
 }
 
 fn constraints_to_ffi(c: &RobotConstraints) -> OndriveRobotConstraints {
@@ -689,6 +688,7 @@ pub extern "C" fn ondrive_world_add_static_gaussian_obstacle(
     let obstacle = Obstacle {
         id,
         radius,
+        dt: 0.0,
         modes: vec![GaussianMode {
             weight: 1.0,
             mean_x: vec![x; horizon],
@@ -702,7 +702,8 @@ pub extern "C" fn ondrive_world_add_static_gaussian_obstacle(
 }
 
 /// Add an obstacle with a provided mean trajectory and fixed std across the
-/// horizon. `mean_x` / `mean_y` must point to `horizon_steps` doubles.
+/// horizon. `mean_x` / `mean_y` must point to `horizon_steps` doubles, one
+/// every `dt` seconds from now (0: each controller's own planning step).
 #[unsafe(no_mangle)]
 pub extern "C" fn ondrive_world_add_trajectory_obstacle(
     h: *mut OndriveWorld,
@@ -713,6 +714,7 @@ pub extern "C" fn ondrive_world_add_trajectory_obstacle(
     std_x: f64,
     std_y: f64,
     horizon_steps: usize,
+    dt: f64,
 ) -> bool {
     if h.is_null() {
         return fail("null world handle");
@@ -728,6 +730,7 @@ pub extern "C" fn ondrive_world_add_trajectory_obstacle(
     let obs = Obstacle {
         id,
         radius,
+        dt: if dt.is_finite() { dt.max(0.0) } else { 0.0 },
         modes: vec![GaussianMode {
             weight: 1.0,
             mean_x: xs,
@@ -779,9 +782,10 @@ pub extern "C" fn ondrive_tracker_init(
         if h.is_null() {
             return fail("null tracker handle");
         }
-        let Some(c) = constraints_to_rs(constraints) else {
+        let Some(mut c) = constraints_to_rs(constraints) else {
             return fail("invalid steering_type in constraints");
         };
+        c.footprint = unsafe { (*h).tracker.constraints().footprint.clone() };
         unsafe { (*h).tracker.init(c) };
         ok()
     })
@@ -1148,4 +1152,134 @@ mod tests {
             .into_owned();
         assert!(msg.contains("boom"), "{msg}");
     }
+}
+
+thread_local! {
+    static LAST_PARAMS: RefCell<Option<CString>> = const { RefCell::new(None) };
+}
+
+/// The controller's own parameters (`MpcConfig`, `McaConfig`, ...) as a
+/// JSON object, or NULL on error. Valid until the next call on this thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn ondrive_tracker_params(h: *const OndriveTracker) -> *const c_char {
+    guarded(ptr::null(), || {
+        if h.is_null() {
+            set_last_error("null tracker handle");
+            return ptr::null();
+        }
+        let text = unsafe { (*h).tracker.params() }.to_string();
+        clear_last_error();
+        LAST_PARAMS.with(|s| {
+            let c = CString::new(text).unwrap_or_default();
+            let p = c.as_ptr();
+            *s.borrow_mut() = Some(c);
+            p
+        })
+    })
+}
+
+/// Update some of the controller's own parameters from a JSON object, e.g.
+/// `{"horizon_steps": 30}`. An unknown name or a wrong type fails and
+/// changes nothing.
+#[unsafe(no_mangle)]
+pub extern "C" fn ondrive_tracker_set_params(h: *mut OndriveTracker, json: *const c_char) -> bool {
+    guarded(false, || {
+        if h.is_null() || json.is_null() {
+            return fail("null pointer");
+        }
+        let text = unsafe { CStr::from_ptr(json) }.to_string_lossy();
+        let value: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => return fail(format!("parameters are not JSON: {e}")),
+        };
+        match unsafe { (*h).tracker.set_params(&value) } {
+            Ok(()) => ok(),
+            Err(e) => fail(e),
+        }
+    })
+}
+
+/// Seed the random sampling of MPPI, MCA and SOC.
+#[unsafe(no_mangle)]
+pub extern "C" fn ondrive_tracker_set_seed(h: *mut OndriveTracker, seed: u64) -> bool {
+    guarded(false, || {
+        if h.is_null() {
+            return fail("null tracker handle");
+        }
+        unsafe { (*h).tracker.set_seed(seed) };
+        ok()
+    })
+}
+
+/// Robot outline as a disc of `radius` metres.
+#[unsafe(no_mangle)]
+pub extern "C" fn ondrive_tracker_set_footprint_disc(h: *mut OndriveTracker, radius: f64) -> bool {
+    guarded(false, || {
+        if h.is_null() {
+            return fail("null tracker handle");
+        }
+        if !(radius.is_finite() && radius > 0.0) {
+            return fail("radius must be positive");
+        }
+        let mut c = unsafe { (*h).tracker.constraints().clone() };
+        c.footprint = crate::types::Footprint::Disc { radius };
+        unsafe { (*h).tracker.init(c) };
+        ok()
+    })
+}
+
+/// Robot outline as a polygon of `count` body-frame points (x forward, y
+/// left), given as `count` interleaved `x, y` pairs.
+#[unsafe(no_mangle)]
+pub extern "C" fn ondrive_tracker_set_footprint_polygon(
+    h: *mut OndriveTracker,
+    xy: *const f64,
+    count: usize,
+) -> bool {
+    guarded(false, || {
+        if h.is_null() || xy.is_null() {
+            return fail("null pointer");
+        }
+        if count < 3 {
+            return fail("a polygon needs at least 3 points");
+        }
+        let Some(len) = count.checked_mul(2) else {
+            return fail("point count overflows");
+        };
+        let values = unsafe { std::slice::from_raw_parts(xy, len) };
+        if !values.iter().all(|v| v.is_finite()) {
+            return fail("polygon points must be finite");
+        }
+        let mut c = unsafe { (*h).tracker.constraints().clone() };
+        c.footprint = crate::types::Footprint::Polygon {
+            points: values.chunks(2).map(|p| (p[0], p[1])).collect(),
+        };
+        unsafe { (*h).tracker.init(c) };
+        ok()
+    })
+}
+
+/// Write up to `capacity` points of the controller's planned trajectory to
+/// `out`; returns how many points the plan has (which may exceed
+/// `capacity`). `out` may be NULL to ask for the count.
+#[unsafe(no_mangle)]
+pub extern "C" fn ondrive_tracker_predicted_trajectory(
+    h: *const OndriveTracker,
+    out: *mut OndriveVec3,
+    capacity: usize,
+) -> usize {
+    guarded(0, || {
+        if h.is_null() {
+            set_last_error("null tracker handle");
+            return 0;
+        }
+        let plan = unsafe { (*h).tracker.predicted_trajectory() };
+        if !out.is_null() {
+            for (i, p) in plan.iter().take(capacity).enumerate() {
+                unsafe { ptr::write(out.add(i), point_to_vec3(*p)) };
+            }
+        }
+        clear_last_error();
+        plan.len()
+    })
 }

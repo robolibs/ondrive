@@ -17,6 +17,8 @@ use std::f64::consts::PI;
 #[derive(Clone, Debug, Default)]
 pub struct PoseRegulatorFollower {
     pub base: ControllerBase,
+    /// Driving direction chosen for the goal it belongs to.
+    direction: Option<((f64, f64, f64), f64)>,
 }
 
 impl PoseRegulatorFollower {
@@ -94,14 +96,23 @@ impl Controller for PoseRegulatorFollower {
 
         let theta = normalize_angle(yaw - goal_yaw);
         let mut alpha = normalize_angle(dy.atan2(dx) - yaw);
-        let mut direction = 1.0;
-        if allow_reverse && alpha.abs() > PI / 2.0 {
-            direction = -1.0;
+        let key = (goal.target_pose.point.x, goal.target_pose.point.y, goal_yaw);
+        let direction = match self.direction {
+            Some((k, d)) if k == key && (d > 0.0 || allow_reverse) => d,
+            _ => {
+                let d = if allow_reverse && alpha.abs() > PI / 2.0 { -1.0 } else { 1.0 };
+                self.direction = Some((key, d));
+                d
+            }
+        };
+        if direction < 0.0 {
             alpha = normalize_angle(alpha + PI);
         }
         let beta = normalize_angle(-theta - alpha);
-        let v = direction * (k_rho * rho).min(constraints.max_linear_velocity.abs());
-        let omega = k_alpha * alpha + k_beta * beta;
+        let wanted = k_rho * rho;
+        let scale = if wanted > 1e-9 { (constraints.max_linear_velocity.abs() / wanted).min(1.0) } else { 1.0 };
+        let v = direction * wanted * scale;
+        let omega = (k_alpha * alpha + k_beta * beta) * scale;
         self.base.status.mode = if direction > 0.0 { "regulating".into() } else { "regulating_reverse".into() };
         finalize(v, omega, constraints, &cfg, allow_reverse, "Regulating to pose")
     }

@@ -4,6 +4,7 @@
 
 use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
+    path_to_body,
     can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, holonomic_point_command,
     is_ackermann, is_holonomic, path_speed, reverse_allowed, steering_limit, steering_to_curvature,
     wheelbase,
@@ -16,12 +17,27 @@ use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, Wo
 use datapod::Point;
 use std::f64::consts::PI;
 
-const SOFTENING_VELOCITY: f64 = 0.5;
 const SEARCH_WINDOW: usize = 64;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct StanleyConfig {
+    /// Speed (m/s) added under the cross-track term so it stays bounded
+    /// at low speed.
+    pub k_soft: f64,
+    /// Gain on the gap between the path's yaw rate and the measured one.
+    pub k_yaw_rate: f64,
+}
+
+impl Default for StanleyConfig {
+    fn default() -> Self {
+        Self { k_soft: 0.5, k_yaw_rate: 0.0 }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct StanleyFollower {
     pub base: ControllerBase,
+    pub stanley_config: StanleyConfig,
     cum: Vec<f64>,
     started: bool,
 }
@@ -95,6 +111,15 @@ impl StanleyFollower {
 }
 
 impl Controller for StanleyFollower {
+    fn params(&self) -> serde_json::Value {
+        serde_json::to_value(&self.stanley_config).unwrap_or_default()
+    }
+
+    fn set_params(&mut self, params: &serde_json::Value) -> Result<(), String> {
+        self.stanley_config = crate::controller::merged(&self.stanley_config, params)?;
+        Ok(())
+    }
+
     fn compute_control(
         &mut self,
         state: &RobotState,
@@ -169,16 +194,18 @@ impl Controller for StanleyFollower {
                 cfg.kp_linear,
                 constraints,
             );
-            // Strafe directly against the lateral error (positive = robot
-            // left of the path, so a negative vy pulls it back on line).
-            let lateral = -cfg.k_cross_track * proj.lateral_error;
+            let (vx, vy) = path_to_body(forward, -cfg.k_cross_track * proj.lateral_error, proj.heading, yaw);
             let omega = cfg.kp_angular.max(0.1) * theta_e;
-            return finalize_holonomic(forward, lateral, omega, constraints, &cfg, "Following path");
+            return finalize_holonomic(vx, vy, omega, constraints, &cfg, "Following path");
         }
 
         let mut theta_e = normalize_angle(proj.heading - yaw);
         let mut direction = 1.0;
-        if allow_reverse && theta_e.abs() > PI / 2.0 {
+        let reverse = match crate::core::path::direction_at(&self.base.path.speeds, &proj) {
+            Some(d) => allow_reverse && d < 0,
+            None => allow_reverse && theta_e.abs() > PI / 2.0,
+        };
+        if reverse {
             direction = -1.0;
             let rear = Point::new(
                 state.pose.point.x - rear_offset * c,
@@ -218,9 +245,13 @@ impl Controller for StanleyFollower {
             )
             * heading_speed_scale(theta_e, constraints);
 
-        let cross_term = (-cfg.k_cross_track * proj.lateral_error)
-            .atan2(SOFTENING_VELOCITY + v.abs());
-        let raw = cfg.k_heading * theta_e + cross_term;
+        let sc = &self.stanley_config;
+        let speed = if state.velocity_valid { state.velocity.linear.abs() } else { v.abs() };
+        let cross_term = (-cfg.k_cross_track * proj.lateral_error).atan2(sc.k_soft.max(1e-3) + speed);
+        let mut raw = cfg.k_heading * theta_e + cross_term;
+        if state.velocity_valid && sc.k_yaw_rate != 0.0 {
+            raw += sc.k_yaw_rate * (v * kappa_path - state.velocity.angular);
+        }
 
         let omega = if ackermann {
             let dmax = steering_limit(constraints);

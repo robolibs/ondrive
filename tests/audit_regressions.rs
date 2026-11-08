@@ -180,6 +180,7 @@ fn teb_avoids_obstacle_on_its_path() {
         obstacles: vec![Obstacle {
             id: 0,
             radius: 0.3,
+            dt: 0.0,
             modes: vec![GaussianMode {
                 weight: 1.0,
                 mean_x: vec![5.0],
@@ -264,6 +265,7 @@ fn dwa_escapes_from_inside_the_obstacle_margin() {
         obstacles: vec![Obstacle {
             id: 0,
             radius: 0.3,
+            dt: 0.0,
             modes: vec![GaussianMode {
                 weight: 1.0,
                 mean_x: vec![-0.75],
@@ -433,6 +435,7 @@ fn obstacle_world(x: f64, y: f64) -> WorldConstraints {
         obstacles: vec![Obstacle {
             id: 0,
             radius: 0.3,
+            dt: 0.0,
             modes: vec![GaussianMode {
                 weight: 1.0,
                 mean_x: vec![x; 40],

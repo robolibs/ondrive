@@ -27,7 +27,11 @@ pub struct Velocity {
 #[derive(Clone, Debug, Default)]
 pub struct RobotState {
     pub pose: Pose,
+    /// Measured body velocity; read only when `velocity_valid` is set.
     pub velocity: Velocity,
+    /// True when `velocity` is a measurement (a measured 0 is a standstill);
+    /// false makes controllers carry on from their last command instead.
+    pub velocity_valid: bool,
     pub timestamp: f64,
     pub allow_reverse: bool,
     pub turn_first: bool,
@@ -37,6 +41,9 @@ pub struct RobotState {
 #[derive(Clone, Debug, Default)]
 pub struct Path {
     pub waypoints: Vec<Pose>,
+    /// Optional signed speed of the motion arriving at each waypoint:
+    /// negative where the path is driven in reverse. A cusp is the last
+    /// waypoint before the sign changes.
     pub speeds: Vec<f64>,
     /// A loop: `Tracker` drives it lap after lap, closing it from the last
     /// waypoint back to the first, and it never completes. A controller used
@@ -132,10 +139,17 @@ pub struct GaussianMode {
     pub std_y: Vec<f64>,
 }
 
+/// A predicted obstacle: a disc of `radius` whose centre follows a Gaussian
+/// mixture over time. Each mode lists one mean and spread per prediction
+/// step, step 0 being now.
 #[derive(Clone, Debug, Default)]
 pub struct Obstacle {
     pub id: u64,
     pub radius: f64,
+    /// Seconds between prediction steps; 0 uses each controller's own
+    /// planning step. Past the last step the prediction carries on at its
+    /// last velocity with its spread still growing.
+    pub dt: f64,
     pub modes: Vec<GaussianMode>,
 }
 
@@ -171,6 +185,40 @@ impl Default for OutputUnits {
     fn default() -> Self {
         OutputUnits::Physical
     }
+}
+
+/// How much of its internals a controller records each tick for display.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DebugLevel {
+    #[default]
+    Off,
+    /// Guides: the detours round obstacles the controller steers by.
+    Basic,
+    /// Guides and a share of the trajectories it sampled or solved, with
+    /// their costs.
+    Full,
+}
+
+impl DebugLevel {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "off" | "none" | "" => Some(Self::Off),
+            "basic" => Some(Self::Basic),
+            "full" | "all" => Some(Self::Full),
+            _ => None,
+        }
+    }
+}
+
+/// A controller's internals from its last tick, for display.
+#[derive(Clone, Debug, Default)]
+pub struct DebugFrame {
+    /// Trajectories the controller sampled or solved, in the world frame.
+    pub rollouts: Vec<Vec<Point>>,
+    /// Cost of each rollout, lower better.
+    pub costs: Vec<f64>,
+    /// Paths that guided the controller round obstacles.
+    pub guides: Vec<Vec<Point>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -417,56 +465,31 @@ impl OccupancyGrid {
         g
     }
 
-    /// Recompute the distance field after editing `occupied`.
+    /// Recompute the distance field after editing `occupied`: the exact
+    /// Euclidean distance between cell centres (Felzenszwalb–Huttenlocher).
     pub fn rebuild_distance_field(&mut self) {
+        const FAR: f64 = 1e20;
         let (w, h) = (self.width, self.height);
-        let inf = f32::INFINITY;
-        let mut d = vec![inf; w * h];
-        for (i, occ) in self.occupied.iter().enumerate() {
-            if *occ {
-                d[i] = 0.0;
+        let mut d: Vec<f64> = self.occupied.iter().map(|o| if *o { 0.0 } else { FAR }).collect();
+        let mut column = vec![0.0; h];
+        for x in 0..w {
+            for y in 0..h {
+                column[y] = d[y * w + x];
+            }
+            let out = squared_distance_1d(&column);
+            for y in 0..h {
+                d[y * w + x] = out[y];
             }
         }
-        // Two-pass chamfer (3-4 mask) distance transform in cell units.
-        let idx = |x: usize, y: usize| y * w + x;
         for y in 0..h {
-            for x in 0..w {
-                let mut best = d[idx(x, y)];
-                if x > 0 {
-                    best = best.min(d[idx(x - 1, y)] + 3.0);
-                }
-                if y > 0 {
-                    best = best.min(d[idx(x, y - 1)] + 3.0);
-                    if x > 0 {
-                        best = best.min(d[idx(x - 1, y - 1)] + 4.0);
-                    }
-                    if x + 1 < w {
-                        best = best.min(d[idx(x + 1, y - 1)] + 4.0);
-                    }
-                }
-                d[idx(x, y)] = best;
-            }
+            let out = squared_distance_1d(&d[y * w..(y + 1) * w]);
+            d[y * w..(y + 1) * w].copy_from_slice(&out);
         }
-        for y in (0..h).rev() {
-            for x in (0..w).rev() {
-                let mut best = d[idx(x, y)];
-                if x + 1 < w {
-                    best = best.min(d[idx(x + 1, y)] + 3.0);
-                }
-                if y + 1 < h {
-                    best = best.min(d[idx(x, y + 1)] + 3.0);
-                    if x + 1 < w {
-                        best = best.min(d[idx(x + 1, y + 1)] + 4.0);
-                    }
-                    if x > 0 {
-                        best = best.min(d[idx(x - 1, y + 1)] + 4.0);
-                    }
-                }
-                d[idx(x, y)] = best;
-            }
-        }
-        let scale = self.resolution as f32 / 3.0;
-        self.distance = d.into_iter().map(|v| v * scale).collect();
+        let res = self.resolution;
+        self.distance = d
+            .into_iter()
+            .map(|s| if s >= 0.5 * FAR { f32::INFINITY } else { (s.sqrt() * res) as f32 })
+            .collect();
     }
 
     fn cell(&self, x: f64, y: f64) -> Option<(usize, usize)> {
@@ -484,10 +507,14 @@ impl OccupancyGrid {
 
     /// Distance from `(x, y)` to the nearest occupied cell centre,
     /// bilinearly interpolated between cell centres so it is continuous;
-    /// infinity outside the grid or when the grid is empty.
+    /// negative inside an occupied cell; infinity outside the grid or when
+    /// the grid is empty.
     pub fn distance_to_occupied(&self, x: f64, y: f64) -> f64 {
         if self.distance.is_empty() || self.cell(x, y).is_none() {
             return f64::INFINITY;
+        }
+        if self.is_occupied(x, y) {
+            return -0.5 * self.resolution;
         }
         let fx = (x - self.origin_x) / self.resolution - 0.5;
         let fy = (y - self.origin_y) / self.resolution - 0.5;
@@ -509,4 +536,50 @@ impl OccupancyGrid {
         let bottom = d01 + tx * (d11 - d01);
         top + ty * (bottom - top)
     }
+}
+
+/// Squared distance of each cell to the nearest zero of `f` along one line,
+/// as the lower envelope of parabolas rooted at each cell.
+fn squared_distance_1d(f: &[f64]) -> Vec<f64> {
+    let n = f.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut v = vec![0usize; n];
+    let mut z = vec![0.0; n + 1];
+    let mut k = 0usize;
+    z[0] = f64::NEG_INFINITY;
+    z[1] = f64::INFINITY;
+    for q in 1..n {
+        let qf = q as f64;
+        let mut s;
+        loop {
+            let vk = v[k] as f64;
+            s = ((f[q] + qf * qf) - (f[v[k]] + vk * vk)) / (2.0 * qf - 2.0 * vk);
+            if s <= z[k] && k > 0 {
+                k -= 1;
+            } else {
+                break;
+            }
+        }
+        if s <= z[k] {
+            v[k] = q;
+            z[k + 1] = f64::INFINITY;
+            continue;
+        }
+        k += 1;
+        v[k] = q;
+        z[k] = s;
+        z[k + 1] = f64::INFINITY;
+    }
+    let mut out = vec![0.0; n];
+    k = 0;
+    for (q, o) in out.iter_mut().enumerate() {
+        while z[k + 1] < q as f64 {
+            k += 1;
+        }
+        let dq = q as f64 - v[k] as f64;
+        *o = dq * dq + f[v[k]];
+    }
+    out
 }

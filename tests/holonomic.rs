@@ -17,6 +17,12 @@ use ondrive::{
 };
 use std::f64::consts::{FRAC_PI_2, PI};
 
+/// `c` with its sampling seeded, so a run repeats exactly.
+fn seeded<C: Controller>(mut c: C, seed: u64) -> C {
+    c.set_seed(seed);
+    c
+}
+
 fn pose(x: f64, y: f64, yaw: f64) -> Pose {
     Pose {
         point: Point::new(x, y, 0.0),
@@ -336,6 +342,7 @@ fn dwa_holonomic_sidesteps_an_obstacle_directly_ahead() {
         obstacles: vec![Obstacle {
             id: 0,
             radius: 0.3,
+            dt: 0.0,
             modes: vec![GaussianMode { weight: 1.0, mean_x: vec![3.0], mean_y: vec![0.0], std_x: vec![0.05], std_y: vec![0.05] }],
         }],
         ..Default::default()
@@ -380,17 +387,17 @@ fn ilqr_holonomic_tracks_while_perpendicular_to_the_path() {
 
 #[test]
 fn mppi_holonomic_tracks_while_perpendicular_to_the_path() {
-    assert_tracks_while_perpendicular_slow_start(MppiFollower::new(), "mppi");
+    assert_tracks_while_perpendicular_slow_start(seeded(MppiFollower::new(), 11), "mppi");
 }
 
 #[test]
 fn mca_holonomic_tracks_while_perpendicular_to_the_path() {
-    assert_tracks_while_perpendicular_slow_start(McaFollower::new(), "mca");
+    assert_tracks_while_perpendicular_slow_start(seeded(McaFollower::new(), 12), "mca");
 }
 
 #[test]
 fn soc_holonomic_tracks_while_perpendicular_to_the_path() {
-    assert_tracks_while_perpendicular_slow_start(SocFollower::new(), "soc");
+    assert_tracks_while_perpendicular_slow_start(seeded(SocFollower::new(), 13), "soc");
 }
 
 #[test]
@@ -412,9 +419,9 @@ fn predictive_family_commands_nonzero_lateral_velocity_when_perpendicular() {
     let cases: Vec<(&str, Box<dyn Controller>)> = vec![
         ("mpc", Box::new(MpcFollower::new())),
         ("ilqr", Box::new(IlqrFollower::new())),
-        ("mppi", Box::new(MppiFollower::new())),
-        ("mca", Box::new(McaFollower::new())),
-        ("soc", Box::new(SocFollower::new())),
+        ("mppi", Box::new(seeded(MppiFollower::new(), 11))),
+        ("mca", Box::new(seeded(McaFollower::new(), 12))),
+        ("soc", Box::new(seeded(SocFollower::new(), 13))),
         ("teb", Box::new(TebFollower::new())),
     ];
     for (name, mut ctrl) in cases {

@@ -6,6 +6,8 @@
 //! zero otherwise, so the solve is identical to the two-control case.
 
 use crate::controller::{Controller, ControllerBase};
+use crate::core::kinematics::planning_step;
+use crate::core::obstacles::{CollisionChecker, footprint_discs, obstacle_barrier};
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
     CostWeights, Model, Reference, build_reference, build_timed_reference, command_from_controls,
@@ -13,7 +15,8 @@ use crate::pred::mppi::{
     update_turn_in_place,
 };
 use crate::types::{
-    Goal, Path, RobotConstraints, RobotState, Trajectory, VelocityCommand, WorldConstraints,
+    DebugFrame, DebugLevel, Goal, Obstacle, Path, RobotConstraints, RobotState, Trajectory, VelocityCommand,
+    WorldConstraints,
 };
 use datapod::Point;
 
@@ -21,7 +24,7 @@ const MAX_ITERATIONS: usize = 20;
 const LINE_SEARCH_STEPS: usize = 6;
 const FD_EPS: f64 = 1e-4;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct MpcConfig {
     pub horizon_steps: usize,
     pub dt: f64,
@@ -42,13 +45,19 @@ pub struct MpcConfig {
     /// Distance along the path from the end at which `ref_velocity` starts
     /// tapering linearly to zero. Set to 0.0 to disable.
     pub approach_taper_distance: f64,
+
+    /// Obstacle barrier `weight_obstacle · exp(−clearance / obstacle_scale)`
+    /// at each step against the obstacles predicted for that step's time
+    /// and the grid; 0 ignores obstacles.
+    pub weight_obstacle: f64,
+    pub obstacle_scale: f64,
 }
 
 impl Default for MpcConfig {
     fn default() -> Self {
         Self {
-            horizon_steps: 10,
-            dt: 0.1,
+            horizon_steps: 20,
+            dt: 0.15,
             weight_cte: 100.0,
             weight_epsi: 100.0,
             weight_vel: 50.0,
@@ -60,6 +69,8 @@ impl Default for MpcConfig {
             turn_first_activation_deg: 60.0,
             turn_first_release_deg: 15.0,
             approach_taper_distance: 2.0,
+            weight_obstacle: 300.0,
+            obstacle_scale: 0.3,
         }
     }
 }
@@ -76,7 +87,14 @@ pub struct MpcFollower {
     is_turning_in_place: bool,
     last_v: f64,
     last_vy: f64,
+    /// Steering the machine has reached, from the commands sent through
+    /// its rate limit; `None` until the first command.
+    actuated: Option<f64>,
+    debug_level: DebugLevel,
+    debug: DebugFrame,
     shift_accum: f64,
+    /// Side obstacles were last passed on: +1 left, −1 right, 0 none.
+    side: f64,
     trajectory: Option<Trajectory>,
     clock: f64,
 }
@@ -87,16 +105,62 @@ impl Default for MpcFollower {
     }
 }
 
+type StageExtra<'a> = dyn Fn(usize, f64, f64, f64) -> f64 + 'a;
+
+/// Steering, acceleration and lateral acceleration over the horizon.
+type Controls = (Vec<f64>, Vec<f64>, Vec<f64>);
+
+/// Extra room the detour guides keep from an obstacle, metres.
+pub(crate) const DETOUR_MARGIN: f64 = 0.25;
+/// Steps over which a detour guide moves aside and back.
+pub(crate) const DETOUR_RAMP: usize = 6;
+/// Cost factor of passing obstacles on the other side than last tick.
+pub(crate) const SIDE_SWITCH_COST: f64 = 1.15;
+/// The points of a reference, as a path.
+pub(crate) fn reference_path(r: &Reference) -> Vec<Point> {
+    (0..r.x.len()).map(|i| Point::new(r.x[i], r.y[i], 0.0)).collect()
+}
+
+/// Lateral and heading weight scale where a detour leaves the reference.
+pub(crate) const DETOURED_WEIGHT: f64 = 0.1;
+
+/// The steering reached `dt` after commanding `command` from `previous`
+/// (the model's starting steering before any command), through the
+/// model's steering rate and lock.
+pub(crate) fn actuated_after(model: &Model, previous: Option<f64>, command: f64, dt: f64) -> f64 {
+    let sb = model.steer_bound();
+    let from = previous.unwrap_or(model.steer0).clamp(-sb, sb);
+    let step = if model.steer_rate.is_finite() { model.steer_rate * dt } else { f64::INFINITY };
+    (from + (command.clamp(-sb, sb) - from).clamp(-step, step)).clamp(-sb, sb)
+}
+
+/// The references to solve against, each with the side it passes
+/// obstacles on (0 the reference itself): `reference` and its detours
+/// round the obstacles on either side (not those crossing the path, which
+/// the barrier has it give way to), `reference` relaxed where they
+/// leave it (topology-guided MPC, de Groot et al. 2024).
+pub(crate) fn guided(reference: &mut Reference, obstacles: &[Obstacle], reach: f64, dt: f64) -> Vec<(Reference, f64)> {
+    let obstacles = crate::pred::mppi::to_go_round(obstacles, reference, dt);
+    let detours: Vec<(Reference, f64)> = [1.0, -1.0]
+        .into_iter()
+        .filter_map(|side| reference.detour(&obstacles, reach + DETOUR_MARGIN, dt, side, DETOUR_RAMP).map(|r| (r, side)))
+        .collect();
+    reference.relax_where_detoured(detours.iter().map(|d| &d.0), DETOURED_WEIGHT);
+    std::iter::once((reference.clone(), 0.0)).chain(detours).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn total_cost(
     model: &Model,
     reference: &Reference,
     w: &CostWeights,
     cfg: &MpcConfig,
+    extra: &StageExtra,
     steer: &[f64],
     accel: &[f64],
     accel_lat: &[f64],
 ) -> f64 {
-    let (mut c, _) = rollout(model, steer, accel, accel_lat, reference, w, &|_, _, _, _| 0.0, false);
+    let (mut c, _) = rollout(model, steer, accel, accel_lat, reference, w, extra, false);
     for i in 1..steer.len() {
         let ds = steer[i] - steer[i - 1];
         let da = accel[i] - accel[i - 1];
@@ -125,7 +189,11 @@ impl MpcFollower {
             is_turning_in_place: false,
             last_v: 0.0,
             last_vy: 0.0,
+            actuated: None,
+            debug_level: DebugLevel::Off,
+            debug: DebugFrame::default(),
             shift_accum: 0.0,
+            side: 0.0,
             trajectory: None,
             clock: 0.0,
             mpc_config: cfg,
@@ -151,13 +219,14 @@ impl MpcFollower {
         reference: &Reference,
         w: &CostWeights,
         cfg: &MpcConfig,
+        extra: &StageExtra,
         steer: &mut [f64],
         accel: &mut [f64],
         accel_lat: &mut [f64],
     ) -> bool {
         let n = steer.len();
         model.clamp_controls(steer, accel, accel_lat);
-        let mut best = total_cost(model, reference, w, cfg, steer, accel, accel_lat);
+        let mut best = total_cost(model, reference, w, cfg, extra, steer, accel, accel_lat);
         if !best.is_finite() {
             return false;
         }
@@ -175,26 +244,26 @@ impl MpcFollower {
             for i in 0..n {
                 let o = steer[i];
                 steer[i] = o + FD_EPS;
-                let cp = total_cost(model, reference, w, cfg, steer, accel, accel_lat);
+                let cp = total_cost(model, reference, w, cfg, extra, steer, accel, accel_lat);
                 steer[i] = o - FD_EPS;
-                let cm = total_cost(model, reference, w, cfg, steer, accel, accel_lat);
+                let cm = total_cost(model, reference, w, cfg, extra, steer, accel, accel_lat);
                 steer[i] = o;
                 grad_s[i] = (cp - cm) / (2.0 * FD_EPS);
 
                 let o = accel[i];
                 accel[i] = o + FD_EPS;
-                let cp = total_cost(model, reference, w, cfg, steer, accel, accel_lat);
+                let cp = total_cost(model, reference, w, cfg, extra, steer, accel, accel_lat);
                 accel[i] = o - FD_EPS;
-                let cm = total_cost(model, reference, w, cfg, steer, accel, accel_lat);
+                let cm = total_cost(model, reference, w, cfg, extra, steer, accel, accel_lat);
                 accel[i] = o;
                 grad_a[i] = (cp - cm) / (2.0 * FD_EPS);
 
                 if bound_al > 1e-6 {
                     let o = accel_lat[i];
                     accel_lat[i] = o + FD_EPS;
-                    let cp = total_cost(model, reference, w, cfg, steer, accel, accel_lat);
+                    let cp = total_cost(model, reference, w, cfg, extra, steer, accel, accel_lat);
                     accel_lat[i] = o - FD_EPS;
-                    let cm = total_cost(model, reference, w, cfg, steer, accel, accel_lat);
+                    let cm = total_cost(model, reference, w, cfg, extra, steer, accel, accel_lat);
                     accel_lat[i] = o;
                     grad_al[i] = (cp - cm) / (2.0 * FD_EPS);
                 }
@@ -217,7 +286,7 @@ impl MpcFollower {
                     cand_al[i] = accel_lat[i] - step * grad_al[i];
                 }
                 model.clamp_controls(&mut cand_s, &mut cand_a, &mut cand_al);
-                let c = total_cost(model, reference, w, cfg, &cand_s, &cand_a, &cand_al);
+                let c = total_cost(model, reference, w, cfg, extra, &cand_s, &cand_a, &cand_al);
                 if c.is_finite() && c < best {
                     best = c;
                     steer.copy_from_slice(&cand_s);
@@ -237,13 +306,32 @@ impl MpcFollower {
 }
 
 impl Controller for MpcFollower {
+    fn params(&self) -> serde_json::Value {
+        serde_json::to_value(&self.mpc_config).unwrap_or_default()
+    }
+
+    fn set_params(&mut self, params: &serde_json::Value) -> Result<(), String> {
+        let cfg = crate::controller::merged(&self.mpc_config, params)?;
+        self.set_mpc_config(cfg);
+        Ok(())
+    }
+
+    fn set_debug(&mut self, level: DebugLevel) {
+        self.debug_level = level;
+        self.debug = DebugFrame::default();
+    }
+
+    fn debug_frame(&self) -> DebugFrame {
+        self.debug.clone()
+    }
+
     fn compute_control(
         &mut self,
         state: &RobotState,
         goal: &Goal,
         constraints: &RobotConstraints,
         dt: f64,
-        _world: Option<&WorldConstraints>,
+        world: Option<&WorldConstraints>,
     ) -> VelocityCommand {
         let prep = match prepare(&mut self.base, &mut self.cursor, state, goal, constraints, dt) {
             Ok(p) => p,
@@ -253,6 +341,7 @@ impl Controller for MpcFollower {
             }
         };
         let mut cfg = self.mpc_config.clone();
+        cfg.dt = planning_step(constraints, cfg.ref_velocity.min(constraints.max_linear_velocity), cfg.horizon_steps, cfg.dt);
         let turning = update_turn_in_place(
             &mut self.is_turning_in_place,
             state,
@@ -274,8 +363,11 @@ impl Controller for MpcFollower {
 
         let v_now = current_speed(state, self.last_v);
         let vy_now = current_lateral_speed(state, self.last_vy);
-        let model = Model::new(state, constraints, v_now, vy_now, cfg.dt, prep.allow_reverse);
-        let reference = match &self.trajectory {
+        let mut model = Model::new(state, constraints, v_now, vy_now, cfg.dt, prep.allow_reverse);
+        if model.ackermann && model.steer_rate.is_finite() && let Some(a) = self.actuated {
+            model.steer0 = a;
+        }
+        let mut reference = match &self.trajectory {
             Some(traj) => build_timed_reference(traj, self.clock, n, cfg.dt),
             None => build_reference(
                 &self.base.path,
@@ -293,33 +385,66 @@ impl Controller for MpcFollower {
             vel: cfg.weight_vel,
             steering: cfg.weight_steering,
             accel: cfg.weight_acceleration,
+            progress: 0.0,
         };
 
-        let mut steer = self.previous_steering.clone();
-        let mut accel = self.previous_acceleration.clone();
-        let mut accel_lat = self.previous_accel_lateral.clone();
-        if !self.solve(&model, &reference, &w, &cfg, &mut steer, &mut accel, &mut accel_lat) {
+        let discs = footprint_discs(constraints);
+        let obstacles: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
+        let reach = discs.iter().map(|d| d.1).fold(0.0_f64, f64::max);
+        let checker = CollisionChecker::new(world, constraints, 0.0);
+        let grid = world.is_some_and(|w| w.grid.is_some());
+        let (step_dt, weight, scale) = (cfg.dt, cfg.weight_obstacle, cfg.obstacle_scale);
+        let barrier = |i: usize, x: f64, y: f64, yaw: f64| -> f64 {
+            let t = (i + 1) as f64 * step_dt;
+            let mut c = obstacle_barrier(obstacles, &discs, t, step_dt, 1.0, (x, y, yaw), weight, scale).cost;
+            if grid && weight > 0.0 && scale > 0.0 {
+                c += weight * (-checker.grid_clearance(x, y, yaw) / scale).min(30.0).exp();
+            }
+            c
+        };
+
+        let guides = guided(&mut reference, obstacles, reach, cfg.dt);
+        let mut best: Option<(f64, f64, Controls)> = None;
+        let mut tried: Vec<(Vec<Point>, f64)> = Vec::new();
+        if self.debug_level >= DebugLevel::Basic {
+            self.debug.guides = guides.iter().skip(1).map(|(g, _)| reference_path(g)).collect();
+        }
+        for (guide, side) in &guides {
+            let mut steer = self.previous_steering.clone();
+            let mut accel = self.previous_acceleration.clone();
+            let mut accel_lat = self.previous_accel_lateral.clone();
+            if !self.solve(&model, guide, &w, &cfg, &barrier, &mut steer, &mut accel, &mut accel_lat) {
+                continue;
+            }
+            let switch = *side != 0.0 && self.side != 0.0 && *side != self.side;
+            let c = total_cost(&model, &reference, &w, &cfg, &barrier, &steer, &accel, &accel_lat)
+                * if switch { SIDE_SWITCH_COST } else { 1.0 };
+            if self.debug_level == DebugLevel::Full {
+                let (_, path) = rollout(&model, &steer, &accel, &accel_lat, &reference, &w, &barrier, true);
+                tried.push((path, c));
+            }
+            if best.as_ref().is_none_or(|b| c < b.0) {
+                best = Some((c, *side, (steer, accel, accel_lat)));
+            }
+        }
+        if self.debug_level == DebugLevel::Full {
+            (self.debug.rollouts, self.debug.costs) = tried.into_iter().unzip();
+        }
+        let Some((_, side, (mut steer, mut accel, mut accel_lat))) = best else {
             return VelocityCommand::invalid("MPC optimizer failed");
+        };
+        if side != 0.0 || guides.len() == 1 {
+            self.side = side;
         }
 
-        let (_, traj) = rollout(&model, &steer, &accel, &accel_lat, &reference, &w, &|_, _, _, _| 0.0, true);
+        let (_, traj) = rollout(&model, &steer, &accel, &accel_lat, &reference, &w, &barrier, true);
         self.predicted_trajectory = traj;
 
         let steer0 = steer[0];
+        self.actuated = Some(actuated_after(&model, self.actuated, steer0, dt));
         let accel0 = accel[0];
         let accel_lat0 = accel_lat[0];
-        self.shift_accum += dt;
-        if self.shift_accum >= cfg.dt {
-            self.shift_accum -= cfg.dt;
-            steer.rotate_left(1);
-            accel.rotate_left(1);
-            accel_lat.rotate_left(1);
-            if n > 1 {
-                steer[n - 1] = steer[n - 2];
-                accel[n - 1] = accel[n - 2];
-                accel_lat[n - 1] = accel_lat[n - 2];
-            }
-        }
+        crate::pred::mppi::shift_warm_start(&mut self.shift_accum, dt, cfg.dt, [&mut steer, &mut accel, &mut accel_lat]);
         self.previous_steering = steer;
         self.previous_acceleration = accel;
         self.previous_accel_lateral = accel_lat;
@@ -371,12 +496,14 @@ impl Controller for MpcFollower {
         self.predicted_trajectory.clear();
         self.is_turning_in_place = false;
         self.shift_accum = 0.0;
+        self.side = 0.0;
     }
 
     fn reset(&mut self) {
         self.set_path(Path::default());
         self.last_v = 0.0;
         self.last_vy = 0.0;
+        self.actuated = None;
     }
 
     fn get_type(&self) -> &'static str {

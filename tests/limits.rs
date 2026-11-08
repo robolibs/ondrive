@@ -92,8 +92,10 @@ fn the_tracker_holds_the_speed_to_the_zone_limit() {
             };
             let mut inside = state(4.0, 0.05, 0.0);
             inside.velocity.linear = 1.0;
+            inside.velocity_valid = true;
             let mut outside = state(1.0, 0.05, 0.0);
             outside.velocity.linear = 1.0;
+            outside.velocity_valid = true;
             let fast = t.tick(&outside, 0.05, Some(&world));
             let slow = t.tick(&inside, 0.05, Some(&world));
             assert!(slow.valid && fast.valid, "{kind:?}");
@@ -206,4 +208,72 @@ fn the_tracker_limits_how_fast_the_steering_angle_changes() {
             );
         }
     }
+}
+
+#[test]
+fn the_tracker_holds_commands_to_the_acceleration_limits() {
+    let mut path = line(3.0);
+    for i in 1..=30 {
+        path.waypoints.push(pose(3.0, i as f64 * 0.1, std::f64::consts::FRAC_PI_2));
+    }
+    for kind in [TrackerKind::PurePursuit, TrackerKind::Pid, TrackerKind::Stanley, TrackerKind::Mpc] {
+        let mut t = Tracker::new(kind);
+        t.init(RobotConstraints {
+            steering_type: SteeringType::Differential,
+            max_linear_velocity: 1.0,
+            max_angular_velocity: 2.0,
+            max_linear_acceleration: 0.5,
+            max_angular_acceleration: 1.0,
+            ..Default::default()
+        });
+        t.set_path(path.clone());
+        let mut s = state(0.0, 0.3, 0.0);
+        let dt = 0.05;
+        let (mut pv, mut pw) = (0.0_f64, 0.0_f64);
+        for i in 0..200 {
+            let cmd = t.tick(&s, dt, None);
+            assert!(cmd.valid, "{kind:?}: {}", cmd.status_message);
+            let stop = cmd.linear_velocity == 0.0 && cmd.angular_velocity == 0.0;
+            if i > 0 && !stop {
+                assert!((cmd.linear_velocity - pv).abs() <= 0.5 * dt + 1e-9, "{kind:?}: Δv {:.4}", cmd.linear_velocity - pv);
+                assert!((cmd.angular_velocity - pw).abs() <= 1.0 * dt + 1e-9, "{kind:?}: Δω {:.4}", cmd.angular_velocity - pw);
+            }
+            (pv, pw) = (cmd.linear_velocity, cmd.angular_velocity);
+            let yaw = s.pose.rotation.to_euler().yaw;
+            s.pose.point.x += cmd.linear_velocity * yaw.cos() * dt;
+            s.pose.point.y += cmd.linear_velocity * yaw.sin() * dt;
+            s.pose.rotation = Quaternion::from_euler(Euler::new(0.0, 0.0, yaw + cmd.angular_velocity * dt));
+        }
+    }
+}
+
+#[test]
+fn a_car_keeps_its_steering_angle_while_standing() {
+    let mut t = Tracker::new(TrackerKind::PurePursuit);
+    t.init(RobotConstraints {
+        steering_type: SteeringType::Ackermann,
+        wheelbase: 0.5,
+        max_steering_angle: 0.6,
+        min_turning_radius: 0.0,
+        max_angular_velocity: 3.0,
+        ..Default::default()
+    });
+    let mut path = line(1.0);
+    for i in 1..=20 {
+        path.waypoints.push(pose(1.0, i as f64 * 0.1, std::f64::consts::FRAC_PI_2));
+    }
+    t.set_path(path);
+    let moving = state(0.6, 0.0, 0.0);
+    let mut steering = 0.0;
+    for _ in 0..20 {
+        steering = t.tick(&moving, 0.05, None).steering_angle;
+    }
+    assert!(steering.abs() > 0.05, "never steered ({steering:.3})");
+    let parked = RobotState { allow_move: true, ..moving };
+    let mut c = ondrive::ControllerConfig::default();
+    c.goal_tolerance = 5.0;
+    t.set_config(c);
+    let cmd = t.tick(&parked, 0.05, None);
+    assert_eq!(cmd.linear_velocity, 0.0);
+    assert!((cmd.steering_angle - steering).abs() < 1e-9, "steering snapped from {steering:.3} to {:.3}", cmd.steering_angle);
 }

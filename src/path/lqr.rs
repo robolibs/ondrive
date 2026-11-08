@@ -8,6 +8,7 @@
 
 use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
+    path_to_body,
     can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, is_holonomic,
     path_speed, reverse_allowed,
 };
@@ -133,10 +134,22 @@ impl Controller for LqrFollower {
                 cfg.kp_linear,
                 constraints,
             );
-            let lateral = -cfg.k_cross_track.max(1e-6) * e_lat;
+            let (vx, vy) = path_to_body(forward, -cfg.k_cross_track.max(1e-6) * e_lat, proj.heading, yaw);
             let omega = cfg.kp_angular.max(0.1) * theta_e;
-            return finalize_holonomic(forward, lateral, omega, constraints, &cfg, "LQR tracking");
+            return finalize_holonomic(vx, vy, omega, constraints, &cfg, "LQR tracking");
         }
+
+        // Reversing runs the same law on a virtual vehicle facing the other
+        // way, driven forward.
+        let reverse = match crate::core::path::direction_at(&self.base.path.speeds, &proj) {
+            Some(d) => allow_reverse && d < 0,
+            None => allow_reverse && theta_e.abs() > std::f64::consts::FRAC_PI_2,
+        };
+        let (theta_e, sign) = if reverse {
+            (normalize_angle(proj.heading - yaw - std::f64::consts::PI), -1.0)
+        } else {
+            (theta_e, 1.0)
+        };
 
         if state.turn_first && can_turn_in_place(constraints.steering_type) && theta_e.abs() > ang_tol
         {
@@ -169,8 +182,8 @@ impl Controller for LqrFollower {
         let u = -k.dot(&x);
 
         let omega = v * kappa_path + u;
-        self.base.status.mode = "lqr".into();
-        finalize(v, omega, constraints, &cfg, allow_reverse, "LQR tracking")
+        self.base.status.mode = if reverse { "lqr_reverse".into() } else { "lqr".into() };
+        finalize(sign * v, omega, constraints, &cfg, allow_reverse, "LQR tracking")
     }
 
     fn set_path(&mut self, path: Path) {

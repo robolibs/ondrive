@@ -73,7 +73,7 @@ fn main() {
                 let mut cfg = ControllerConfig::default();
                 cfg.goal_tolerance = 0.3; cfg.angular_tolerance = PI; cfg.lookahead_distance = 1.0; cfg.allow_reverse = sc.reverse;
                 t.set_config(cfg); t.init(c.clone()); t.set_path(sc.path.clone());
-                let world = sc.obstacle.map(|(ox, oy)| WorldConstraints { obstacles: vec![Obstacle { id: 0, radius: 0.3, modes: vec![GaussianMode { weight: 1.0, mean_x: vec![ox; 40], mean_y: vec![oy; 40], std_x: vec![0.05; 40], std_y: vec![0.05; 40] }] }], ..Default::default() });
+                let world = sc.obstacle.map(|(ox, oy)| WorldConstraints { obstacles: vec![Obstacle { id: 0, radius: 0.3, dt: 0.0, modes: vec![GaussianMode { weight: 1.0, mean_x: vec![ox; 40], mean_y: vec![oy; 40], std_x: vec![0.05; 40], std_y: vec![0.05; 40] }] }], ..Default::default() });
                 let mut state = RobotState { pose: sc.start, allow_move: true, ..Default::default() };
                 let (mut reached, mut sim_t, mut cte_max, mut vmax, mut kviol, mut nan, mut min_obs) = (false, 0.0, 0.0f64, 0.0f64, 0usize, false, f64::MAX);
                 let end = sc.path.waypoints.last().unwrap().point;

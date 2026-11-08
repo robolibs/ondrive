@@ -26,7 +26,7 @@ const REPLAN_MIN_INTERVAL: f64 = 2.0;
 /// Extra plans allowed to refine the final orientation.
 const MAX_REFINEMENTS: usize = 6;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PoseReachConfig {
     /// Turning radius used for planning; 0 derives it from the constraints
     /// (`radius_margin / max_curvature`, or `default_radius` when unlimited).
@@ -46,6 +46,12 @@ pub struct PoseReachConfig {
     pub cusp_tolerance: f64,
     /// Heading feedback gain blended in over the final approach.
     pub k_final_heading: f64,
+    /// Planning cost of a metre driven in reverse, against 1 forward.
+    pub reverse_penalty: f64,
+    /// Planning cost of each change of direction, in metres.
+    pub cusp_penalty: f64,
+    /// Runs shorter than this (metres) cost three cusps more each.
+    pub min_run: f64,
 }
 
 impl Default for PoseReachConfig {
@@ -60,6 +66,9 @@ impl Default for PoseReachConfig {
             lookahead: 0.5,
             cusp_tolerance: 0.1,
             k_final_heading: 2.0,
+            reverse_penalty: 1.5,
+            cusp_penalty: 1.0,
+            min_run: 0.3,
         }
     }
 }
@@ -81,6 +90,8 @@ pub struct PoseReachFollower {
     goal_index: usize,
     extension_end: Option<Pose>,
     planned_for: Option<(f64, f64, f64, bool)>,
+    /// Goal the refinement count belongs to.
+    refined_for: Option<(f64, f64, f64, bool)>,
     since_replan: f64,
     replans: usize,
     refinements: usize,
@@ -146,6 +157,11 @@ impl PoseReachFollower {
     /// Number of plans computed since the last reset.
     pub fn replan_count(&self) -> usize {
         self.replans
+    }
+
+    /// Refinement attempts spent on the current goal.
+    pub fn refinement_count(&self) -> usize {
+        self.refinements
     }
 
     fn radius(&self, constraints: &RobotConstraints) -> f64 {
@@ -231,6 +247,9 @@ impl PoseReachFollower {
         } else {
             dubins_all(&state.pose, &goal.target_pose, radius, spacing)
         };
+        let mut candidates = candidates;
+        let cost = |c: &CurvePath| plan_cost(c, &self.pose_config);
+        candidates.sort_by(|a, b| cost(a).total_cmp(&cost(b)));
         let checker = CollisionChecker::new(world, constraints, 0.0);
         let curve = if checker.has_obstacles() {
             candidates.into_iter().find(|c| {
@@ -272,6 +291,16 @@ impl PoseReachFollower {
 }
 
 impl Controller for PoseReachFollower {
+    fn params(&self) -> serde_json::Value {
+        serde_json::to_value(&self.pose_config).unwrap_or_default()
+    }
+
+    fn set_params(&mut self, params: &serde_json::Value) -> Result<(), String> {
+        let cfg = crate::controller::merged(&self.pose_config, params)?;
+        self.set_pose_config(cfg);
+        Ok(())
+    }
+
     fn compute_control(
         &mut self,
         state: &RobotState,
@@ -321,6 +350,10 @@ impl Controller for PoseReachFollower {
             || self.runs.is_empty()
             || (self.since_replan >= REPLAN_MIN_INTERVAL
                 && (lateral > self.pose_config.replan_lateral || heading > self.pose_config.replan_heading));
+        if self.refined_for != Some(key) {
+            self.refined_for = Some(key);
+            self.refinements = 0;
+        }
         if needs {
             if !self.replan(state, goal, constraints, reverse, world) {
                 return VelocityCommand::invalid("no feasible curve to the goal pose");
@@ -328,9 +361,6 @@ impl Controller for PoseReachFollower {
             self.planned_for = Some(key);
             self.since_replan = 0.0;
             self.replans += 1;
-            if self.planned_for != Some(key) {
-                self.refinements = 0;
-            }
         }
 
         // Advance to the next run once the current one is finished.
@@ -339,10 +369,8 @@ impl Controller for PoseReachFollower {
             if last {
                 break;
             }
-            let end = self.runs[self.run_index].path.waypoints.last().unwrap();
             let check = check_goal(&state.pose, &self.run_goal(goal), &self.base.config);
-            let _ = end;
-            if check.position_ok {
+            if check.position_ok || self.follower.get_status().goal_reached {
                 self.run_index += 1;
                 self.load_run(goal, constraints);
             } else {
@@ -395,6 +423,10 @@ impl Controller for PoseReachFollower {
 
     fn set_path(&mut self, _path: Path) {
         self.planned_for = None;
+        self.refined_for = None;
+        self.runs.clear();
+        self.run_index = 0;
+        self.refinements = 0;
     }
 
     fn reset(&mut self) {
@@ -403,6 +435,7 @@ impl Controller for PoseReachFollower {
         self.runs.clear();
         self.run_index = 0;
         self.planned_for = None;
+        self.refined_for = None;
         self.since_replan = 0.0;
         self.replans = 0;
         self.refinements = 0;
@@ -428,4 +461,27 @@ impl Controller for PoseReachFollower {
     fn base_mut(&mut self) -> &mut ControllerBase {
         &mut self.base
     }
+}
+
+/// Planning cost of a curve: its length, reverse driving weighted by
+/// `reverse_penalty`, `cusp_penalty` per change of direction, and three
+/// cusps more for every run shorter than `min_run`.
+fn plan_cost(c: &CurvePath, cfg: &PoseReachConfig) -> f64 {
+    let mut cost = 0.0;
+    let mut run = 0.0;
+    let mut cusps = 0.0;
+    for i in 1..c.poses.len() {
+        let step = c.poses[i - 1].point.distance_to_2d(c.poses[i].point);
+        let reverse = c.directions[i] < 0;
+        cost += if reverse { cfg.reverse_penalty.max(1.0) * step } else { step };
+        if c.directions[i] != c.directions[i - 1] {
+            cusps += 1.0;
+            if run < cfg.min_run {
+                cusps += 3.0;
+            }
+            run = 0.0;
+        }
+        run += step;
+    }
+    cost + cfg.cusp_penalty.max(0.0) * cusps
 }

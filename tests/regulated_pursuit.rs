@@ -153,6 +153,7 @@ fn rpp_stops_before_an_obstacle_on_the_path() {
         obstacles: vec![Obstacle {
             id: 0,
             radius: 0.3,
+            dt: 0.0,
             modes: vec![GaussianMode { weight: 1.0, mean_x: vec![5.0], mean_y: vec![0.0], std_x: vec![0.05], std_y: vec![0.05] }],
         }],
         ..Default::default()

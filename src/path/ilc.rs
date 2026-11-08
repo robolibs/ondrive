@@ -13,7 +13,7 @@ use crate::types::{
 };
 use datapod::{Point, Pose};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct IlcConfig {
     /// Fraction of the recorded error applied as correction per pass.
     pub gain: f64,
@@ -143,6 +143,20 @@ impl IlcFollower {
 }
 
 impl Controller for IlcFollower {
+    fn params(&self) -> serde_json::Value {
+        serde_json::to_value(&self.ilc_config).unwrap_or_default()
+    }
+
+    fn set_params(&mut self, params: &serde_json::Value) -> Result<(), String> {
+        let cfg = crate::controller::merged(&self.ilc_config, params)?;
+        self.ilc_config = cfg;
+        Ok(())
+    }
+
+    fn set_seed(&mut self, seed: u64) {
+        self.inner.set_seed(seed);
+    }
+
     fn compute_control(
         &mut self,
         state: &RobotState,

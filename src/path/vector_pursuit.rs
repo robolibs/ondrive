@@ -19,7 +19,7 @@ use std::f64::consts::PI;
 /// unit curvature), keeping tight bends from being cut.
 const CURVATURE_LOOKAHEAD_GAIN: f64 = 0.5;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct VectorPursuitConfig {
     /// Weight of the rotation screw in the blend (0 = plain Pure Pursuit,
     /// 1 = pole rotation only), applied in full from `lateral_scale` of
@@ -57,6 +57,16 @@ impl VectorPursuitFollower {
 }
 
 impl Controller for VectorPursuitFollower {
+    fn params(&self) -> serde_json::Value {
+        serde_json::to_value(&self.vp_config).unwrap_or_default()
+    }
+
+    fn set_params(&mut self, params: &serde_json::Value) -> Result<(), String> {
+        let cfg = crate::controller::merged(&self.vp_config, params)?;
+        self.vp_config = cfg;
+        Ok(())
+    }
+
     fn compute_control(
         &mut self,
         state: &RobotState,

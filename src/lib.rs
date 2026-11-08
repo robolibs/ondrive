@@ -1,6 +1,6 @@
 //! ondrive — motion-control / path-tracking library for mobile robots.
 //!
-//! See `PLAN.md` at the crate root for the design overview. The public
+//! See `README.md` at the crate root for the design overview. The public
 //! surface is kept flat at `ondrive::*` via re-exports below.
 
 pub mod core;
@@ -24,7 +24,7 @@ pub use crate::core::math::{
 };
 pub use crate::tracker::{Tracker, TrackerKind, smoothen_path};
 pub use crate::types::{
-    ControllerConfig, ControllerStatus, GaussianMode, Goal, Obstacle, OutputUnits,
+    ControllerConfig, ControllerStatus, DebugFrame, DebugLevel, GaussianMode, Goal, Obstacle, OutputUnits,
     Footprint, OccupancyGrid, Path, RobotConstraints, RobotState, SteeringType, Trajectory,
     TrajectorySample, Velocity, VelocityCommand, WorldConstraints, Zone,
 };
@@ -32,7 +32,7 @@ pub use crate::types::{
 pub use crate::fuzzy::{FlcConfig, FlcFollower, Term};
 pub use crate::path::{
     IlcConfig, IlcFollower, KanayamaFollower, LqrFollower, PurePursuitFollower,
-    RegulatedPursuitConfig, RegulatedPursuitFollower, StanleyFollower, VectorPursuitConfig,
+    RegulatedPursuitConfig, RegulatedPursuitFollower, StanleyConfig, StanleyFollower, VectorPursuitConfig,
     VectorPursuitFollower,
 };
 pub use crate::point::{

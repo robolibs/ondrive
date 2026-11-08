@@ -35,6 +35,31 @@ pub fn wheelbase(constraints: &RobotConstraints) -> f64 {
     }
 }
 
+/// Seconds a command takes to act: the time a rate-limited Ackermann
+/// steering needs to swing half way to lock, at most 1.5 s; 0 for other
+/// platforms.
+pub fn actuation_delay(constraints: &RobotConstraints) -> f64 {
+    if !is_ackermann(constraints.steering_type) {
+        return 0.0;
+    }
+    let (lock, rate) = (constraints.max_steering_angle, constraints.max_steering_rate);
+    if lock > 0.0 && rate > 0.0 { (0.5 * lock / rate).min(1.5) } else { 0.0 }
+}
+
+/// Step of a predictive controller planning `n` steps of `dt` at `speed`:
+/// `dt`, stretched on an Ackermann machine so the horizon spans two of its
+/// tightest turning radii and two half swings of its steering (what it takes
+/// to see an obstacle and get round it), at most 12 s in all.
+pub fn planning_step(constraints: &RobotConstraints, speed: f64, n: usize, dt: f64) -> f64 {
+    let n = n.max(1) as f64;
+    let k = max_curvature(constraints);
+    if !is_ackermann(constraints.steering_type) || !(k.is_finite() && k > 0.0) {
+        return dt;
+    }
+    let needed = 2.0 / (k * speed.abs().max(0.1)) + 2.0 * actuation_delay(constraints);
+    (n * dt).max(needed.min(12.0)) / n
+}
+
 /// Largest path curvature the platform can follow. Unbounded for platforms
 /// that can turn in place.
 pub fn max_curvature(constraints: &RobotConstraints) -> f64 {
@@ -146,7 +171,13 @@ pub fn finalize(
         }
     }
     let w_max = constraints.max_angular_velocity.max(0.0);
-    omega = omega.clamp(-w_max, w_max);
+    let mut v = v;
+    if omega.abs() > w_max {
+        if v.abs() > 1e-6 {
+            v *= w_max / omega.abs();
+        }
+        omega = omega.clamp(-w_max, w_max);
+    }
     let (v, omega) = wheel_limited(v, omega, constraints);
     if is_ackermann(constraints.steering_type) && v.abs() > 1e-6 {
         steering_angle = curvature_to_steering(omega / v, constraints);
@@ -263,13 +294,10 @@ pub fn stop(message: &str) -> VelocityCommand {
     }
 }
 
-/// Steering-angle bound consistent with `max_curvature`: the configured
-/// steering limit when set, otherwise the angle equivalent of the curvature
-/// limit (or just under 90 degrees when unlimited).
+/// Steering-angle bound of `max_curvature`, which holds both
+/// `max_steering_angle` and `min_turning_radius` (just under 90 degrees when
+/// neither is set).
 pub fn steering_limit(constraints: &RobotConstraints) -> f64 {
-    if constraints.max_steering_angle > 0.0 {
-        return constraints.max_steering_angle.abs();
-    }
     let k = max_curvature(constraints);
     if k.is_finite() {
         curvature_to_steering(k, constraints).abs()
@@ -301,4 +329,12 @@ pub fn unreachable_arc_speed_floor(
     } else {
         None
     }
+}
+
+/// Body-frame `(vx, vy)` of a velocity given in the path frame: `along` the
+/// path heading `path_heading` and `across` it to the left, for a robot
+/// facing `yaw`.
+pub fn path_to_body(along: f64, across: f64, path_heading: f64, yaw: f64) -> (f64, f64) {
+    let (s, c) = path_heading.sin_cos();
+    world_to_body(along * c - across * s, along * s + across * c, yaw)
 }

@@ -12,6 +12,9 @@ use crate::types::{Goal, RobotConstraints, RobotState, VelocityCommand, WorldCon
 use datapod::Point;
 use std::f64::consts::PI;
 
+/// Time constant of the distance integral's leak while the robot closes in.
+const INTEGRAL_LEAK_S: f64 = 1.0;
+
 #[derive(Clone, Debug, Default)]
 pub struct PidFollower {
     pub base: ControllerBase,
@@ -22,6 +25,7 @@ pub struct PidFollower {
     has_last: bool,
     last_direction: f64,
     last_goal: Option<Point>,
+    linear_derivative: f64,
 }
 
 impl PidFollower {
@@ -31,11 +35,34 @@ impl PidFollower {
 
     fn clear_loops(&mut self) {
         self.linear_integral = 0.0;
+        self.linear_derivative = 0.0;
         self.angular_integral = 0.0;
         self.last_distance_error = 0.0;
         self.last_heading_error = 0.0;
         self.has_last = false;
         self.last_direction = 0.0;
+    }
+
+    /// Distance loop on the signed error `e` (negative once past the goal):
+    /// PID with a low-pass derivative. The integral builds only while the
+    /// robot is not closing in and the output is not saturated, and leaks
+    /// away while it is closing in. Returns a speed in `[0, limit]`.
+    fn linear_loop(&mut self, e: f64, dt: f64, cfg: &crate::types::ControllerConfig, limit: f64) -> f64 {
+        let raw_derivative = if self.has_last { (e - self.last_distance_error) / dt } else { 0.0 };
+        self.last_distance_error = e;
+        let filter = if cfg.kp_linear > 1e-9 { 0.1 * cfg.kd_linear.abs() / cfg.kp_linear } else { 0.0 };
+        self.linear_derivative += dt / (filter + dt) * (raw_derivative - self.linear_derivative);
+        let limit = limit.max(0.0);
+        let output = |integral: f64| cfg.kp_linear * e + cfg.ki_linear * integral + cfg.kd_linear * self.linear_derivative;
+        let raw = output(self.linear_integral);
+        let saturated = (raw >= limit && e > 0.0) || (raw <= 0.0 && e < 0.0);
+        let closing = e * raw_derivative < -0.05 * e.abs();
+        if closing {
+            self.linear_integral *= (-dt / INTEGRAL_LEAK_S).exp();
+        } else if !saturated {
+            self.linear_integral = clamped_integral(self.linear_integral, e, dt, cfg.ki_linear, limit);
+        }
+        output(self.linear_integral).clamp(0.0, limit)
     }
 
     fn note_goal(&mut self, goal: &Goal) {
@@ -66,22 +93,7 @@ impl PidFollower {
         let distance = dx.hypot(dy);
         let orientation_err = normalize_angle(yaw_of(&goal.target_pose) - yaw_of(&state.pose));
 
-        self.linear_integral = clamped_integral(
-            self.linear_integral,
-            distance,
-            dt,
-            cfg.ki_linear,
-            constraints.max_linear_velocity,
-        );
-        let linear_derivative = if self.has_last {
-            (distance - self.last_distance_error) / dt
-        } else {
-            0.0
-        };
-        let speed = (cfg.kp_linear * distance
-            + cfg.ki_linear * self.linear_integral
-            + cfg.kd_linear * linear_derivative)
-            .max(0.0);
+        let speed = self.linear_loop(distance, dt, cfg, constraints.max_linear_velocity);
 
         self.angular_integral = clamped_integral(
             self.angular_integral,
@@ -99,7 +111,6 @@ impl PidFollower {
             + cfg.ki_angular * self.angular_integral
             + cfg.kd_angular * angular_derivative;
 
-        self.last_distance_error = distance;
         self.last_heading_error = orientation_err;
         self.has_last = true;
         self.last_direction = 1.0;
@@ -185,24 +196,10 @@ impl Controller for PidFollower {
             + cfg.ki_angular * self.angular_integral
             + cfg.kd_angular * angular_derivative;
 
-        self.linear_integral = clamped_integral(
-            self.linear_integral,
-            distance,
-            dt,
-            cfg.ki_linear,
-            constraints.max_linear_velocity,
-        );
-        let linear_derivative = if self.has_last {
-            (distance - self.last_distance_error) / dt
-        } else {
-            0.0
-        };
-        let speed = cfg.kp_linear * distance
-            + cfg.ki_linear * self.linear_integral
-            + cfg.kd_linear * linear_derivative;
+        let along = distance * bearing_err.cos();
+        let speed = self.linear_loop(along, dt, &cfg, constraints.max_linear_velocity);
 
         self.last_heading_error = bearing_err;
-        self.last_distance_error = distance;
         self.has_last = true;
 
         self.base.status.distance_to_goal = distance;

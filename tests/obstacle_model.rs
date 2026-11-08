@@ -76,6 +76,7 @@ fn polygon_footprint_clearance_depends_on_heading() {
         obstacles: vec![Obstacle {
             id: 0,
             radius: 0.1,
+            dt: 0.0,
             modes: vec![GaussianMode { weight: 1.0, mean_x: vec![1.0], mean_y: vec![0.0], std_x: vec![0.05], std_y: vec![0.05] }],
         }],
         ..Default::default()
@@ -160,4 +161,19 @@ fn pose_planner_picks_a_collision_free_curve() {
     for w in &plan.waypoints {
         assert!(!checker.collides(0, w.point.x, w.point.y, w.rotation.to_euler().yaw), "plan passes through the block at ({:.2},{:.2})", w.point.x, w.point.y);
     }
+}
+
+#[test]
+fn grid_distances_are_euclidean_and_negative_inside_occupied_cells() {
+    // One occupied cell at the centre of a 21 × 21 grid of 0.1 m cells.
+    let mut occ = vec![false; 21 * 21];
+    occ[10 * 21 + 10] = true;
+    let g = OccupancyGrid::new(0.0, 0.0, 0.1, 21, 21, occ);
+    let (cx, cy) = (1.05, 1.05);
+    for (dx, dy) in [(0.7, 0.0), (0.5, 0.5), (0.3, 0.4), (0.0, 0.9), (0.6, 0.8)] {
+        let d = g.distance_to_occupied(cx + dx, cy + dy);
+        let exact = f64::hypot(dx, dy);
+        assert!((d - exact).abs() < 1e-6, "({dx}, {dy}): {d:.4} vs {exact:.4}");
+    }
+    assert!(g.distance_to_occupied(cx + 0.02, cy - 0.03) < 0.0, "inside the occupied cell reads as clear");
 }
