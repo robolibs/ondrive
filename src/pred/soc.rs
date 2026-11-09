@@ -19,7 +19,7 @@ use crate::core::kinematics::planning;
 use crate::core::obstacles::{CollisionChecker, robot_radius};
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
-    CostWeights, Model, Track, build_reference, build_timed_reference, command_from_controls, current_lateral_speed,
+    Along, CostWeights, Model, Track, build_reference, build_timed_reference, command_from_controls, current_lateral_speed, give_way_ahead,
     correlated_noise, current_speed, detour_relax, effective_sample_size, guide_paths, left_by, pick_detour, pursue, savitzky_golay,
     importance_weights, prepare, speed_at_arc_length, update_turn_in_place,
 };
@@ -425,6 +425,15 @@ impl Controller for SocFollower {
         let vy_now = current_lateral_speed(state, self.last_vy);
         let model = Model::new(state, constraints, v_now, vy_now, cfg.dt, prep.allow_reverse);
         let speed = ref_velocity.min(constraints.max_linear_velocity);
+        let obstacles: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
+        let along = Along {
+            path: &self.base.path,
+            cum: &self.cursor.cum,
+            trajectory: self.trajectory.as_ref(),
+            clock: self.clock,
+            from: prep.proj.arc_length,
+        };
+        let share = give_way_ahead(&along, obstacles, constraints, n, cfg.dt, speed, v_now);
         let mut reference = Track::new(
             self.trajectory.as_ref(),
             self.clock,
@@ -433,11 +442,10 @@ impl Controller for SocFollower {
             prep.proj.arc_length,
             n,
             cfg.dt,
-            speed,
+            speed * share,
             cfg.decel_distance,
             prep.pos_tol,
         );
-        let obstacles: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
         self.debug.guides.clear();
         let mut detour: Vec<(f64, f64)> = Vec::new();
         if !obstacles.is_empty() {
@@ -645,7 +653,8 @@ impl Controller for SocFollower {
         let dt_apply = dt.min(cfg.dt);
         let v_cap = speed_at_arc_length(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length)
             .unwrap_or(f64::INFINITY)
-            .min(crate::pred::mpc::REF_SPEED_HEADROOM * ref_velocity.max(0.1));
+            .min(crate::pred::mpc::REF_SPEED_HEADROOM * ref_velocity.max(0.1))
+            * share;
         self.base.status.mode = "soc_tracking".into();
         let cmd = command_from_controls(
             v_now,

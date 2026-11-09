@@ -756,20 +756,16 @@ impl MppiFollower {
         if obstacles.is_empty() {
             return 1.0;
         }
-        let long = (GIVE_WAY_COURSE_S / step).ceil() as usize;
-        let mut reference = |n: usize| match &self.trajectory {
-            Some(traj) => Some(build_timed_reference(traj, self.clock, n, step)),
-            None => self
-                .cursor
-                .project(&self.base.path.waypoints, state.pose.point, self.base.path_index)
-                .map(|p| build_reference(&self.base.path, &self.cursor.cum, p.arc_length, n, step, speed, 0.0)),
+        let from = match &self.trajectory {
+            Some(_) => 0.0,
+            None => match self.cursor.project(&self.base.path.waypoints, state.pose.point, self.base.path_index) {
+                Some(p) => p.arc_length,
+                None => return 1.0,
+            },
         };
-        let (Some(near), Some(ahead)) = (reference(n), reference(long.max(n))) else {
-            return 1.0;
-        };
-        let course = polyline_course((0..ahead.x.len()).map(|i| (ahead.x[i], ahead.y[i], ahead.yaw[i])).collect());
         let v = if state.velocity_valid { state.velocity.linear } else { self.last_v };
-        give_way_share(&near, obstacles, constraints, &course, speed, v, step)
+        let along = Along { path: &self.base.path, cum: &self.cursor.cum, trajectory: self.trajectory.as_ref(), clock: self.clock, from };
+        give_way_ahead(&along, obstacles, constraints, n, step, speed, v)
     }
 
     /// Forgets the guides recorded for display.
@@ -1456,6 +1452,46 @@ pub(crate) fn give_way_share(
     let checker = CollisionChecker::new(Some(&crossing), constraints, GIVE_WAY_MARGIN).with_spread(1.0);
     let decel = constraints.max_linear_acceleration.abs();
     yield_share(&checker, course, speed, v_now, GIVE_WAY_LOOKOUT_S, decel, &GIVE_WAY_SHARES)
+}
+
+/// Where a controller drives on from: the timed `trajectory` from `clock`,
+/// or else `path` (cumulative lengths `cum`) from arc length `from`.
+pub(crate) struct Along<'a> {
+    pub path: &'a Path,
+    pub cum: &'a [f64],
+    pub trajectory: Option<&'a Trajectory>,
+    pub clock: f64,
+    pub from: f64,
+}
+
+impl Along<'_> {
+    /// `n` steps of `step` of it at `speed`.
+    pub fn reference(&self, n: usize, step: f64, speed: f64) -> Reference {
+        match self.trajectory {
+            Some(traj) => build_timed_reference(traj, self.clock, n, step),
+            None => build_reference(self.path, self.cum, self.from, n, step, speed, 0.0),
+        }
+    }
+}
+
+/// Share of `speed`, setting off at `v_now`, that gives way to traffic
+/// crossing the next `n` steps of `step` of `along`: `give_way_share` for
+/// driving on along it.
+pub(crate) fn give_way_ahead(
+    along: &Along,
+    obstacles: &[Obstacle],
+    constraints: &RobotConstraints,
+    n: usize,
+    step: f64,
+    speed: f64,
+    v_now: f64,
+) -> f64 {
+    if obstacles.is_empty() {
+        return 1.0;
+    }
+    let ahead = along.reference(((GIVE_WAY_COURSE_S / step).ceil() as usize).max(n), step, speed);
+    let course = polyline_course((0..ahead.x.len()).map(|i| (ahead.x[i], ahead.y[i], ahead.yaw[i])).collect());
+    give_way_share(&along.reference(n, step, speed), obstacles, constraints, &course, speed, v_now, step)
 }
 
 /// The course along the polyline `points` (x, y, yaw): the pose after a

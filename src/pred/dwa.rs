@@ -187,8 +187,17 @@ impl Controller for DwaFollower {
 
         let a_lin = constraints.max_linear_acceleration.abs().max(1e-6);
         let a_ang = constraints.max_angular_acceleration.abs().max(1e-6);
+        let x0 = state.pose.point.x;
+        let y0 = state.pose.point.y;
+        let yaw0 = state.pose.rotation.to_euler().yaw;
+        let course = normalize_angle(yaw0 + bearing);
+        let free_v = dwa
+            .target_velocity
+            .min(v_hi)
+            .min((cfg.kp_linear.max(0.1) * dist_to_goal).max(0.15 * v_hi));
+        let share = give_way(world, constraints, (x0, y0, course), free_v, v_now.abs());
         let v_min = (v_now - a_lin * dt).max(v_lo);
-        let v_max = (v_now + a_lin * dt).min(v_hi);
+        let v_max = (v_now + a_lin * dt).min(v_hi).min(cruise * share).max(v_min);
         let w_min = (w_now - a_ang * dt).max(-w_lim);
         let w_max = (w_now + a_ang * dt).min(w_lim);
         let (vy_min, vy_max) = if holonomic {
@@ -205,19 +214,11 @@ impl Controller for DwaFollower {
         let kappa_max = max_curvature(constraints);
         let checker = CollisionChecker::new(world, constraints, 0.0).with_step(sim_dt).with_spread(2.0);
         let goal_p = goal.target_pose.point;
-        let target_v = dwa
-            .target_velocity
-            .min(v_hi)
-            .min((cfg.kp_linear.max(0.1) * dist_to_goal).max(0.15 * v_hi));
-
-        let x0 = state.pose.point.x;
-        let y0 = state.pose.point.y;
-        let yaw0 = state.pose.rotation.to_euler().yaw;
+        let target_v = free_v * share;
 
         // Against obstacles standing or crossing the course to the goal, while
         // braking from here keeps clear, arcs that would leave the robot unable
         // to stop clear of them are refused, so the robot gives way.
-        let course = normalize_angle(yaw0 + bearing);
         let yield_to: Option<WorldConstraints> = world.map(|w| WorldConstraints {
             obstacles: w.obstacles.iter().filter(|o| !along_heading(o, course)).cloned().collect(),
             ..Default::default()
@@ -227,7 +228,6 @@ impl Controller for DwaFollower {
             .filter(|w| !w.obstacles.is_empty())
             .map(|w| CollisionChecker::new(Some(w), constraints, 0.0).with_step(sim_dt).with_spread(2.0));
         let yielding = tail.as_ref().is_some_and(|c| !hit_while_braking(c, (x0, y0, yaw0), v_now.abs(), a_lin, 0, sim_dt));
-        let target_v = target_v * give_way(world, constraints, (x0, y0, course), target_v, v_now.abs());
         let mut samples: Vec<Sample> = Vec::with_capacity(v_samples * w_samples * vy_samples);
         for vi in 0..v_samples {
             let v = v_min + (v_max - v_min) * vi as f64 / (v_samples - 1) as f64;
@@ -374,6 +374,7 @@ impl Controller for DwaFollower {
         let mut mode = "dwa";
         if v.hypot(vy).abs() < 1e-9
             && dist_to_goal > cfg.goal_tolerance
+            && share > 0.0
             && let Some(turn) = recovery_turn(&checker, x0, y0, yaw0, dwa.obstacle_margin)
         {
             if can_turn_in_place(constraints.steering_type) {
