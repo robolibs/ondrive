@@ -130,7 +130,7 @@ impl Default for SocConfig {
             kernel_bandwidth: 1.0,
             use_covariance_adaptation: true,
             noise_correlation: 0.7,
-            smooth_sampling: false,
+            smooth_sampling: true,
             ess_low: 0.01,
             ess_high: 0.05,
             turn_first_activation_deg: 60.0,
