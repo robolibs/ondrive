@@ -90,6 +90,7 @@ pub const ONDRIVE_KIND_VECTOR_PURSUIT: u32 = 16;
 pub const ONDRIVE_KIND_KANAYAMA: u32 = 17;
 pub const ONDRIVE_KIND_APF: u32 = 18;
 pub const ONDRIVE_KIND_ILC: u32 = 19;
+pub const ONDRIVE_KIND_SLIP_ADAPTIVE: u32 = 20;
 
 pub const ONDRIVE_STEERING_DIFFERENTIAL: u32 = 0;
 pub const ONDRIVE_STEERING_ACKERMANN: u32 = 1;
@@ -121,6 +122,7 @@ fn kind_from_u32(v: u32) -> Option<TrackerKind> {
         ONDRIVE_KIND_KANAYAMA => TrackerKind::Kanayama,
         ONDRIVE_KIND_APF => TrackerKind::Apf,
         ONDRIVE_KIND_ILC => TrackerKind::Ilc,
+        ONDRIVE_KIND_SLIP_ADAPTIVE => TrackerKind::SlipAdaptive,
         _ => return None,
     })
 }
@@ -1017,6 +1019,7 @@ pub extern "C" fn ondrive_tracker_kind(h: *const OndriveTracker) -> u32 {
         TrackerKind::Kanayama => ONDRIVE_KIND_KANAYAMA,
         TrackerKind::Apf => ONDRIVE_KIND_APF,
         TrackerKind::Ilc => ONDRIVE_KIND_ILC,
+        TrackerKind::SlipAdaptive => ONDRIVE_KIND_SLIP_ADAPTIVE,
     }
 }
 

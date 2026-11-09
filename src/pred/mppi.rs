@@ -67,6 +67,10 @@ pub struct MppiConfig {
     pub ess_high: f64,
     /// Savitzky–Golay smoothing of the plan after each update.
     pub smoothing: bool,
+    /// Sample the noise as integrated control rates (Smooth MPPI) rather
+    /// than correlated controls.
+    #[serde(default)]
+    pub smooth_sampling: bool,
     /// Obstacle critics against each step's predicted obstacles and the
     /// grid: `weight_collision` for every step in
     /// contact, `weight_repulsion · (1 − d / repulsion_distance)²` closer
@@ -109,6 +113,7 @@ impl Default for MppiConfig {
             ess_low: 0.01,
             ess_high: 0.05,
             smoothing: true,
+            smooth_sampling: false,
             weight_collision: 2000.0,
             weight_repulsion: 400.0,
             repulsion_distance: 1.0,
@@ -998,6 +1003,18 @@ impl MppiFollower {
                 }
                 // Pure pursuit of the detour round the obstacles ahead.
                 3 if self.guide.len() > 1 => pursue(&model, &self.guide, v_ref, &mut steer, &mut accel, &mut accel_lat),
+                _ if working.smooth_sampling => {
+                    integrated_noise(&mut steer, sigma_s, &mut self.rng);
+                    integrated_noise(&mut accel, sigma_a, &mut self.rng);
+                    integrated_noise(&mut accel_lat, sigma_al, &mut self.rng);
+                    if j >= zero_centred {
+                        for t in 0..n {
+                            steer[t] += self.mean_steering[t];
+                            accel[t] += self.mean_acceleration[t];
+                            accel_lat[t] += self.mean_accel_lateral[t];
+                        }
+                    }
+                }
                 _ => {
                     correlated_noise(&mut steer, sigma_s, working.noise_correlation, &mut self.rng);
                     correlated_noise(&mut accel, sigma_a, working.noise_correlation, &mut self.rng);
@@ -1422,6 +1439,19 @@ pub(crate) fn savitzky_golay(seq: &mut [f64]) {
             acc += c * src[idx];
         }
         *out = acc / 231.0;
+    }
+}
+
+/// Fill `out` with Gaussian noise sampled in the space of control rates and
+/// integrated (input lifting of Smooth MPPI, Kim et al. 2022): a random walk
+/// whose spread grows to `sigma` at the last step, small at the first.
+pub(crate) fn integrated_noise(out: &mut [f64], sigma: f64, rng: &mut StdRng) {
+    let step = sigma / (out.len().max(1) as f64).sqrt();
+    let mut walk = 0.0;
+    for e in out.iter_mut() {
+        let w: f64 = rand_distr::StandardNormal.sample(rng);
+        walk += step * w;
+        *e = walk;
     }
 }
 

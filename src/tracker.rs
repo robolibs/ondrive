@@ -4,7 +4,7 @@ use crate::core::obstacles::CollisionChecker;
 use crate::core::path::{PathCursor, cumulative_lengths, cusp_after, end_heading, next_cusp, sample, segment_heading};
 use crate::fuzzy::FlcFollower;
 use crate::path::{
-    IlcFollower, KanayamaFollower, LqrFollower, PurePursuitFollower, RegulatedPursuitFollower,
+    IlcFollower, KanayamaFollower, LqrFollower, PurePursuitFollower, RegulatedPursuitFollower, SlipAdaptiveFollower,
     StanleyFollower, VectorPursuitFollower,
 };
 use crate::point::{
@@ -41,6 +41,7 @@ pub enum TrackerKind {
     Kanayama,
     Apf,
     Ilc,
+    SlipAdaptive,
 }
 
 impl TrackerKind {
@@ -53,7 +54,10 @@ impl TrackerKind {
     /// Whether the controller models the machine's actuation lag itself;
     /// the tracker hands every other one the state predicted through it.
     pub fn models_actuation(self) -> bool {
-        matches!(self, TrackerKind::Mpc | TrackerKind::Mppi | TrackerKind::Mca | TrackerKind::Soc | TrackerKind::Ilqr)
+        matches!(
+            self,
+            TrackerKind::Mpc | TrackerKind::Mppi | TrackerKind::Mca | TrackerKind::Soc | TrackerKind::Ilqr | TrackerKind::SlipAdaptive
+        )
     }
 }
 
@@ -84,6 +88,8 @@ pub struct Tracker {
     last_command: Option<(f64, f64, f64)>,
     /// Seconds the machine has stood while commanded to move.
     stalled_for: f64,
+    /// Control barrier filter on the final command against moving obstacles.
+    safety: crate::core::safety::SafetyConfig,
 }
 
 impl Tracker {
@@ -110,6 +116,7 @@ impl Tracker {
             last_steering: None,
             last_command: None,
             stalled_for: 0.0,
+            safety: crate::core::safety::SafetyConfig::default(),
         }
     }
 
@@ -236,6 +243,29 @@ impl Tracker {
     /// ignore it.
     pub fn set_seed(&mut self, seed: u64) {
         self.controller.set_seed(seed);
+    }
+
+    /// The safety filter's settings as a JSON object.
+    pub fn safety(&self) -> serde_json::Value {
+        serde_json::to_value(self.safety).unwrap_or_default()
+    }
+
+    /// Update some of the safety filter's settings from a JSON object, e.g.
+    /// `{"enabled": false}`. An unknown name or a wrong type is an error and
+    /// changes nothing.
+    pub fn set_safety(&mut self, settings: &serde_json::Value) -> Result<(), String> {
+        let mut merged = self.safety();
+        let (Some(into), Some(from)) = (merged.as_object_mut(), settings.as_object()) else {
+            return Err("safety settings must be an object".into());
+        };
+        for (k, v) in from {
+            if !into.contains_key(k) {
+                return Err(format!("unknown safety setting `{k}`"));
+            }
+            into.insert(k.clone(), v.clone());
+        }
+        self.safety = serde_json::from_value(merged).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn get_status(&self) -> ControllerStatus {
@@ -409,6 +439,11 @@ impl Tracker {
                     w *= scale;
                 }
             }
+        }
+
+        if let Some((fv, fw)) = crate::core::safety::filter(&self.safety, c, &state.pose, (v, w), vy, world) {
+            (v, w) = (fv, fw);
+            cmd.status_message = format!("{} (safety filter)", cmd.status_message);
         }
 
         if is_ackermann(c.steering_type) {
@@ -801,6 +836,7 @@ fn make_controller(kind: TrackerKind) -> Box<dyn Controller> {
         TrackerKind::Kanayama => Box::new(KanayamaFollower::new()),
         TrackerKind::Apf => Box::new(ApfFollower::new()),
         TrackerKind::Ilc => Box::new(IlcFollower::default()),
+        TrackerKind::SlipAdaptive => Box::new(SlipAdaptiveFollower::new()),
     }
 }
 

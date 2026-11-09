@@ -49,6 +49,7 @@ fn kind_from_str(s: &str) -> PyResult<TrackerKind> {
         "kanayama" => TrackerKind::Kanayama,
         "apf" => TrackerKind::Apf,
         "ilc" => TrackerKind::Ilc,
+        "slip_adaptive" => TrackerKind::SlipAdaptive,
         other => {
             return Err(PyValueError::new_err(format!(
                 "unknown tracker kind: {other}"
@@ -79,6 +80,7 @@ fn kind_to_str(k: TrackerKind) -> &'static str {
         TrackerKind::Kanayama => "kanayama",
         TrackerKind::Apf => "apf",
         TrackerKind::Ilc => "ilc",
+        TrackerKind::SlipAdaptive => "slip_adaptive",
     }
 }
 
@@ -1109,6 +1111,20 @@ impl PyTracker {
         self.inner.set_seed(seed);
     }
 
+    /// The safety filter's settings as a dict.
+    fn safety(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let text = self.inner.safety().to_string();
+        Ok(py.import("json")?.call_method1("loads", (text,))?.unbind())
+    }
+
+    /// Update some of the safety filter's settings, e.g.
+    /// `set_safety({"enabled": False})`.
+    fn set_safety(&mut self, py: Python<'_>, settings: &Bound<'_, PyAny>) -> PyResult<()> {
+        let text: String = py.import("json")?.call_method1("dumps", (settings,))?.extract()?;
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        self.inner.set_safety(&value).map_err(PyValueError::new_err)
+    }
+
     /// The controller's planned trajectory from the last tick, as `(x, y, z)`.
     fn predicted_trajectory(&self) -> Vec<(f64, f64, f64)> {
         self.inner.predicted_trajectory().into_iter().map(|p| (p.x, p.y, p.z)).collect()
@@ -1203,6 +1219,7 @@ fn available_tracker_kinds() -> Vec<&'static str> {
         "kanayama",
         "apf",
         "ilc",
+        "slip_adaptive",
     ]
 }
 

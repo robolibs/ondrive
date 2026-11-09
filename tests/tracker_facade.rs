@@ -172,6 +172,7 @@ fn reset_keeps_the_path_and_restarts_progress_on_it() {
         TrackerKind::Kanayama,
         TrackerKind::Apf,
         TrackerKind::Ilc,
+        TrackerKind::SlipAdaptive,
     ];
     for kind in kinds {
         let mut t = Tracker::new(kind);

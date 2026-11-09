@@ -4,3 +4,4 @@ pub mod kinematics;
 pub mod math;
 pub mod obstacles;
 pub mod path;
+pub mod safety;

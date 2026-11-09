@@ -13,7 +13,7 @@ use ondrive::{
 use std::f64::consts::PI;
 use std::ptr;
 
-const KINDS: [TrackerKind; 20] = [
+const KINDS: [TrackerKind; 21] = [
     TrackerKind::Pid,
     TrackerKind::Carrot,
     TrackerKind::PurePursuit,
@@ -34,6 +34,7 @@ const KINDS: [TrackerKind; 20] = [
     TrackerKind::Kanayama,
     TrackerKind::Apf,
     TrackerKind::Ilc,
+    TrackerKind::SlipAdaptive,
 ];
 
 fn pose(x: f64, y: f64, yaw: f64) -> Pose {

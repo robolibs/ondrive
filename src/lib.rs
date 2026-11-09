@@ -32,7 +32,8 @@ pub use crate::types::{
 pub use crate::fuzzy::{FlcConfig, FlcFollower, Term};
 pub use crate::path::{
     IlcConfig, IlcFollower, KanayamaFollower, LqrFollower, PurePursuitFollower,
-    RegulatedPursuitConfig, RegulatedPursuitFollower, StanleyConfig, StanleyFollower, VectorPursuitConfig,
+    RegulatedPursuitConfig, RegulatedPursuitFollower, SlipAdaptiveConfig, SlipAdaptiveFollower, StanleyConfig,
+    StanleyFollower, VectorPursuitConfig,
     VectorPursuitFollower,
 };
 pub use crate::point::{
