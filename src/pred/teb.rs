@@ -14,7 +14,7 @@
 
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::{
-    finalize, finalize_holonomic, is_ackermann, is_holonomic, max_curvature, speed_bounds, wheelbase,
+    actuation_delay, finalize, finalize_holonomic, is_ackermann, is_holonomic, max_curvature, speed_bounds, wheelbase,
     world_to_body,
 };
 use crate::core::math::{normalize_angle, yaw_of};
@@ -66,7 +66,7 @@ impl Default for TebConfig {
             weight_obstacle: 100.0,
             weight_kinematic: 50.0,
             weight_goal: 5.0,
-            obstacle_margin: 1.0,
+            obstacle_margin: 0.8,
             dt_min: 0.05,
             dt_max: 1.0,
             control_lookahead: 0.4,
@@ -78,6 +78,10 @@ impl Default for TebConfig {
 fn default_turn_filter() -> f64 {
     0.15
 }
+
+/// Share of the distance covered during the steering delay added to the
+/// obstacle margin.
+const LAG_MARGIN_GAIN: f64 = 0.25;
 
 #[derive(Clone, Debug, Default)]
 pub struct TebFollower {
@@ -127,16 +131,23 @@ struct Problem<'a> {
 }
 
 impl Problem<'_> {
-    /// Penalty for coming within `obstacle_margin` of an obstacle as it is
-    /// predicted `t` seconds from now.
+    /// Room kept from obstacles: `obstacle_margin`, plus `LAG_MARGIN_GAIN`
+    /// of the distance the band's top speed covers while the steering
+    /// takes effect.
+    fn margin(&self) -> f64 {
+        self.cfg.obstacle_margin + LAG_MARGIN_GAIN * self.v_hi.abs() * actuation_delay(self.constraints)
+    }
+
+    /// Penalty for coming within `margin` of an obstacle as it is predicted
+    /// `t` seconds from now.
     fn obstacle_cost(&self, t: f64, x: f64, y: f64, yaw: f64) -> f64 {
         let c = self.cfg;
         if !self.checker.has_obstacles() {
             return 0.0;
         }
-        let d = self.checker.clearance_at(t, x, y, yaw);
-        if d < c.obstacle_margin {
-            let s = c.obstacle_margin - d;
+        let (d, margin) = (self.checker.clearance_at(t, x, y, yaw), self.margin());
+        if d < margin {
+            let s = margin - d;
             c.weight_obstacle * s * s
         } else {
             0.0
