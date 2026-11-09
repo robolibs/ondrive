@@ -1075,7 +1075,8 @@ impl MppiFollower {
         let dt_apply = dt.min(working.dt);
         let v_cap = speed_at_arc_length(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length)
             .unwrap_or(f64::INFINITY)
-            .min(speed_scale * constraints.max_linear_velocity.max(0.0));
+            .min(speed_scale * constraints.max_linear_velocity.max(0.0))
+            .min(crate::pred::mpc::REF_SPEED_HEADROOM * working.ref_velocity.max(0.1));
         self.base.status.mode = mode.into();
         let cmd = command_from_controls(
             v_now,

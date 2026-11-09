@@ -640,7 +640,8 @@ impl Controller for SocFollower {
 
         let dt_apply = dt.min(cfg.dt);
         let v_cap = speed_at_arc_length(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length)
-            .unwrap_or(f64::INFINITY);
+            .unwrap_or(f64::INFINITY)
+            .min(crate::pred::mpc::REF_SPEED_HEADROOM * ref_velocity.max(0.1));
         self.base.status.mode = "soc_tracking".into();
         let cmd = command_from_controls(
             v_now,
