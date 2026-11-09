@@ -41,6 +41,8 @@ pub struct IlqrConfig {
     pub weight_steering: f64,
     pub weight_acceleration: f64,
     pub weight_terminal: f64,
+    /// Cost per (rad/s)² of turn rate off the reference's curvature times the speed.
+    pub weight_yaw_rate: f64,
 
     pub ref_velocity: f64,
     pub turn_first_activation_deg: f64,
@@ -66,6 +68,7 @@ impl Default for IlqrConfig {
             weight_steering: 10.0,
             weight_acceleration: 5.0,
             weight_terminal: 3.0,
+            weight_yaw_rate: 100.0,
             ref_velocity: 1.0,
             turn_first_activation_deg: 60.0,
             turn_first_release_deg: 15.0,
@@ -234,6 +237,26 @@ impl Problem<'_> {
         lxx[(1, 1)] = w_cte * (ease_dd * rc * rc + 0.5 * rs * rs);
         lxx[(2, 2)] = 2.0 * w_epsi;
         lxx[(3, 3)] = 2.0 * w_vel;
+
+        // Turn rate against the reference's curvature at the present speed.
+        let (omega, d_v, d_s) = if self.model.ackermann {
+            let l = wheelbase(self.model.constraints);
+            (x[3] * x[5].tan() / l, x[5].tan() / l, x[3] / (l * x[5].cos().powi(2)))
+        } else {
+            (x[5], 0.0, 1.0)
+        };
+        let (lo, hi) = (ri.saturating_sub(1), (ri + 1).min(r.yaw.len().saturating_sub(1)));
+        let ds = (r.x[hi] - r.x[lo]).hypot(r.y[hi] - r.y[lo]);
+        let kappa = if hi > lo && ds > 1e-6 { normalize_angle(r.yaw[hi] - r.yaw[lo]) / ds } else { 0.0 };
+        let d_v = d_v - kappa;
+        let (e_w, w_w) = (omega - kappa * x[3], scale * cfg.weight_yaw_rate);
+        cost += w_w * e_w * e_w;
+        lx[3] += 2.0 * w_w * e_w * d_v;
+        lx[5] += 2.0 * w_w * e_w * d_s;
+        lxx[(3, 3)] += 2.0 * w_w * d_v * d_v;
+        lxx[(3, 5)] += 2.0 * w_w * d_v * d_s;
+        lxx[(5, 3)] += 2.0 * w_w * d_v * d_s;
+        lxx[(5, 5)] += 2.0 * w_w * d_s * d_s;
 
         if !self.obstacles.is_empty() {
             let t = (i + 1) as f64 * self.model.dt;
