@@ -66,7 +66,7 @@ impl Default for TebConfig {
             weight_obstacle: 100.0,
             weight_kinematic: 50.0,
             weight_goal: 5.0,
-            obstacle_margin: 0.4,
+            obstacle_margin: 1.0,
             dt_min: 0.05,
             dt_max: 1.0,
             control_lookahead: 0.4,
