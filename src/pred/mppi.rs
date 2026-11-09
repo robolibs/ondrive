@@ -833,7 +833,8 @@ impl MppiFollower {
     /// the robot's speed if faster): the points of the reference its detour
     /// leaves, where tracking the path gives way to going round, and the
     /// share of the speed to drive, `plan_avoidance`'s pace held lower by
-    /// `give_way_share` along its detour, or the path, at that pace.
+    /// `give_way_share` at that pace along its detour, or the path, and
+    /// along the last plan driven.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn avoidance(
         &mut self,
@@ -872,6 +873,12 @@ impl MppiFollower {
                 give_way_share(&along.reference(n, step, paced), obstacles, constraints, &course_through(&self.guide), paced, v, step)
             }
             None => give_way_ahead(&along, obstacles, constraints, n, step, paced, v),
+        };
+        let planned: Vec<(f64, f64)> = self.predicted_trajectory.iter().map(|p| (p.x, p.y)).collect();
+        let share = if planned.len() >= 2 {
+            share.min(give_way_share(&along.reference(n, step, paced), obstacles, constraints, &course_through(&planned), paced, v, step))
+        } else {
+            share
         };
         let points = plan.guide.as_ref().map_or(Vec::new(), |g| left_by(&plan.reference, g));
         (points, plan.pace * share)
@@ -1798,8 +1805,8 @@ pub(crate) struct Avoidance {
 /// of each pace of `AVOID_PACES` (only the first on a timed trajectory),
 /// driven as is or detoured to either side over `n` steps of `step` at
 /// that share of `speed` and on for `swerve`'s lookahead (at least
-/// `CROSSING_LOOKOUT_S` while traffic crosses), the cheapest,
-/// never a detour in front of crossing traffic still shifting at its end
+/// `CROSSING_LOOKOUT_S` while traffic crosses), the cheapest, never a
+/// detour in front of crossing traffic still shifting at its end
 /// (`AHEAD_TAIL`): a detour costs its widest shift, metres, `AHEAD_COST`
 /// times more in front of crossing traffic, plus `LATE_COST` per metre the
 /// robot sits off where it starts (`guide_gap`), and a pace `PACE_COST` per
