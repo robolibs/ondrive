@@ -14,7 +14,7 @@
 
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::{
-    finalize, finalize_holonomic, is_ackermann, is_holonomic, max_curvature, speed_bounds,
+    finalize, finalize_holonomic, is_ackermann, is_holonomic, max_curvature, speed_bounds, wheelbase,
     world_to_body,
 };
 use crate::core::math::{normalize_angle, yaw_of};
@@ -79,6 +79,7 @@ pub struct TebFollower {
     band_initialised: bool,
     last_v: f64,
     last_vy: f64,
+    last_w: f64,
     /// Side the band last went round obstacles on: +1 left, −1 right, 0 none.
     side: f64,
     auto_path_goal: Option<(f64, f64, f64)>,
@@ -105,6 +106,11 @@ struct Problem<'a> {
     v_lo: f64,
     v_hi: f64,
     v_start: f64,
+    /// Measured turn rate the band sets off from.
+    w_start: f64,
+    /// Steering rate over wheelbase, for an Ackermann machine's turn-rate
+    /// change limit `|v| · steer_per_wheelbase`; infinite when unlimited.
+    steer_per_wheelbase: f64,
     ackermann: bool,
     holonomic: bool,
     /// Path segment the robot projects onto, where projections start.
@@ -134,6 +140,7 @@ impl Problem<'_> {
         let a_max = self.constraints.max_linear_acceleration.abs();
         let mut cost = 0.0;
         let mut prev_v: Option<(f64, f64)> = None;
+        let mut prev_w: Option<(f64, f64)> = None;
         let mut last_v = 0.0;
         let mut times = vec![0.0; n];
         for i in 0..n - 1 {
@@ -158,6 +165,14 @@ impl Problem<'_> {
             let w = dyaw / dt;
             let w_over = (w.abs() - self.constraints.max_angular_velocity.abs()).max(0.0);
             cost += c.weight_angular_limit * w_over * w_over;
+
+            let (pw, pwdt) = prev_w.unwrap_or((self.w_start, dt));
+            let alpha = (w - pw) / (0.5 * (pwdt + dt));
+            let speed = v.abs().max(TURN_CHANGE_SPEED_FLOOR);
+            let steering = speed * self.steer_per_wheelbase + (w.abs() / speed) * a_max;
+            let alpha_over = (alpha.abs() - steering).max(0.0);
+            cost += c.weight_acceleration_limit * alpha_over * alpha_over;
+            prev_w = Some((w, dt));
 
             let (pv, pdt) = prev_v.unwrap_or((self.v_start, dt));
             let a = (v - pv) / (0.5 * (pdt + dt));
@@ -215,6 +230,9 @@ impl Problem<'_> {
         cost
     }
 }
+
+/// Speed, m/s, below which the turn-rate change limit is taken at this speed.
+const TURN_CHANGE_SPEED_FLOOR: f64 = 0.2;
 
 /// Move a sampled band pose sideways off any obstacle it would sit on, so
 /// the optimiser sees a lateral gradient instead of a symmetric saddle.
@@ -564,6 +582,12 @@ impl Controller for TebFollower {
             v_lo,
             v_hi,
             v_start: v_now,
+            w_start: if state.velocity_valid { state.velocity.angular } else { self.last_w },
+            steer_per_wheelbase: if is_ackermann(constraints.steering_type) && constraints.max_steering_rate > 0.0 {
+                constraints.max_steering_rate / wheelbase(constraints)
+            } else {
+                f64::INFINITY
+            },
             ackermann: is_ackermann(constraints.steering_type),
             holonomic,
             start_segment,
@@ -605,6 +629,7 @@ impl Controller for TebFollower {
         self.base.status.mode = "teb".into();
         let cmd = finalize(v, w, constraints, &self.base.config, prep.allow_reverse, "TEB tracking");
         self.last_v = if cmd.valid { v.clamp(v_lo, v_hi) } else { 0.0 };
+        self.last_w = if cmd.valid { w } else { 0.0 };
         cmd
     }
 
@@ -620,6 +645,7 @@ impl Controller for TebFollower {
     fn reset(&mut self) {
         self.set_path(Path::default());
         self.last_v = 0.0;
+        self.last_w = 0.0;
         self.last_vy = 0.0;
     }
 
