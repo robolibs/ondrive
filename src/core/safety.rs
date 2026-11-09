@@ -94,14 +94,16 @@ pub fn filter(
     Some(closest(&planes, nominal, cfg.turn_weight.max(1e-6)))
 }
 
-/// Speed and turn-rate limits of the platform, in the direction of travel
-/// of `v_nominal`, as half-planes.
+/// Speed and turn-rate limits of the platform, as half-planes: in the
+/// direction of travel of `v_nominal`, or back the other way too down to
+/// the platform's least speed when it can reverse.
 fn bounds(constraints: &RobotConstraints, v_nominal: f64) -> Vec<Halfplane> {
     let v_max = constraints.max_linear_velocity.abs();
     let w_max = constraints.max_angular_velocity.abs();
     let mut out = vec![Halfplane { a_v: 0.0, a_w: 1.0, b: -w_max }, Halfplane { a_v: 0.0, a_w: -1.0, b: -w_max }];
     let dir = if v_nominal < 0.0 { -1.0 } else { 1.0 };
-    out.push(Halfplane { a_v: dir, a_w: 0.0, b: 0.0 });
+    let back = if constraints.min_linear_velocity < 0.0 { constraints.min_linear_velocity.abs().min(v_max) } else { 0.0 };
+    out.push(Halfplane { a_v: dir, a_w: 0.0, b: -back });
     out.push(Halfplane { a_v: -dir, a_w: 0.0, b: -v_max });
     let kappa = max_curvature(constraints);
     if is_ackermann(constraints.steering_type) && kappa.is_finite() {
@@ -195,5 +197,14 @@ mod tests {
         let cfg = SafetyConfig { enabled: true, ..SafetyConfig::default() };
         let (v, _) = filter(&cfg, &constraints(), &pose(0.0, 0.0, 0.0), (0.5, 0.0), 0.0, Some(&world(1.3, 0.0, -1.0, 0.0))).unwrap();
         assert!(v <= 1e-9, "v {v}");
+    }
+
+    #[test]
+    fn reverses_away_from_an_obstacle_closing_head_on_when_it_can() {
+        let cfg = SafetyConfig { enabled: true, ..SafetyConfig::default() };
+        let mut c = constraints();
+        c.min_linear_velocity = -1.0;
+        let (v, _) = filter(&cfg, &c, &pose(0.0, 0.0, 0.0), (0.5, 0.0), 0.0, Some(&world(1.3, 0.0, -1.0, 0.0))).unwrap();
+        assert!(v < -0.1, "v {v}");
     }
 }
