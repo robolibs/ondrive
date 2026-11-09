@@ -301,6 +301,7 @@ impl Controller for McaFollower {
         let all: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
         let detoured = self.mppi.detoured_points(state, all, reach, n, step, speed);
         let relax = detour_relax(&detoured, (speed * step).max(0.3));
+        let ref_scale = ref_scale.min(self.mppi.give_way(state, constraints, all, n, step, speed));
         self.mppi.step_with(state, goal, constraints, dt, &extra, &relax, ref_scale, "MCA tracking", "mca_tracking")
     }
 

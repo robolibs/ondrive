@@ -105,6 +105,7 @@ fn polygon_distance(poly: &[(f64, f64)], x: f64, y: f64) -> f64 {
 
 /// Footprint-aware clearance against predicted obstacles and the occupancy
 /// grid of a `WorldConstraints`. Built once per tick.
+#[derive(Clone)]
 pub struct CollisionChecker<'a> {
     world: Option<&'a WorldConstraints>,
     /// Body-frame footprint polygon; empty for a disc.
@@ -320,14 +321,19 @@ pub fn footprint_discs(constraints: &RobotConstraints) -> Vec<(f64, f64)> {
     (0..n).map(|i| (back + half_step * (2 * i + 1) as f64, radius)).collect()
 }
 
-/// The fastest of `shares` of the command `(v, omega)` whose arc from
-/// `(x, y, yaw)`, held for `lookout` seconds plus the time to stop from it at
-/// `decel`, stays clear of `checker`'s obstacles as they move. When none
-/// does, the share (standing still included) keeping the most room.
+/// The fastest of `shares` of `speed` that keeps `checker`'s obstacles, as
+/// they move, clear of the robot driving `course` (its pose after a signed
+/// distance), setting off at `v_now` and changing speed at `decel`, over
+/// `lookout` seconds plus the time to stop plus `STANDING_TAIL_S`: either
+/// held throughout, passing ahead of them, or held for `lookout` and then
+/// braked to a stand, letting them pass. When none does: standing still if
+/// braking now keeps clear of their predicted tracks, else the share
+/// (standing still included) keeping the most room.
 pub fn yield_share(
     checker: &CollisionChecker,
-    (x, y, yaw): (f64, f64, f64),
-    (v, omega): (f64, f64),
+    course: &dyn Fn(f64) -> (f64, f64, f64),
+    speed: f64,
+    v_now: f64,
     lookout: f64,
     decel: f64,
     shares: &[f64],
@@ -335,24 +341,46 @@ pub fn yield_share(
     if !checker.has_obstacles() {
         return 1.0;
     }
-    let room = |s: f64| {
-        let (u, w) = (v * s, omega * s);
-        let horizon = lookout + u.abs() / decel.max(1e-3);
+    let decel = decel.max(1e-3);
+    let nominal = checker.clone().with_spread(0.0);
+    let arc_on = |checker: &CollisionChecker, s: f64, brake: bool| {
+        let u = speed * s;
+        let horizon = lookout + u.abs().max(v_now.abs()) / decel + STANDING_TAIL_S;
         let step = 0.05;
-        let (mut px, mut py, mut th, mut t) = (x, y, yaw, 0.0);
+        let (mut along, mut t, mut v) = (0.0, 0.0, v_now);
         let mut worst = f64::INFINITY;
         while t <= horizon {
+            let (px, py, th) = course(along);
             worst = worst.min(checker.clearance_at(t, px, py, th));
-            px += u * step * th.cos();
-            py += u * step * th.sin();
-            th += w * step;
+            let aim = if brake && t >= lookout { 0.0 } else { u };
+            v += (aim - v).clamp(-decel * step, decel * step);
+            along += v * step;
             t += step;
         }
         worst
     };
-    shares
-        .iter()
-        .copied()
-        .find(|s| room(*s) >= 0.0)
-        .unwrap_or_else(|| shares.iter().copied().chain([0.0]).max_by(|a, b| room(*a).total_cmp(&room(*b))).unwrap_or(0.0))
+    let room = |s: f64| arc_on(checker, s, false).max(arc_on(checker, s, true));
+    shares.iter().copied().find(|s| room(*s) >= 0.0).unwrap_or_else(|| {
+        if arc_on(&nominal, 0.0, true) >= 0.0 {
+            return 0.0;
+        }
+        shares.iter().copied().chain([0.0]).max_by(|a, b| room(*a).total_cmp(&room(*b))).unwrap_or(0.0)
+    })
+}
+
+/// Seconds the give-way check stands the robot after braking, watching for
+/// traffic still crossing where it stopped.
+const STANDING_TAIL_S: f64 = 4.0;
+
+/// The course of an arc of curvature `kappa` from `(x, y, yaw)`: the pose
+/// after a signed distance along it.
+pub fn arc_course((x, y, yaw): (f64, f64, f64), kappa: f64) -> impl Fn(f64) -> (f64, f64, f64) {
+    move |d| {
+        if kappa.abs() < 1e-9 {
+            (x + d * yaw.cos(), y + d * yaw.sin(), yaw)
+        } else {
+            let th = yaw + kappa * d;
+            (x + (th.sin() - yaw.sin()) / kappa, y - (th.cos() - yaw.cos()) / kappa, th)
+        }
+    }
 }

@@ -155,8 +155,8 @@ pub(crate) fn actuated_after(model: &Model, previous: Option<f64>, command: f64,
 /// reference at `GIVE_WAY_SHARES` of its pace, letting the crossing pass
 /// first (the same idea over time instead of space).
 pub(crate) fn guided(reference: &mut Reference, obstacles: &[Obstacle], reach: f64, dt: f64) -> Vec<Guide> {
-    let crossing = obstacles.iter().any(|o| crate::pred::mppi::crosses(o, reference, dt));
-    let obstacles = crate::pred::mppi::to_go_round(obstacles, reference, dt);
+    let crossing = obstacles.iter().any(|o| crate::pred::mppi::crosses(o, reference, dt, reach));
+    let obstacles = crate::pred::mppi::to_go_round(obstacles, reference, dt, reach);
     let detours: Vec<Guide> = [1.0, -1.0]
         .into_iter()
         .filter_map(|side| {

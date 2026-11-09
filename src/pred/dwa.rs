@@ -227,6 +227,7 @@ impl Controller for DwaFollower {
             .filter(|w| !w.obstacles.is_empty())
             .map(|w| CollisionChecker::new(Some(w), constraints, 0.0).with_step(sim_dt).with_spread(2.0));
         let yielding = tail.as_ref().is_some_and(|c| !hit_while_braking(c, (x0, y0, yaw0), v_now.abs(), a_lin, 0, sim_dt));
+        let target_v = target_v * give_way(world, constraints, (x0, y0, course), target_v, v_now.abs());
         let mut samples: Vec<Sample> = Vec::with_capacity(v_samples * w_samples * vy_samples);
         for vi in 0..v_samples {
             let v = v_min + (v_max - v_min) * vi as f64 / (v_samples - 1) as f64;
@@ -451,6 +452,35 @@ fn hit_while_braking(
         }
     }
     false
+}
+
+/// Share of `speed` along `course` from `(x, y)`, setting off at `v_now`,
+/// that gives way to the obstacles moving across that course: `yield_share`
+/// against those alone.
+fn give_way(world: Option<&WorldConstraints>, constraints: &RobotConstraints, (x, y, course): (f64, f64, f64), speed: f64, v_now: f64) -> f64 {
+    let Some(w) = world else { return 1.0 };
+    let crossing = WorldConstraints {
+        obstacles: w.obstacles.iter().filter(|o| moving(o) && !along_heading(o, course)).cloned().collect(),
+        ..Default::default()
+    };
+    if crossing.obstacles.is_empty() {
+        return 1.0;
+    }
+    use crate::pred::mppi::{GIVE_WAY_LOOKOUT_S, GIVE_WAY_MARGIN, GIVE_WAY_SHARES};
+    let checker = CollisionChecker::new(Some(&crossing), constraints, GIVE_WAY_MARGIN).with_spread(1.0);
+    let decel = constraints.max_linear_acceleration.abs();
+    let line = crate::core::obstacles::arc_course((x, y, course), 0.0);
+    crate::core::obstacles::yield_share(&checker, &line, speed, v_now, GIVE_WAY_LOOKOUT_S, decel, &GIVE_WAY_SHARES)
+}
+
+/// Whether `o` moves faster than a crawl over the first second of its
+/// prediction.
+fn moving(o: &crate::types::Obstacle) -> bool {
+    use crate::core::obstacles::modes_at;
+    let (Some(now), Some(soon)) = (modes_at(o, 0.0, 0.1).next(), modes_at(o, 1.0, 0.1).next()) else {
+        return false;
+    };
+    (soon.x - now.x).hypot(soon.y - now.y) > 0.1
 }
 
 /// Whether `o` moves along the line of a robot heading `yaw` (more along

@@ -267,7 +267,9 @@ impl TebFollower {
         let speed = (0.8 * constraints.max_linear_velocity).max(0.1);
         let reference = build_reference(&self.base.path, &self.cursor.cum, from, n, step, speed, 0.0);
         let pose = (state.pose.point.x, state.pose.point.y, state.pose.rotation.to_euler().yaw);
-        give_way_share(&reference, &world.obstacles, constraints, pose, command, step)
+        let (v, w) = command;
+        let course = crate::core::obstacles::arc_course(pose, if v.abs() > 1e-9 { w / v } else { 0.0 });
+        give_way_share(&reference, &world.obstacles, constraints, &course, v, v, step)
     }
 
     fn detour_guide(&mut self, from: f64, constraints: &RobotConstraints, obstacles: &[Obstacle]) -> Option<Vec<Pose>> {

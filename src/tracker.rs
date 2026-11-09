@@ -842,7 +842,7 @@ fn detour_target(
     let reference = crate::pred::mppi::build_reference(path, cum, from, n, DETOUR_DT, speed, 0.0);
     let along: Vec<crate::types::Obstacle> = obstacles
         .iter()
-        .filter(|o| !crate::pred::mppi::crosses(o, &reference, DETOUR_DT))
+        .filter(|o| !crate::pred::mppi::crosses(o, &reference, DETOUR_DT, crate::core::obstacles::robot_radius(constraints)))
         .cloned()
         .collect();
     if along.is_empty() {

@@ -659,7 +659,7 @@ pub(crate) fn command_from_controls(
         let omega = cfg.kp_angular.max(0.1) * epsi;
         return finalize(0.0, omega, constraints, cfg, allow_reverse, "Turning to align");
     }
-    let cap = if v_cap > 0.0 { v_cap } else { f64::INFINITY };
+    let cap = if v_cap >= 0.0 { v_cap } else { f64::INFINITY };
     let v = (v_now + accel * dt).clamp(-cap, cap);
     if is_holonomic(constraints.steering_type) {
         let vy = vy_now + accel_lat * dt;
@@ -742,8 +742,8 @@ impl MppiFollower {
     }
 
     /// Share of `speed` that gives way to traffic crossing the path ahead
-    /// (`n` steps of `step`): `give_way_share` for driving on at `speed` on
-    /// the present curvature.
+    /// (`n` steps of `step`): `give_way_share` for driving on along the
+    /// path at `speed`.
     pub(crate) fn give_way(
         &mut self,
         state: &RobotState,
@@ -756,19 +756,20 @@ impl MppiFollower {
         if obstacles.is_empty() {
             return 1.0;
         }
-        let reference = match &self.trajectory {
-            Some(traj) => build_timed_reference(traj, self.clock, n, step),
-            None => {
-                let Some(p) = self.cursor.project(&self.base.path.waypoints, state.pose.point, self.base.path_index) else {
-                    return 1.0;
-                };
-                build_reference(&self.base.path, &self.cursor.cum, p.arc_length, n, step, speed, 0.0)
-            }
+        let long = (GIVE_WAY_COURSE_S / step).ceil() as usize;
+        let mut reference = |n: usize| match &self.trajectory {
+            Some(traj) => Some(build_timed_reference(traj, self.clock, n, step)),
+            None => self
+                .cursor
+                .project(&self.base.path.waypoints, state.pose.point, self.base.path_index)
+                .map(|p| build_reference(&self.base.path, &self.cursor.cum, p.arc_length, n, step, speed, 0.0)),
         };
-        let (v, w) = if state.velocity_valid { (state.velocity.linear, state.velocity.angular) } else { (self.last_v, 0.0) };
-        let kappa = w / v.abs().max(0.1);
-        let pose = (state.pose.point.x, state.pose.point.y, state.pose.rotation.to_euler().yaw);
-        give_way_share(&reference, obstacles, constraints, pose, (speed, speed * kappa), step)
+        let (Some(near), Some(ahead)) = (reference(n), reference(long.max(n))) else {
+            return 1.0;
+        };
+        let course = polyline_course((0..ahead.x.len()).map(|i| (ahead.x[i], ahead.y[i], ahead.yaw[i])).collect());
+        let v = if state.velocity_valid { state.velocity.linear } else { self.last_v };
+        give_way_share(&near, obstacles, constraints, &course, speed, v, step)
     }
 
     /// Forgets the guides recorded for display.
@@ -1073,10 +1074,12 @@ impl MppiFollower {
         );
 
         let dt_apply = dt.min(working.dt);
+        let top = constraints.max_linear_velocity;
         let v_cap = speed_at_arc_length(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length)
             .unwrap_or(f64::INFINITY)
-            .min(speed_scale * constraints.max_linear_velocity.max(0.0))
-            .min(crate::pred::mpc::REF_SPEED_HEADROOM * working.ref_velocity.max(0.1));
+            .min(if top > 0.0 { top } else { f64::INFINITY })
+            .min(crate::pred::mpc::REF_SPEED_HEADROOM * working.ref_velocity.max(0.1))
+            * speed_scale;
         self.base.status.mode = mode.into();
         let cmd = command_from_controls(
             v_now,
@@ -1430,18 +1433,21 @@ pub(crate) fn correlated_noise(out: &mut [f64], sigma: f64, rho: f64, rng: &mut 
     }
 }
 
-/// Share of `command` from `pose` that gives way to the obstacles crossing
-/// `reference` (one point per `step`): `yield_share` against those alone.
+/// Share of `speed` along `course`, setting off at `v_now`, that gives way
+/// to the obstacles crossing `reference` (one point per `step`):
+/// `yield_share` against those alone.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn give_way_share(
     reference: &Reference,
     obstacles: &[Obstacle],
     constraints: &RobotConstraints,
-    pose: (f64, f64, f64),
-    command: (f64, f64),
+    course: &dyn Fn(f64) -> (f64, f64, f64),
+    speed: f64,
+    v_now: f64,
     step: f64,
 ) -> f64 {
     let crossing = WorldConstraints {
-        obstacles: obstacles.iter().filter(|o| crosses(o, reference, step)).cloned().collect(),
+        obstacles: obstacles.iter().filter(|o| crosses(o, reference, step, robot_radius(constraints))).cloned().collect(),
         ..Default::default()
     };
     if crossing.obstacles.is_empty() {
@@ -1449,34 +1455,64 @@ pub(crate) fn give_way_share(
     }
     let checker = CollisionChecker::new(Some(&crossing), constraints, GIVE_WAY_MARGIN).with_spread(1.0);
     let decel = constraints.max_linear_acceleration.abs();
-    yield_share(&checker, pose, command, GIVE_WAY_LOOKOUT_S, decel, &GIVE_WAY_SHARES)
+    yield_share(&checker, course, speed, v_now, GIVE_WAY_LOOKOUT_S, decel, &GIVE_WAY_SHARES)
 }
 
-/// Shares of the command tried, fastest first, until its arc keeps clear of
-/// crossing traffic.
-const GIVE_WAY_SHARES: [f64; 4] = [1.0, 0.75, 0.5, 0.25];
-/// Seconds the give-way check watches the arc for crossing traffic.
-const GIVE_WAY_LOOKOUT_S: f64 = 2.0;
+/// The course along the polyline `points` (x, y, yaw): the pose after a
+/// distance along it, held on the last heading past either end.
+pub(crate) fn polyline_course(points: Vec<(f64, f64, f64)>) -> impl Fn(f64) -> (f64, f64, f64) {
+    let mut cum = vec![0.0];
+    for w in points.windows(2) {
+        cum.push(cum.last().unwrap() + (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1));
+    }
+    move |d| {
+        let Some(&first) = points.first() else { return (0.0, 0.0, 0.0) };
+        if d <= 0.0 || points.len() == 1 {
+            let (x, y, yaw) = first;
+            return (x + d * yaw.cos(), y + d * yaw.sin(), yaw);
+        }
+        let last = cum.len() - 1;
+        if d >= cum[last] {
+            let (x, y, yaw) = points[last];
+            let over = d - cum[last];
+            return (x + over * yaw.cos(), y + over * yaw.sin(), yaw);
+        }
+        let i = cum.partition_point(|c| *c <= d).saturating_sub(1).min(last - 1);
+        let u = ((d - cum[i]) / (cum[i + 1] - cum[i]).max(1e-9)).clamp(0.0, 1.0);
+        let (a, b) = (points[i], points[i + 1]);
+        (a.0 + u * (b.0 - a.0), a.1 + u * (b.1 - a.1), a.2 + u * normalize_angle(b.2 - a.2))
+    }
+}
+
+/// Shares of the speed tried, fastest first, until its course keeps clear
+/// of crossing traffic.
+pub(crate) const GIVE_WAY_SHARES: [f64; 4] = [1.0, 0.75, 0.5, 0.25];
+/// Seconds the give-way check watches the course for crossing traffic.
+pub(crate) const GIVE_WAY_LOOKOUT_S: f64 = 2.0;
+/// Seconds of path at the reference speed the give-way course spans.
+const GIVE_WAY_COURSE_S: f64 = 12.0;
 /// Room, metres, the give-way check keeps beyond the footprint.
-const GIVE_WAY_MARGIN: f64 = 0.1;
+pub(crate) const GIVE_WAY_MARGIN: f64 = 0.1;
 
 /// Whether `o` is about to cross the path: it moves across it (more across
 /// than along, at the point of `reference` nearest it) rather than stands
 /// on it or moves along it, and its prediction comes within `CROSSING_REACH`
-/// of the stretch of path `reference` covers: traffic to give way to, not
-/// to go round. Its velocity is read over the first second of its
-/// prediction, in steps of `step`.
-pub(crate) fn crosses(o: &Obstacle, reference: &Reference, step: f64) -> bool {
-    moves_across(o, reference, step) && comes_near(o, reference, step)
+/// of the stretch of path `reference` covers, or within the room a detour
+/// with `reach` keeps from it: traffic to give way to, not to go round. Its
+/// velocity is read over the first second of its prediction, in steps of
+/// `step`.
+pub(crate) fn crosses(o: &Obstacle, reference: &Reference, step: f64, reach: f64) -> bool {
+    moves_across(o, reference, step) && comes_near(o, reference, step, reach)
 }
 
 /// Whether any point of `o`'s prediction over the reference's span comes
-/// within its radius plus `CROSSING_REACH` of any point of `reference`.
-fn comes_near(o: &Obstacle, reference: &Reference, step: f64) -> bool {
+/// within its radius plus `CROSSING_REACH`, or plus the detour room of
+/// `reach`, of any point of `reference`.
+fn comes_near(o: &Obstacle, reference: &Reference, step: f64, reach: f64) -> bool {
     (0..reference.x.len()).any(|k| {
         modes_at(o, k as f64 * step, step).any(|m| {
-            (0..reference.x.len())
-                .any(|i| (m.x - reference.x[i]).hypot(m.y - reference.y[i]) < m.radius + CROSSING_REACH)
+            let near = m.radius + CROSSING_REACH.max(reach + DETOUR_MARGIN + 2.0 * m.std_x.max(m.std_y));
+            (0..reference.x.len()).any(|i| (m.x - reference.x[i]).hypot(m.y - reference.y[i]) < near)
         })
     })
 }
@@ -1508,8 +1544,8 @@ const CROSSING_MIN_SPEED: f64 = 0.1;
 
 /// The obstacles of `obstacles` that are worth going round on `reference`:
 /// all but the ones crossing it.
-pub(crate) fn to_go_round(obstacles: &[Obstacle], reference: &Reference, step: f64) -> Vec<Obstacle> {
-    obstacles.iter().filter(|o| !crosses(o, reference, step)).cloned().collect()
+pub(crate) fn to_go_round(obstacles: &[Obstacle], reference: &Reference, step: f64, reach: f64) -> Vec<Obstacle> {
+    obstacles.iter().filter(|o| !crosses(o, reference, step, reach)).cloned().collect()
 }
 
 /// Points of `reference` that the detour `g` leaves, each with its offset.
@@ -1525,7 +1561,7 @@ pub(crate) fn left_by(reference: &Reference, g: &Reference) -> Vec<(f64, f64, f6
 /// The detours of `reference` round `obstacles` (not those crossing it) on
 /// each side, as paths: what a controller steering by them shows.
 pub(crate) fn guide_paths(reference: &Reference, obstacles: &[Obstacle], reach: f64, step: f64) -> Vec<Vec<Point>> {
-    let obstacles = to_go_round(obstacles, reference, step);
+    let obstacles = to_go_round(obstacles, reference, step, reach);
     [1.0, -1.0]
         .into_iter()
         .filter_map(|side| reference.detour(&obstacles, reach + DETOUR_MARGIN, step, side, DETOUR_RAMP))
@@ -1545,7 +1581,7 @@ pub(crate) fn pick_detour(
     side: &mut f64,
 ) -> Option<Reference> {
     use crate::pred::mpc::SIDE_SWITCH_COST;
-    let obstacles = to_go_round(obstacles, reference, step);
+    let obstacles = to_go_round(obstacles, reference, step, reach);
     let mut best: Option<(f64, f64, Reference)> = None;
     for s in [1.0, -1.0] {
         let Some(g) = reference.detour(&obstacles, reach + DETOUR_MARGIN, step, s, DETOUR_RAMP) else {
