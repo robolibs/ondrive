@@ -51,6 +51,22 @@ impl TrackerKind {
         matches!(self, TrackerKind::Pid | TrackerKind::Carrot | TrackerKind::Dwa | TrackerKind::PoseReach | TrackerKind::PoseRegulator | TrackerKind::Apf)
     }
 
+    /// Whether the controller, or the tracker on its behalf, steers round
+    /// obstacles; every other one runs the safety filter by default.
+    pub fn avoids_obstacles(self) -> bool {
+        !matches!(
+            self,
+            TrackerKind::PurePursuit
+                | TrackerKind::Stanley
+                | TrackerKind::Lqr
+                | TrackerKind::Kanayama
+                | TrackerKind::VectorPursuit
+                | TrackerKind::Flc
+                | TrackerKind::Ilc
+                | TrackerKind::SlipAdaptive
+        )
+    }
+
     /// Whether the controller models the machine's actuation lag itself;
     /// the tracker hands every other one the state predicted through it.
     pub fn models_actuation(self) -> bool {
@@ -116,7 +132,7 @@ impl Tracker {
             last_steering: None,
             last_command: None,
             stalled_for: 0.0,
-            safety: crate::core::safety::SafetyConfig::default(),
+            safety: crate::core::safety::SafetyConfig { enabled: !kind.avoids_obstacles(), ..Default::default() },
         }
     }
 
