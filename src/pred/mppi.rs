@@ -956,7 +956,7 @@ impl MppiFollower {
         constraints: &RobotConstraints,
         dt: f64,
         extra: &dyn Fn(usize, f64, f64, f64) -> f64,
-        relax: &dyn Fn(f64, f64) -> (f64, f64),
+        relax: &dyn Fn(f64, f64) -> (f64, f64, f64),
         ref_scale: f64,
         message: &str,
         mode: &str,
@@ -1012,11 +1012,7 @@ impl MppiFollower {
         );
         let mut corridor = corridor;
         corridor.release = (0.5 * prep.pos_tol).max(0.05);
-        for i in 0..corridor.x.len() {
-            let (scale, allow) = relax(corridor.x[i], corridor.y[i]);
-            corridor.lateral[i] = scale.clamp(0.0, 1.0);
-            corridor.allow[i] = allow.max(0.0);
-        }
+        corridor.relax_with(relax);
         let w = self.weights(&working);
         let cost_of = |steer: &[f64], accel: &[f64], accel_lat: &[f64], collect: bool| match &reference {
             Some(r) => rollout(&model, steer, accel, accel_lat, r, &w, extra, collect),
@@ -1249,7 +1245,7 @@ impl Controller for MppiFollower {
         let obstacles: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
         let has_grid = world.is_some_and(|w| w.grid.is_some());
         if (obstacles.is_empty() && !has_grid) || (cfg.weight_collision <= 0.0 && cfg.weight_repulsion <= 0.0) {
-            return self.step_with(state, goal, constraints, dt, &|_, _, _, _| 0.0, &|_, _| (1.0, 0.0), 1.0, "MPPI tracking", "mppi_tracking");
+            return self.step_with(state, goal, constraints, dt, &|_, _, _, _| 0.0, &|_, _| (1.0, 0.0, 0.0), 1.0, "MPPI tracking", "mppi_tracking");
         }
         let (n, step) = self.plan_for(constraints);
         let (n, step) = (n.max(1), step.max(1e-3));
@@ -1358,12 +1354,28 @@ pub(crate) struct Corridor {
     pub lateral: Vec<f64>,
     /// Lateral error past which the full weight returns at each point.
     pub allow: Vec<f64>,
+    /// Sideways offset, + to the left, the eased weight pulls towards at
+    /// each point: the detour's.
+    pub toward: Vec<f64>,
     pub spacing: f64,
     /// Indices of the cusps: the last point before the direction changes.
     pub cusps: Vec<usize>,
     /// How close a rollout must come to a cusp before it counts as
     /// progressing onto the next leg.
     pub release: f64,
+}
+
+impl Corridor {
+    /// Eases the lateral and heading weights at each point by `relax`:
+    /// `(scale, allow, toward)`.
+    pub(crate) fn relax_with(&mut self, relax: &dyn Fn(f64, f64) -> (f64, f64, f64)) {
+        for i in 0..self.x.len() {
+            let (scale, allow, toward) = relax(self.x[i], self.y[i]);
+            self.lateral[i] = scale.clamp(0.0, 1.0);
+            self.allow[i] = allow.max(0.0);
+            self.toward[i] = toward;
+        }
+    }
 }
 
 /// Signed speed of the path at arc length `s`: that of the waypoint the
@@ -1413,6 +1425,7 @@ pub(crate) fn build_corridor(
         c.v.push(if reverse { -v } else { v });
         c.lateral.push(1.0);
         c.allow.push(0.0);
+        c.toward.push(0.0);
         if s >= total || s >= s0 + length {
             break;
         }
@@ -1489,7 +1502,9 @@ pub(crate) fn rollout_corridor(
             let heading = normalize_angle(yaw - corridor.yaw[j]);
             let speed = v - corridor.v[j];
             let relaxed = corridor.lateral[j];
-            stage += w.cte * eased_lateral(lateral, relaxed, corridor.allow[j]).0
+            let excess = (lateral.abs() - corridor.allow[j]).max(0.0);
+            let pulled = lateral - corridor.toward[j];
+            stage += w.cte * (relaxed * pulled * pulled + (1.0 - relaxed) * excess * excess)
                 + relaxed * w.epsi * heading * heading
                 + w.vel * speed * speed;
         }
@@ -1727,6 +1742,30 @@ fn behind(o: &Obstacle, reference: &Reference, step: f64) -> Option<f64> {
     velocity_on(o, reference, step).map(|(across, _)| -across.signum())
 }
 
+/// Whether the detour to `side` of `along` driven at `speed` for twice the
+/// span of `reference` comes back within `settled` of it somewhere past
+/// that span: a detour the horizon cut short rather than one racing traffic.
+#[allow(clippy::too_many_arguments)]
+fn settles_later(along: &Along, reference: &Reference, obstacles: &[Obstacle], reach: f64, step: f64, speed: f64, side: f64, swerve: Swerve, settled: f64) -> bool {
+    let n = reference.x.len();
+    let longer = along.reference(2 * n, step, speed);
+    let Some(g) = longer.detour(obstacles, reach + DETOUR_MARGIN, step, side, DETOUR_RAMP, swerve) else {
+        return true;
+    };
+    (n..g.x.len().min(longer.x.len())).any(|i| (g.x[i] - longer.x[i]).hypot(g.y[i] - longer.y[i]) <= settled)
+}
+
+/// Whether `o` stands now behind `rear`, metres along the heading of
+/// `reference`'s first point (negative behind it), by more than its radius:
+/// traffic the robot has already passed.
+fn left_behind(o: &Obstacle, reference: &Reference, rear: f64) -> bool {
+    let (Some(m), Some(&x), Some(&y), Some(&yaw)) = (modes_at(o, 0.0, 1.0).next(), reference.x.first(), reference.y.first(), reference.yaw.first()) else {
+        return false;
+    };
+    let (s, c) = yaw.sin_cos();
+    (m.x - x) * c + (m.y - y) * s < rear - m.radius
+}
+
 /// The side passing behind each obstacle of `obstacles` crossing `reference`.
 fn behind_sides(obstacles: &[Obstacle], reference: &Reference, step: f64, reach: f64) -> Vec<f64> {
     obstacles.iter().filter(|o| crosses(o, reference, step, reach)).filter_map(|o| behind(o, reference, step)).collect()
@@ -1746,12 +1785,14 @@ const AHEAD_COST: f64 = 2.0;
 /// Speed, m/s, below which an obstacle counts as standing.
 const CROSSING_MIN_SPEED: f64 = 0.1;
 
-/// Points of `reference` that the detour `g` leaves, each with its offset.
+/// Points of `reference` that the detour `g` leaves, each with its offset
+/// sideways, + to the left.
 pub(crate) fn left_by(reference: &Reference, g: &Reference) -> Vec<(f64, f64, f64)> {
     (0..reference.x.len().min(g.x.len()))
         .filter_map(|i| {
-            let offset = (g.x[i] - reference.x[i]).hypot(g.y[i] - reference.y[i]);
-            (offset > 1e-3).then_some((reference.x[i], reference.y[i], offset))
+            let (s, c) = reference.yaw[i].sin_cos();
+            let offset = -(g.x[i] - reference.x[i]) * s + (g.y[i] - reference.y[i]) * c;
+            (offset.abs() > 1e-3).then_some((reference.x[i], reference.y[i], offset))
         })
         .collect()
 }
@@ -1818,8 +1859,9 @@ pub(crate) struct Avoidance {
 /// that share of `speed` and on for `swerve`'s lookahead (at least
 /// `CROSSING_LOOKOUT_S` while traffic crosses), the cheapest, never a
 /// detour in front of crossing traffic still shifting at its end
-/// (`AHEAD_TAIL`): a detour costs its widest shift, metres, `AHEAD_COST`
-/// times more in front of crossing traffic, plus `LATE_COST` per metre the
+/// (`AHEAD_TAIL`): a detour costs its widest shift, metres, plus the square
+/// of its excess over the robot's width per width, `AHEAD_COST` times more
+/// in front of crossing traffic, plus `LATE_COST` per metre the
 /// robot sits off where it starts (`guide_gap`), and a pace `PACE_COST` per
 /// share of the speed given up. `last` (side, pace) is kept unless another
 /// is cheaper by `SIDE_SWITCH_COST`, and updated.
@@ -1836,15 +1878,19 @@ pub(crate) fn plan_avoidance(
     last: &mut (f64, f64),
 ) -> Avoidance {
     use crate::pred::mpc::SIDE_SWITCH_COST;
+    let (back, _, half, keep) = swerve.keep(reach);
+    let width = 2.0 * if half > 0.0 { half } else { reach.max(0.1) };
+    let start = along.reference(1, step, speed);
+    let ahead: Vec<Obstacle> = obstacles.iter().filter(|o| !left_behind(o, &start, back - keep)).cloned().collect();
     let mut far = n + (swerve.lookahead() / (speed.abs() * step).max(1e-3)).ceil() as usize;
-    if obstacles.iter().any(|o| crosses(o, &along.reference(far, step, speed), step, reach)) {
+    if ahead.iter().any(|o| crosses(o, &along.reference(far, step, speed), step, reach)) {
         far = far.max((CROSSING_LOOKOUT_S / step.max(1e-3)).ceil() as usize);
     }
     let paces: &[f64] = if along.trajectory.is_some() { &AVOID_PACES[..1] } else { &AVOID_PACES };
     let mut best: Option<(f64, f64, Avoidance)> = None;
     for &pace in paces {
         let reference = along.reference((far as f64 / pace).ceil() as usize, step, speed * pace);
-        let behinds = behind_sides(obstacles, &reference, step, reach);
+        let behinds = behind_sides(&ahead, &reference, step, reach);
         let mut options: Vec<(f64, f64, Option<Reference>)> = Vec::new();
         let mut met = false;
         for s in [1.0, -1.0] {
@@ -1856,12 +1902,15 @@ pub(crate) fn plan_avoidance(
             let shift: Vec<f64> = (0..g.x.len()).map(|i| (g.x[i] - reference.x[i]).hypot(g.y[i] - reference.y[i])).collect();
             let widest = shift.iter().copied().fold(0.0_f64, f64::max);
             let in_front = behinds.iter().any(|b| *b != s);
-            let racing = in_front && shift.last().is_some_and(|t| *t > AHEAD_TAIL * widest);
+            let racing = in_front
+                && shift.last().is_some_and(|t| *t > AHEAD_TAIL * widest)
+                && !settles_later(along, &reference, obstacles, reach, step, speed * pace, s, swerve, AHEAD_TAIL * widest);
             if racing {
                 continue;
             }
             let late = LATE_COST * (guide_gap(&reference, &points, robot) - SWERVE_SLACK).max(0.0);
-            options.push((s, if in_front { AHEAD_COST } else { 1.0 } * widest + late, Some(g)));
+            let wide = widest + (widest - width).max(0.0).powi(2) / width;
+            options.push((s, if in_front { AHEAD_COST } else { 1.0 } * wide + late, Some(g)));
         }
         if !met {
             options.push((0.0, 0.0, None));
@@ -1888,13 +1937,13 @@ pub(crate) fn plan_avoidance(
 }
 
 /// Shares of the reference speed an avoidance plan weighs, fastest first.
-pub(crate) const AVOID_PACES: [f64; 4] = [1.0, 0.75, 0.5, 0.25];
+pub(crate) const AVOID_PACES: [f64; 6] = [1.0, 0.85, 0.7, 0.55, 0.4, 0.25];
 /// Cost, in metres of detour, per metre the robot sits sideways of where a
 /// detour starts beyond `SWERVE_SLACK`: a swerve begun too late.
 const LATE_COST: f64 = 10.0;
 /// Seconds ahead an avoidance plan looks at least while traffic crosses
 /// the path, to see the crossing through.
-const CROSSING_LOOKOUT_S: f64 = 10.0;
+const CROSSING_LOOKOUT_S: f64 = 15.0;
 /// Share of its widest shift above which a detour in front of crossing
 /// traffic still shifts at its end: racing the traffic past the reference.
 const AHEAD_TAIL: f64 = 0.5;
@@ -1939,16 +1988,17 @@ const PURSUE_TIME_S: f64 = 1.0;
 /// Every how many samples one rollout is kept for display.
 const ROLLOUT_STRIDE: usize = 16;
 
-/// `(DETOURED_WEIGHT, offset + margin)` of the nearest `detoured` point
-/// within `near`, else `(1, 0)`: the easing of the lateral weight there.
-pub(crate) fn detour_relax(detoured: &[(f64, f64, f64)], near: f64) -> impl Fn(f64, f64) -> (f64, f64) + '_ {
+/// `(DETOURED_WEIGHT, |offset| + margin, offset)` of the widest `detoured`
+/// point within `near`, else `(1, 0, 0)`: the easing of the lateral weight
+/// there and the sideways offset it pulls towards.
+pub(crate) fn detour_relax(detoured: &[(f64, f64, f64)], near: f64) -> impl Fn(f64, f64) -> (f64, f64, f64) + '_ {
     move |x, y| {
         detoured
             .iter()
             .filter(|(px, py, _)| (px - x).hypot(py - y) < near)
-            .map(|(_, _, offset)| offset + ALLOW_MARGIN)
-            .reduce(f64::max)
-            .map_or((1.0, 0.0), |allow| (DETOURED_WEIGHT, allow))
+            .map(|(_, _, offset)| *offset)
+            .reduce(|a, b| if b.abs() > a.abs() { b } else { a })
+            .map_or((1.0, 0.0, 0.0), |offset| (DETOURED_WEIGHT, offset.abs() + ALLOW_MARGIN, offset))
     }
 }
 
@@ -1992,21 +2042,16 @@ impl Track {
     }
 
     /// Eases the lateral and heading weights at each point by `relax`:
-    /// `(scale, allow)`, see [`eased_lateral`].
-    pub(crate) fn relax_with(&mut self, relax: &dyn Fn(f64, f64) -> (f64, f64)) {
+    /// `(scale, allow, toward)`, see [`eased_lateral`]; a path's eased
+    /// weight pulls towards `toward`.
+    pub(crate) fn relax_with(&mut self, relax: &dyn Fn(f64, f64) -> (f64, f64, f64)) {
         match self {
             Track::Timed(r) => {
-                let eased: Vec<(f64, f64)> = (0..r.x.len()).map(|i| relax(r.x[i], r.y[i])).collect();
+                let eased: Vec<(f64, f64, f64)> = (0..r.x.len()).map(|i| relax(r.x[i], r.y[i])).collect();
                 r.lateral = eased.iter().map(|e| e.0.clamp(0.0, 1.0)).collect();
                 r.allow = eased.iter().map(|e| e.1.max(0.0)).collect();
             }
-            Track::Path(c) => {
-                for i in 0..c.x.len() {
-                    let (scale, allow) = relax(c.x[i], c.y[i]);
-                    c.lateral[i] = scale.clamp(0.0, 1.0);
-                    c.allow[i] = allow.max(0.0);
-                }
-            }
+            Track::Path(c) => c.relax_with(relax),
         }
     }
 
@@ -2030,7 +2075,7 @@ impl Track {
 
 #[cfg(test)]
 mod tests {
-    use super::{Along, Reference, Swerve, eased_lateral, pick_detour, plan_avoidance};
+    use super::{Along, Reference, Swerve, detour_relax, eased_lateral, left_behind, left_by, pick_detour, plan_avoidance};
     use crate::types::{Footprint, GaussianMode, Obstacle, Path, RobotConstraints, SteeringType};
     use datapod::{Euler, Point, Pose, Quaternion};
 
@@ -2115,6 +2160,39 @@ mod tests {
             pick_detour(&reference, &[mover], 0.6, 0.15, &mut side, Swerve::default());
             assert_eq!(side, -1.0, "robot at {x}, mover at {y}");
         }
+    }
+
+    #[test]
+    fn detour_relax_pulls_towards_the_signed_offset_of_the_widest_detour() {
+        let detoured = [(0.0, 0.0, 0.5), (1.0, 0.0, -1.2)];
+        let relax = detour_relax(&detoured, 2.0);
+        let (scale, allow, toward) = relax(0.5, 0.0);
+        assert_eq!(scale, crate::pred::mpc::DETOURED_WEIGHT);
+        assert!((allow - (1.2 + super::ALLOW_MARGIN)).abs() < 1e-12);
+        assert_eq!(toward, -1.2);
+        assert_eq!(relax(10.0, 0.0), (1.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn left_by_signs_the_offset_to_the_left() {
+        let reference = Reference { x: vec![0.0, 1.0, 2.0], y: vec![0.0; 3], yaw: vec![0.0; 3], v: vec![1.0; 3], ..Default::default() };
+        let mut guide = reference.clone();
+        guide.y = vec![0.0, 1.0, -0.5];
+        let left = left_by(&reference, &guide);
+        assert_eq!(left.len(), 2);
+        assert!((left[0].2 - 1.0).abs() < 1e-12 && (left[1].2 + 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn traffic_is_left_behind_once_past_the_rear() {
+        let start = Reference { x: vec![10.0, 10.2], y: vec![0.0; 2], yaw: vec![0.0; 2], v: vec![1.0; 2], ..Default::default() };
+        let at = |x: f64| {
+            let mode = GaussianMode { weight: 1.0, mean_x: vec![x; 2], mean_y: vec![-2.0; 2], std_x: vec![0.0; 2], std_y: vec![0.0; 2] };
+            Obstacle { id: 0, radius: 0.6, modes: vec![mode], dt: 0.2 }
+        };
+        assert!(left_behind(&at(7.0), &start, -1.5));
+        assert!(!left_behind(&at(8.5), &start, -1.5));
+        assert!(!left_behind(&at(14.0), &start, -1.5));
     }
 
     #[test]

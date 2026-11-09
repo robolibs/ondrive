@@ -249,7 +249,7 @@ impl Controller for McaFollower {
             .unwrap_or_default();
         let has_grid = world.is_some_and(|w| w.grid.is_some());
         if obstacles.is_empty() && !has_grid {
-            return self.mppi.step_with(state, goal, constraints, dt, &|_, _, _, _| 0.0, &|_, _| (1.0, 0.0), 1.0, "MCA tracking", "mca_tracking");
+            return self.mppi.step_with(state, goal, constraints, dt, &|_, _, _, _| 0.0, &|_, _| (1.0, 0.0, 0.0), 1.0, "MCA tracking", "mca_tracking");
         }
 
         let (n, step) = self.mppi.plan_for(constraints);
