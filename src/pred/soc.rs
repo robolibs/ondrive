@@ -34,14 +34,18 @@ const OBSTACLE_INFLUENCE: f64 = 1.0;
 /// Extra clearance treated as contact.
 const OBSTACLE_SAFETY_MARGIN: f64 = 0.2;
 
-/// Share of the gap to the best guide that the final samples are pulled
-/// through, `1 - alpha` of SVG-MPPI with alpha 0.1.
+/// Share of the gap to the best guide that the centre of the final samples
+/// moves, `1 - alpha` of SVG-MPPI with alpha 0.1.
 const GUIDE_PULL: f64 = 0.9;
+/// Weight of the pull of every control towards zero, over the configured
+/// sampling variance.
+const CONTROL_PULL: f64 = 0.05;
 /// Index of the guide that starts as the previous plan braked to a stop,
 /// followed whenever it is the cheapest.
 const BRAKE_GUIDE: usize = 1;
-/// Index of the guide that pursues the detour round the obstacles ahead,
-/// followed whenever it is the cheapest.
+/// Index of the guide that pursues the detour round the obstacles ahead, or
+/// the path when there is none; a detour is followed whenever it is the
+/// cheapest.
 const DETOUR_GUIDE: usize = 3;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -448,11 +452,15 @@ impl Controller for SocFollower {
         );
         self.debug.guides.clear();
         let mut detour: Vec<(f64, f64)> = Vec::new();
+        let ahead = match &self.trajectory {
+            Some(traj) => build_timed_reference(traj, self.clock, n, cfg.dt),
+            None => build_reference(&self.base.path, &self.cursor.cum, prep.proj.arc_length, n, cfg.dt, speed, 0.0),
+        };
+        let path_ahead: Vec<(f64, f64)> = {
+            let far = along.reference(2 * n, cfg.dt, speed);
+            (0..far.x.len()).map(|i| (far.x[i], far.y[i])).collect()
+        };
         if !obstacles.is_empty() {
-            let ahead = match &self.trajectory {
-                Some(traj) => build_timed_reference(traj, self.clock, n, cfg.dt),
-                None => build_reference(&self.base.path, &self.cursor.cum, prep.proj.arc_length, n, cfg.dt, speed, 0.0),
-            };
             let points = match pick_detour(&ahead, obstacles, robot_radius(constraints), cfg.dt, &mut self.side) {
                 Some(g) => {
                     detour = (0..g.x.len()).map(|i| (g.x[i], g.y[i])).collect();
@@ -515,10 +523,11 @@ impl Controller for SocFollower {
                 model.clamp_controls(&mut guides_s[i], &mut guides_a[i], &mut guides_al[i]);
             }
         }
-        // A fourth guide pursues the detour round the obstacles ahead.
+        // A fourth guide pursues the detour round the obstacles ahead, or the path.
         let has_detour = k_guide > DETOUR_GUIDE && detour.len() > 1;
-        if has_detour {
-            pursue(&model, &detour, speed, &mut guides_s[DETOUR_GUIDE], &mut guides_a[DETOUR_GUIDE], &mut guides_al[DETOUR_GUIDE]);
+        let pursued = if has_detour { &detour } else { &path_ahead };
+        if k_guide > DETOUR_GUIDE && pursued.len() > 1 {
+            pursue(&model, pursued, speed * share, &mut guides_s[DETOUR_GUIDE], &mut guides_a[DETOUR_GUIDE], &mut guides_al[DETOUR_GUIDE]);
             model.clamp_controls(&mut guides_s[DETOUR_GUIDE], &mut guides_a[DETOUR_GUIDE], &mut guides_al[DETOUR_GUIDE]);
         }
 
@@ -566,13 +575,17 @@ impl Controller for SocFollower {
 
         let k = cfg.num_samples.max(1);
         let lambda = self.lambda.max(1e-6);
-        // Final samples centre on the previous solution; the best guide pulls
-        // through the control term only (SVG-MPPI, Honda et al.).
-        let base_s = self.mean_steering.clone();
-        let base_a = self.mean_acceleration.clone();
-        let base_al = self.mean_accel_lateral.clone();
-        let (guide_s, guide_a, guide_al) = (&guides_s[best], &guides_a[best], &guides_al[best]);
+        // Final samples centre on the previous solution moved most of the way
+        // to the best guide (SVG-MPPI, Honda et al.).
         let (sb, ab, lb) = (model.steer_bound(), model.accel_bound(), model.accel_lat_bound());
+        let toward = |mean: &[f64], guide: &[f64], bound: f64| -> Vec<f64> {
+            mean.iter().zip(guide).map(|(m, g)| (m + GUIDE_PULL * (g - m)).clamp(-bound, bound)).collect()
+        };
+        let base_s = toward(&self.mean_steering, &guides_s[best], sb);
+        let base_a = toward(&self.mean_acceleration, &guides_a[best], ab);
+        let base_al = toward(&self.mean_accel_lateral, &guides_al[best], lb);
+        let nominal_s = cfg.steering_noise.max(1e-6).powi(2);
+        let nominal_a = cfg.acceleration_noise.max(1e-6).powi(2);
         let mut costs = vec![0.0; k];
         let mut noise_s = vec![vec![0.0; n]; k];
         let mut noise_a = vec![vec![0.0; n]; k];
@@ -593,9 +606,7 @@ impl Controller for SocFollower {
                 noise_s[j][t] = es;
                 noise_a[j][t] = ea;
                 noise_al[j][t] = eal;
-                control_cost += (GUIDE_PULL * (base_s[t] - guide_s[t]) + 0.05 * base_s[t]) * es / (std_s[t] * std_s[t])
-                    + (GUIDE_PULL * (base_a[t] - guide_a[t]) + 0.05 * base_a[t]) * ea / (std_a[t] * std_a[t])
-                    + (GUIDE_PULL * (base_al[t] - guide_al[t]) + 0.05 * base_al[t]) * eal / (std_al[t] * std_al[t]);
+                control_cost += CONTROL_PULL * (base_s[t] * es / nominal_s + base_a[t] * ea / nominal_a + base_al[t] * eal / nominal_a);
             }
             let (c, _) = reference.rollout(&model, &steer, &accel, &accel_lat, &w, &extra, false);
             costs[j] = c + lambda * control_cost;
