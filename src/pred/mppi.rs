@@ -1273,7 +1273,7 @@ pub(crate) struct Corridor {
 
 /// Signed speed of the path at arc length `s`: that of the waypoint the
 /// segment there leads to, if the path carries speeds.
-fn signed_speed_at(speeds: &[f64], cum: &[f64], s: f64) -> Option<f64> {
+pub(crate) fn signed_speed_at(speeds: &[f64], cum: &[f64], s: f64) -> Option<f64> {
     if speeds.is_empty() || speeds.len() != cum.len() {
         return None;
     }

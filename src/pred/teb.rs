@@ -20,7 +20,7 @@ use crate::core::kinematics::{
 use crate::core::math::{normalize_angle, yaw_of};
 use crate::core::obstacles::{CollisionChecker, robot_radius};
 use crate::core::path::{PathCursor, cumulative_lengths, project, sample};
-use crate::pred::mppi::{build_reference, current_lateral_speed, current_speed, give_way_share, pick_detour, prepare};
+use crate::pred::mppi::{build_reference, current_lateral_speed, current_speed, give_way_share, pick_detour, prepare, signed_speed_at};
 use crate::types::{Goal, Obstacle, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::{Euler, Point, Pose, Quaternion};
 
@@ -338,10 +338,18 @@ impl TebFollower {
     }
 
     fn sample_band_pose(&self, s: f64, step: usize, checker: &CollisionChecker) -> (Point, f64) {
-        let (p, h) = sample(&self.base.path.waypoints, &self.cursor.cum, s);
+        let (p, h) = self.path_pose(s);
         let t = step as f64 * self.teb_config.dt_nominal;
         let p = push_off_obstacles(p, h, t, checker, self.teb_config.obstacle_margin);
         (p, h)
+    }
+
+    /// The path at arc length `s` and the body heading there: the direction
+    /// of travel, turned round on stretches the path drives in reverse.
+    fn path_pose(&self, s: f64) -> (Point, f64) {
+        let (p, h) = sample(&self.base.path.waypoints, &self.cursor.cum, s);
+        let reverse = signed_speed_at(&self.base.path.speeds, &self.cursor.cum, s).is_some_and(|v| v < 0.0);
+        (p, if reverse { normalize_angle(h + std::f64::consts::PI) } else { h })
     }
 
     fn initialise_band(
@@ -559,7 +567,7 @@ impl Controller for TebFollower {
 
         let (v_lo, v_hi) = speed_bounds(constraints, prep.allow_reverse);
         let total = self.cursor.total_length();
-        let mut target = sample(&self.base.path.waypoints, &self.cursor.cum, self.band.tail_s.min(total));
+        let mut target = self.path_pose(self.band.tail_s.min(total));
         let mut waypoints = self.base.path.waypoints.clone();
         let mut cum = self.cursor.cum.clone();
         let mut start_segment = prep.proj.segment;
