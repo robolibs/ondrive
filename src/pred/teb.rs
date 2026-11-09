@@ -45,6 +45,10 @@ pub struct TebConfig {
     pub dt_max: f64,
     /// Seconds of band the command is read over.
     pub control_lookahead: f64,
+    /// Time constant, seconds, of the low-pass filter on the commanded
+    /// turn rate; 0 passes it straight through.
+    #[serde(default = "default_turn_filter")]
+    pub turn_filter: f64,
 }
 
 impl Default for TebConfig {
@@ -66,8 +70,13 @@ impl Default for TebConfig {
             dt_min: 0.05,
             dt_max: 1.0,
             control_lookahead: 0.4,
+            turn_filter: default_turn_filter(),
         }
     }
+}
+
+fn default_turn_filter() -> f64 {
+    0.15
 }
 
 #[derive(Clone, Debug, Default)]
@@ -615,7 +624,8 @@ impl Controller for TebFollower {
             length += (self.band.x[k + 1] - self.band.x[k]).hypot(self.band.y[k + 1] - self.band.y[k]);
             k += 1;
         }
-        let w = normalize_angle(self.band.yaw[k] - self.band.yaw[0]) / span;
+        let w_band = normalize_angle(self.band.yaw[k] - self.band.yaw[0]) / span;
+        let w = self.last_w + (w_band - self.last_w) * (dt / (self.teb_config.turn_filter + dt)).min(1.0);
         let a_max = constraints.max_linear_acceleration.abs().max(1e-6);
 
         if holonomic {
