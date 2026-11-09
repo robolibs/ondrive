@@ -12,7 +12,7 @@ use crate::core::kinematics::{
 };
 use crate::core::math::{heading_error, normalize_angle};
 use crate::core::obstacles::{CollisionChecker, robot_radius};
-use crate::pred::mppi::{build_reference, pick_detour};
+use crate::pred::mppi::{Swerve, build_reference, pick_detour};
 use crate::core::path::{PathCursor, cusp_after, sample, speed_cap};
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
@@ -308,7 +308,7 @@ impl Controller for RegulatedPursuitFollower {
             let speed = (DETOUR_SPEED_SHARE * constraints.max_linear_velocity).max(0.1);
             let ahead = (lookahead.min(stop_at - proj.arc_length).max(0.0) / (speed * DETOUR_DT)).round() as usize;
             let reference = build_reference(&self.base.path, &self.cursor.cum, proj.arc_length, ahead + 6, DETOUR_DT, speed, 0.0);
-            if let Some(g) = pick_detour(&reference, obstacles, robot_radius(constraints) + DETOUR_ROOM, DETOUR_DT, &mut self.side) {
+            if let Some(g) = pick_detour(&reference, obstacles, robot_radius(constraints) + DETOUR_ROOM, DETOUR_DT, &mut self.side, Swerve::of(constraints, speed)) {
                 let k = ahead.min(g.x.len() - 1);
                 target = Point::new(g.x[k], g.y[k], 0.0);
             }

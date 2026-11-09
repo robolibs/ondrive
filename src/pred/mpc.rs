@@ -150,17 +150,21 @@ pub(crate) fn actuated_after(model: &Model, previous: Option<f64>, command: f64,
 
 /// The references to solve against, each with the side it passes
 /// obstacles on (0 none): `reference`; its detours round the obstacles on
-/// either side, `reference` relaxed where they leave it (topology-guided
-/// MPC, de Groot et al. 2024); and, when something crosses the path, the
-/// reference at `GIVE_WAY_SHARES` of its pace, letting the crossing pass
-/// first (the same idea over time instead of space).
-pub(crate) fn guided(reference: &mut Reference, obstacles: &[Obstacle], reach: f64, dt: f64) -> Vec<Guide> {
+/// either side (behind crossing traffic), ramped as the machine of
+/// `constraints` can swerve, `reference` relaxed where they leave it
+/// (topology-guided MPC, de Groot et al. 2024); and, when something crosses
+/// the path, the reference at `GIVE_WAY_SHARES` of its pace, letting the
+/// crossing pass first (the same idea over time instead of space).
+pub(crate) fn guided(reference: &mut Reference, obstacles: &[Obstacle], reach: f64, dt: f64, constraints: &RobotConstraints) -> Vec<Guide> {
     let crossing = obstacles.iter().any(|o| crate::pred::mppi::crosses(o, reference, dt, reach));
-    let obstacles = crate::pred::mppi::to_go_round(obstacles, reference, dt, reach);
+    let behind = crate::pred::mppi::pass_behind(obstacles, reference, dt, reach);
+    let speed = reference.v.iter().copied().fold(0.0_f64, |a, v| a.max(v.abs()));
+    let swerve = crate::pred::mppi::Swerve::of(constraints, speed);
     let detours: Vec<Guide> = [1.0, -1.0]
         .into_iter()
+        .filter(|side| behind.is_none_or(|b| b == *side))
         .filter_map(|side| {
-            reference.detour(&obstacles, reach + DETOUR_MARGIN, dt, side, DETOUR_RAMP).map(|r| Guide { reference: r, side, pace: 1.0 })
+            reference.detour(obstacles, reach + DETOUR_MARGIN, dt, side, DETOUR_RAMP, swerve).map(|r| Guide { reference: r, side, pace: 1.0 })
         })
         .collect();
     reference.relax_where_detoured(detours.iter().map(|d| &d.reference), DETOURED_WEIGHT);
@@ -452,7 +456,7 @@ impl Controller for MpcFollower {
             c
         };
 
-        let guides = guided(&mut reference, obstacles, reach, cfg.dt);
+        let guides = guided(&mut reference, obstacles, reach, cfg.dt, constraints);
         let mut best: Option<(f64, f64, Controls)> = None;
         let mut tried: Vec<(Vec<Point>, f64)> = Vec::new();
         if self.debug_level >= DebugLevel::Basic {

@@ -1,5 +1,5 @@
 use crate::controller::{Controller, check_goal};
-use crate::core::kinematics::{actuation_delay, curvature_to_steering, is_ackermann, is_holonomic, stop, wheelbase};
+use crate::core::kinematics::{actuation_delay, can_turn_in_place, curvature_to_steering, is_ackermann, is_holonomic, stop, wheelbase};
 use crate::core::obstacles::CollisionChecker;
 use crate::core::path::{PathCursor, cumulative_lengths, cusp_after, end_heading, next_cusp, sample, segment_heading};
 use crate::fuzzy::FlcFollower;
@@ -868,9 +868,10 @@ fn blocked(waypoints: &[Pose], idx: usize, checker: &CollisionChecker) -> bool {
 
 /// Where a point controller heads while obstacles block the path between
 /// arc lengths `from` (the robot) and `to` (its target): the target moved
-/// onto the cheaper detour round the obstacles' predictions, the robot
-/// taken to drive the path at `speed_now` (no slower than a share of its
-/// top speed), or the detour's
+/// onto the cheaper detour round the obstacles' predictions (behind the
+/// traffic crossing the path on a machine that turns in place, which on
+/// any other is left to give way to), the robot taken to drive the path at
+/// `speed_now` (no slower than a share of its top speed), or the detour's
 /// widest point when that comes first and is still ahead of `robot` by
 /// more than `tol`. `side` (+1 left, −1 right, 0 none) is the side last
 /// taken, kept unless the other is cheaper by `SIDE_SWITCH_COST`; `None`
@@ -892,22 +893,31 @@ fn detour_target(
     let top = constraints.max_linear_velocity.abs();
     let speed = speed_now.abs().clamp(DETOUR_SPEED_FLOOR * top, top).max(0.1);
     let target_step = ((to - from).max(0.0) / (speed * DETOUR_DT)).round() as usize;
-    let n = (target_step + DETOUR_RAMP).clamp(2, 80);
-    let reference = crate::pred::mppi::build_reference(path, cum, from, n, DETOUR_DT, speed, 0.0);
-    let along: Vec<crate::types::Obstacle> = obstacles
-        .iter()
-        .filter(|o| !crate::pred::mppi::crosses(o, &reference, DETOUR_DT, crate::core::obstacles::robot_radius(constraints)))
-        .cloned()
-        .collect();
-    if along.is_empty() {
+    let reach = crate::core::obstacles::robot_radius(constraints);
+    let mut n = (target_step + DETOUR_RAMP).clamp(2, 80);
+    let mut reference = crate::pred::mppi::build_reference(path, cum, from, n, DETOUR_DT, speed, 0.0);
+    let crossing = |o: &crate::types::Obstacle, r: &crate::pred::mppi::Reference| crate::pred::mppi::crosses(o, r, DETOUR_DT, reach);
+    let kept: Vec<crate::types::Obstacle> = if can_turn_in_place(constraints.steering_type) {
+        obstacles.to_vec()
+    } else {
+        obstacles.iter().filter(|o| !crossing(o, &reference)).cloned().collect()
+    };
+    if kept.is_empty() {
         *side = 0.0;
         return None;
     }
-    let obstacles = along.as_slice();
-    let reach = crate::core::obstacles::robot_radius(constraints);
+    let obstacles = kept.as_slice();
+    if obstacles.iter().any(|o| crossing(o, &reference)) {
+        n = n.max((CROSSING_LOOKOUT_S / DETOUR_DT).ceil() as usize).min(80);
+        reference = crate::pred::mppi::build_reference(path, cum, from, n, DETOUR_DT, speed, 0.0);
+    }
+    let behind = crate::pred::mppi::pass_behind(obstacles, &reference, DETOUR_DT, reach);
     let mut best: Option<(f64, f64, Point)> = None;
     for s in [1.0, -1.0] {
-        let Some(g) = reference.detour(obstacles, reach + DETOUR_MARGIN, DETOUR_DT, s, DETOUR_RAMP) else {
+        if behind.is_some_and(|b| b != s) {
+            continue;
+        }
+        let Some(g) = reference.detour(obstacles, reach + DETOUR_MARGIN, DETOUR_DT, s, DETOUR_RAMP, crate::pred::mppi::Swerve::of(constraints, speed)) else {
             continue;
         };
         let shift: Vec<f64> = (0..g.x.len()).map(|i| (g.x[i] - reference.x[i]).hypot(g.y[i] - reference.y[i])).collect();
@@ -929,6 +939,8 @@ fn detour_target(
 
 /// Seconds between the points of a point controller's detour.
 const DETOUR_DT: f64 = 0.2;
+/// Seconds of path a point controller's detour spans while traffic crosses.
+const CROSSING_LOOKOUT_S: f64 = 12.0;
 /// Share of the top speed below which a point controller's detour does not
 /// take the robot's speed to fall.
 const DETOUR_SPEED_FLOOR: f64 = 0.3;

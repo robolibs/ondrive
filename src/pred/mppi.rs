@@ -12,8 +12,8 @@
 
 use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
-    can_turn_in_place, finalize, finalize_holonomic, is_ackermann, is_holonomic, reverse_allowed,
-    planning, steering_limit, wheelbase,
+    actuation_delay, can_turn_in_place, finalize, finalize_holonomic, is_ackermann, is_holonomic, reverse_allowed,
+    max_curvature, planning, steering_limit, wheelbase,
 };
 use crate::core::math::normalize_angle;
 use crate::core::obstacles::{CollisionChecker, modes_at, robot_radius, yield_share};
@@ -156,6 +156,34 @@ pub(crate) fn eased_lateral(e: f64, scale: f64, allow: f64) -> (f64, f64, f64) {
 /// Lateral room past a detour's own width before the full weight returns.
 const ALLOW_MARGIN: f64 = 0.3;
 
+/// How sharply a machine swerves: its tightest turning radius and the
+/// distance its steering takes to swing over, metres (0 for one that
+/// turns in place).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Swerve {
+    pub radius: f64,
+    pub lag: f64,
+}
+
+impl Swerve {
+    /// The swerve of the machine of `constraints` at `speed`.
+    pub fn of(constraints: &RobotConstraints, speed: f64) -> Self {
+        let k = max_curvature(constraints);
+        Swerve {
+            radius: if k.is_finite() && k > 0.0 { 1.0 / k } else { 0.0 },
+            lag: 4.0 * speed.abs() * actuation_delay(constraints),
+        }
+    }
+
+    /// Distance along the way over which a sideways shift of `d` metres can
+    /// be driven: two opposite arcs of the tightest turn, and the steering
+    /// swinging over between them.
+    pub fn length(&self, d: f64) -> f64 {
+        let d = d.abs().min(2.0 * self.radius);
+        (4.0 * self.radius * d - d * d).max(0.0).sqrt() + self.lag
+    }
+}
+
 impl Reference {
     pub fn lateral_at(&self, i: usize) -> f64 {
         self.lateral.get(i).copied().unwrap_or(1.0)
@@ -189,9 +217,10 @@ impl Reference {
     /// This reference moved sideways round every obstacle mode it meets at
     /// its own time (passes within the mode's radius plus `reach` plus two
     /// spreads of), passing them on `side` (+1 left, −1 right), ramped in
-    /// and out over `ramp` points: the guidance that keeps a solve in one
+    /// and out over `ramp` points or the length `swerve` needs for the
+    /// largest shift, if longer: the guidance that keeps a solve in one
     /// homotopy class. `None` when it meets no obstacle.
-    pub fn detour(&self, obstacles: &[Obstacle], reach: f64, dt: f64, side: f64, ramp: usize) -> Option<Reference> {
+    pub fn detour(&self, obstacles: &[Obstacle], reach: f64, dt: f64, side: f64, ramp: usize, swerve: Swerve) -> Option<Reference> {
         let n = self.x.len();
         let mut need = vec![0.0_f64; n];
         for (i, need) in need.iter_mut().enumerate() {
@@ -210,7 +239,11 @@ impl Reference {
         if need.iter().all(|v| *v <= 0.0) {
             return None;
         }
-        let ramp = ramp.max(1) as f64;
+        let span: f64 = (1..n).map(|i| (self.x[i] - self.x[i - 1]).hypot(self.y[i] - self.y[i - 1])).sum();
+        let spacing = span / (n.max(2) - 1) as f64;
+        let widest = need.iter().copied().fold(0.0_f64, f64::max);
+        let turns = if spacing > 1e-6 { (swerve.length(widest) / spacing).ceil() as usize } else { 0 };
+        let ramp = ramp.max(turns).max(1) as f64;
         let mut out = self.clone();
         for i in 0..n {
             let shift = (0..n)
@@ -761,7 +794,8 @@ impl MppiFollower {
 
     /// Share of `speed` that gives way to traffic crossing the path ahead
     /// (`n` steps of `step`): `give_way_share` for driving on along the
-    /// path at `speed`.
+    /// detour picked by `detoured_points` while the robot is on it, else
+    /// along the path, at `speed`.
     pub(crate) fn give_way(
         &mut self,
         state: &RobotState,
@@ -783,6 +817,10 @@ impl MppiFollower {
         };
         let v = if state.velocity_valid { state.velocity.linear } else { self.last_v };
         let along = Along { path: &self.base.path, cum: &self.cursor.cum, trajectory: self.trajectory.as_ref(), clock: self.clock, from };
+        let reference = along.reference(n, step, speed);
+        if self.guide.len() >= 2 && on_guide(&reference, &self.guide, (state.pose.point.x, state.pose.point.y)) {
+            return give_way_share(&reference, obstacles, constraints, &course_through(&self.guide), speed, v, step);
+        }
         give_way_ahead(&along, obstacles, constraints, n, step, speed, v)
     }
 
@@ -800,6 +838,7 @@ impl MppiFollower {
         state: &RobotState,
         obstacles: &[Obstacle],
         reach: f64,
+        swerve: Swerve,
         n: usize,
         step: f64,
         speed: f64,
@@ -817,9 +856,9 @@ impl MppiFollower {
             }
         };
         if self.debug_level >= DebugLevel::Basic {
-            self.debug.guides = guide_paths(&reference, obstacles, reach, step);
+            self.debug.guides = guide_paths(&reference, obstacles, reach, step, swerve);
         }
-        let Some(g) = pick_detour(&reference, obstacles, reach, step, &mut self.side) else {
+        let Some(g) = pick_detour(&reference, obstacles, reach, step, &mut self.side, swerve) else {
             return Vec::new();
         };
         self.guide = (0..g.x.len()).map(|i| (g.x[i], g.y[i])).collect();
@@ -1191,7 +1230,7 @@ impl Controller for MppiFollower {
             }
         };
         let speed = cfg.ref_velocity.min(constraints.max_linear_velocity);
-        let detoured = self.detoured_points(state, obstacles, robot_radius(constraints), n, step, speed);
+        let detoured = self.detoured_points(state, obstacles, robot_radius(constraints), Swerve::of(constraints, speed), n, step, speed);
         let relax = detour_relax(&detoured, (speed * step).max(0.3));
         let share = self.give_way(state, constraints, obstacles, n, step, speed);
         self.step_with(state, goal, constraints, dt, &critic, &relax, share, "MPPI tracking", "mppi_tracking")
@@ -1537,6 +1576,34 @@ pub(crate) fn give_way_ahead(
     give_way_share(&along.reference(n, step, speed), obstacles, constraints, &course, speed, v_now, step)
 }
 
+/// Whether `(x, y)` sits where `guide` starts, sideways of `reference`'s
+/// first point, within `SWERVE_SLACK`: a detour the robot is on, not one it
+/// would have to jump to.
+pub(crate) fn on_guide(reference: &Reference, guide: &[(f64, f64)], (x, y): (f64, f64)) -> bool {
+    let (Some(&(gx, gy)), Some(&rx), Some(&ry), Some(&yaw)) = (guide.first(), reference.x.first(), reference.y.first(), reference.yaw.first()) else {
+        return false;
+    };
+    let (s, c) = yaw.sin_cos();
+    let lateral = |px: f64, py: f64| -(px - rx) * s + (py - ry) * c;
+    (lateral(x, y) - lateral(gx, gy)).abs() <= SWERVE_SLACK
+}
+
+/// Sideways distance, metres, within which the robot counts as on a detour.
+const SWERVE_SLACK: f64 = 0.4;
+
+/// `polyline_course` through `points`, each heading towards its neighbours.
+pub(crate) fn course_through(points: &[(f64, f64)]) -> impl Fn(f64) -> (f64, f64, f64) {
+    let k = points.len();
+    polyline_course(
+        (0..k)
+            .map(|i| {
+                let (a, b) = (points[i.saturating_sub(1)], points[(i + 1).min(k - 1)]);
+                (points[i].0, points[i].1, (b.1 - a.1).atan2(b.0 - a.0))
+            })
+            .collect(),
+    )
+}
+
 /// The course along the polyline `points` (x, y, yaw): the pose after a
 /// distance along it, held on the last heading past either end.
 pub(crate) fn polyline_course(points: Vec<(f64, f64, f64)>) -> impl Fn(f64) -> (f64, f64, f64) {
@@ -1577,9 +1644,8 @@ pub(crate) const GIVE_WAY_MARGIN: f64 = 0.1;
 /// than along, at the point of `reference` nearest it) rather than stands
 /// on it or moves along it, and its prediction comes within `CROSSING_REACH`
 /// of the stretch of path `reference` covers, or within the room a detour
-/// with `reach` keeps from it: traffic to give way to, not to go round. Its
-/// velocity is read over the first second of its prediction, in steps of
-/// `step`.
+/// with `reach` keeps from it: traffic to pass behind. Its velocity is read
+/// over the first second of its prediction, in steps of `step`.
 pub(crate) fn crosses(o: &Obstacle, reference: &Reference, step: f64, reach: f64) -> bool {
     moves_across(o, reference, step) && comes_near(o, reference, step, reach)
 }
@@ -1601,31 +1667,50 @@ fn comes_near(o: &Obstacle, reference: &Reference, step: f64, reach: f64) -> boo
 const CROSSING_REACH: f64 = 2.0;
 
 fn moves_across(o: &Obstacle, reference: &Reference, step: f64) -> bool {
-    let (Some(now), Some(soon)) = (modes_at(o, 0.0, step).next(), modes_at(o, 1.0, step).next()) else {
-        return false;
-    };
+    velocity_on(o, reference, step).is_some_and(|(across, along)| across.abs() > along.abs())
+}
+
+/// Velocity of `o` over the first second of its prediction, split across
+/// (+ to the left) and along the point of `reference` nearest it; `None`
+/// when it stands.
+fn velocity_on(o: &Obstacle, reference: &Reference, step: f64) -> Option<(f64, f64)> {
+    let (now, soon) = (modes_at(o, 0.0, step).next()?, modes_at(o, 1.0, step).next()?);
     let (vx, vy) = (soon.x - now.x, soon.y - now.y);
     if vx.hypot(vy) < CROSSING_MIN_SPEED {
-        return false;
+        return None;
     }
-    let Some(k) = (0..reference.x.len()).min_by(|a, b| {
+    let k = (0..reference.x.len()).min_by(|a, b| {
         let d = |i: usize| (reference.x[i] - now.x).hypot(reference.y[i] - now.y);
         d(*a).total_cmp(&d(*b))
-    }) else {
-        return false;
-    };
+    })?;
     let (s, c) = reference.yaw[k].sin_cos();
-    (vx * -s + vy * c).abs() > (vx * c + vy * s).abs()
+    Some((vx * -s + vy * c, vx * c + vy * s))
 }
+
+/// The side (+1 left, −1 right) that passes behind `o` crossing
+/// `reference`: the one it comes from.
+fn behind(o: &Obstacle, reference: &Reference, step: f64) -> Option<f64> {
+    velocity_on(o, reference, step).map(|(across, _)| -across.signum())
+}
+
+/// The side passing behind each obstacle of `obstacles` crossing `reference`.
+fn behind_sides(obstacles: &[Obstacle], reference: &Reference, step: f64, reach: f64) -> Vec<f64> {
+    obstacles.iter().filter(|o| crosses(o, reference, step, reach)).filter_map(|o| behind(o, reference, step)).collect()
+}
+
+/// The side passing behind all the traffic crossing `reference`, when it
+/// all comes from the same side.
+pub(crate) fn pass_behind(obstacles: &[Obstacle], reference: &Reference, step: f64, reach: f64) -> Option<f64> {
+    let behinds = behind_sides(obstacles, reference, step, reach);
+    behinds.first().copied().filter(|b| behinds.iter().all(|x| x == b))
+}
+
+/// Cost factor of a detour passing in front of traffic crossing the path
+/// rather than behind it.
+const AHEAD_COST: f64 = 2.0;
 
 /// Speed, m/s, below which an obstacle counts as standing.
 const CROSSING_MIN_SPEED: f64 = 0.1;
-
-/// The obstacles of `obstacles` that are worth going round on `reference`:
-/// all but the ones crossing it.
-pub(crate) fn to_go_round(obstacles: &[Obstacle], reference: &Reference, step: f64, reach: f64) -> Vec<Obstacle> {
-    obstacles.iter().filter(|o| !crosses(o, reference, step, reach)).cloned().collect()
-}
 
 /// Points of `reference` that the detour `g` leaves, each with its offset.
 pub(crate) fn left_by(reference: &Reference, g: &Reference) -> Vec<(f64, f64, f64)> {
@@ -1637,37 +1722,45 @@ pub(crate) fn left_by(reference: &Reference, g: &Reference) -> Vec<(f64, f64, f6
         .collect()
 }
 
-/// The detours of `reference` round `obstacles` (not those crossing it) on
-/// each side, as paths: what a controller steering by them shows.
-pub(crate) fn guide_paths(reference: &Reference, obstacles: &[Obstacle], reach: f64, step: f64) -> Vec<Vec<Point>> {
-    let obstacles = to_go_round(obstacles, reference, step, reach);
+/// The detours of `reference` round `obstacles` on each side, as paths:
+/// what a controller steering by them shows.
+pub(crate) fn guide_paths(reference: &Reference, obstacles: &[Obstacle], reach: f64, step: f64, swerve: Swerve) -> Vec<Vec<Point>> {
     [1.0, -1.0]
         .into_iter()
-        .filter_map(|side| reference.detour(&obstacles, reach + DETOUR_MARGIN, step, side, DETOUR_RAMP))
+        .filter_map(|side| reference.detour(obstacles, reach + DETOUR_MARGIN, step, side, DETOUR_RAMP, swerve))
         .map(|g| (0..g.x.len()).map(|i| Point::new(g.x[i], g.y[i], 0.0)).collect())
         .collect()
 }
 
-/// The one detour of `reference` round `obstacles` (not those crossing it)
-/// to follow: the side whose offsets add up least, `side` (last chosen, +1
-/// left, −1 right, 0 none) kept unless the other is cheaper by
-/// `SIDE_SWITCH_COST`; `side` is updated, and `None` when no detour is needed.
+/// The one detour of `reference` round `obstacles`, standing, moving along
+/// or crossing it, each met where it is at the reference's own time: behind
+/// the crossing traffic when it all comes from one side, else the side
+/// whose offsets add up least, `AHEAD_COST` times more for passing in front
+/// of crossing traffic, `side` (last chosen, +1 left, −1 right, 0 none)
+/// kept unless the other is cheaper by `SIDE_SWITCH_COST`; `side` is
+/// updated, and `None` when no detour is needed.
 pub(crate) fn pick_detour(
     reference: &Reference,
     obstacles: &[Obstacle],
     reach: f64,
     step: f64,
     side: &mut f64,
+    swerve: Swerve,
 ) -> Option<Reference> {
     use crate::pred::mpc::SIDE_SWITCH_COST;
-    let obstacles = to_go_round(obstacles, reference, step, reach);
+    let behinds = behind_sides(obstacles, reference, step, reach);
+    let only = pass_behind(obstacles, reference, step, reach);
     let mut best: Option<(f64, f64, Reference)> = None;
     for s in [1.0, -1.0] {
-        let Some(g) = reference.detour(&obstacles, reach + DETOUR_MARGIN, step, s, DETOUR_RAMP) else {
+        if only.is_some_and(|b| b != s) {
+            continue;
+        }
+        let Some(g) = reference.detour(obstacles, reach + DETOUR_MARGIN, step, s, DETOUR_RAMP, swerve) else {
             continue;
         };
         let total: f64 = (0..g.x.len()).map(|i| (g.x[i] - reference.x[i]).hypot(g.y[i] - reference.y[i])).sum();
-        let cost = total * if *side != 0.0 && s != *side { SIDE_SWITCH_COST } else { 1.0 };
+        let ahead = if behinds.iter().any(|b| *b != s) { AHEAD_COST } else { 1.0 };
+        let cost = ahead * total * if *side != 0.0 && s != *side { SIDE_SWITCH_COST } else { 1.0 };
         if best.as_ref().is_none_or(|b| cost < b.0) {
             best = Some((cost, s, g));
         }
@@ -1805,7 +1898,63 @@ impl Track {
 
 #[cfg(test)]
 mod tests {
-    use super::eased_lateral;
+    use super::{Reference, Swerve, eased_lateral, pick_detour};
+    use crate::types::{GaussianMode, Obstacle};
+
+    /// A straight reference along x from `robot_x` at 1 m/s and a mover
+    /// crossing it at x = 15 from `mover_y`, 0.7 m/s to the left.
+    fn crossing_ahead(robot_x: f64, mover_y: f64) -> (Reference, Obstacle) {
+        let (n, step) = (60, 0.15);
+        let reference = Reference {
+            x: (0..=n).map(|i| robot_x + step * i as f64).collect(),
+            y: vec![0.0; n + 1],
+            yaw: vec![0.0; n + 1],
+            v: vec![1.0; n + 1],
+            ..Default::default()
+        };
+        let (steps, dt) = (40, 0.25);
+        let mode = GaussianMode {
+            weight: 1.0,
+            mean_x: vec![15.0; steps + 1],
+            mean_y: (0..=steps).map(|k| mover_y + 0.7 * k as f64 * dt).collect(),
+            std_x: vec![0.05; steps + 1],
+            std_y: vec![0.05; steps + 1],
+        };
+        (reference, Obstacle { id: 0, radius: 0.6, modes: vec![mode], dt })
+    }
+
+    #[test]
+    fn ramps_a_detour_over_the_length_the_machine_can_swerve_in() {
+        let (n, step) = (60, 0.25);
+        let reference = Reference {
+            x: (0..=n).map(|i| 0.3 * i as f64).collect(),
+            y: vec![0.0; n + 1],
+            yaw: vec![0.0; n + 1],
+            v: vec![1.2; n + 1],
+            ..Default::default()
+        };
+        let mode = GaussianMode { weight: 1.0, mean_x: vec![12.0; 2], mean_y: vec![0.0; 2], std_x: vec![0.0; 2], std_y: vec![0.0; 2] };
+        let rock = Obstacle { id: 0, radius: 0.6, modes: vec![mode], dt: 1.0 };
+        let shift_at = |swerve: Swerve, x: f64| {
+            let g = reference.detour(std::slice::from_ref(&rock), 1.0, step, 1.0, 6, swerve).unwrap();
+            let i = (x / 0.3).round() as usize;
+            g.y[i]
+        };
+        let tractor = Swerve { radius: 5.3, lag: 3.75 };
+        assert_eq!(shift_at(Swerve::default(), 6.0), 0.0);
+        assert!(shift_at(tractor, 6.0) > 0.2, "{}", shift_at(tractor, 6.0));
+        assert!(shift_at(tractor, 12.0) >= 1.6);
+    }
+
+    #[test]
+    fn passes_behind_traffic_crossing_from_the_right() {
+        for (x, y) in [(5.9, -6.8), (8.8, -4.7), (11.0, -3.2)] {
+            let (reference, mover) = crossing_ahead(x, y);
+            let mut side = 0.0;
+            pick_detour(&reference, &[mover], 0.6, 0.15, &mut side, Swerve::default());
+            assert_eq!(side, -1.0, "robot at {x}, mover at {y}");
+        }
+    }
 
     #[test]
     fn eased_lateral_is_plain_outside_detours_and_full_past_the_allowance() {

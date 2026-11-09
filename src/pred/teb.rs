@@ -20,7 +20,7 @@ use crate::core::kinematics::{
 use crate::core::math::{normalize_angle, yaw_of};
 use crate::core::obstacles::{CollisionChecker, robot_radius};
 use crate::core::path::{PathCursor, cumulative_lengths, project, sample};
-use crate::pred::mppi::{build_reference, current_lateral_speed, current_speed, give_way_share, pick_detour, prepare, signed_speed_at};
+use crate::pred::mppi::{Swerve, build_reference, current_lateral_speed, current_speed, give_way_share, pick_detour, prepare, signed_speed_at};
 use crate::types::{Goal, Obstacle, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::{Euler, Point, Pose, Quaternion};
 
@@ -308,7 +308,7 @@ impl TebFollower {
         let n = 2 * self.teb_config.n_poses.max(3);
         let speed = (0.8 * constraints.max_linear_velocity).max(0.1);
         let reference = build_reference(&self.base.path, &self.cursor.cum, from, n, step, speed, 0.0);
-        let g = pick_detour(&reference, obstacles, robot_radius(constraints), step, &mut self.side)?;
+        let g = pick_detour(&reference, obstacles, robot_radius(constraints), step, &mut self.side, Swerve::of(constraints, speed))?;
         let k = g.x.len();
         Some(
             (0..k)

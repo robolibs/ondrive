@@ -17,7 +17,7 @@
 use crate::controller::{Controller, ControllerBase};
 use crate::core::obstacles::{CollisionChecker, ModeAt, footprint_discs, modes_at};
 
-use crate::pred::mppi::{MppiConfig, MppiFollower, detour_relax};
+use crate::pred::mppi::{MppiConfig, MppiFollower, Swerve, detour_relax};
 use crate::types::{
     ControllerConfig, ControllerStatus, DebugFrame, DebugLevel, Goal, Obstacle, Path, RobotConstraints, RobotState,
     VelocityCommand, WorldConstraints,
@@ -315,7 +315,7 @@ impl Controller for McaFollower {
         let reach = discs.iter().map(|d| d.1).fold(0.0_f64, f64::max);
         let speed = self.mppi.mppi_config.ref_velocity.min(constraints.max_linear_velocity);
         let all: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
-        let detoured = self.mppi.detoured_points(state, all, reach, n, step, speed);
+        let detoured = self.mppi.detoured_points(state, all, reach, Swerve::of(constraints, speed), n, step, speed);
         let relax = detour_relax(&detoured, (speed * step).max(0.3));
         let ref_scale = ref_scale.min(self.mppi.give_way(state, constraints, all, n, step, speed));
         self.mppi.step_with(state, goal, constraints, dt, &extra, &relax, ref_scale, "MCA tracking", "mca_tracking")

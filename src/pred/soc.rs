@@ -19,9 +19,9 @@ use crate::core::kinematics::planning;
 use crate::core::obstacles::{CollisionChecker, robot_radius};
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
-    Along, CostWeights, Model, Track, build_reference, build_timed_reference, command_from_controls, current_lateral_speed, give_way_ahead,
+    Along, CostWeights, Model, Swerve, Track, build_reference, build_timed_reference, command_from_controls, course_through, current_lateral_speed, give_way_ahead, give_way_share,
     correlated_noise, current_speed, detour_relax, effective_sample_size, guide_paths, left_by, pick_detour, pursue, savitzky_golay,
-    importance_weights, integrated_noise, prepare, speed_at_arc_length, update_turn_in_place,
+    importance_weights, integrated_noise, on_guide, prepare, speed_at_arc_length, update_turn_in_place,
 };
 use crate::types::{
     DebugFrame, DebugLevel, Goal, Obstacle, Path, RobotConstraints, RobotState, Trajectory, VelocityCommand, WorldConstraints,
@@ -442,7 +442,21 @@ impl Controller for SocFollower {
             clock: self.clock,
             from: prep.proj.arc_length,
         };
-        let share = give_way_ahead(&along, obstacles, constraints, n, cfg.dt, speed, v_now);
+        let ahead = match &self.trajectory {
+            Some(traj) => build_timed_reference(traj, self.clock, n, cfg.dt),
+            None => build_reference(&self.base.path, &self.cursor.cum, prep.proj.arc_length, n, cfg.dt, speed, 0.0),
+        };
+        let picked = if obstacles.is_empty() {
+            None
+        } else {
+            pick_detour(&ahead, obstacles, robot_radius(constraints), cfg.dt, &mut self.side, Swerve::of(constraints, speed))
+        };
+        let detour: Vec<(f64, f64)> = picked.as_ref().map_or(Vec::new(), |g| (0..g.x.len()).map(|i| (g.x[i], g.y[i])).collect());
+        let share = if detour.len() >= 2 && on_guide(&ahead, &detour, (state.pose.point.x, state.pose.point.y)) {
+            give_way_share(&ahead, obstacles, constraints, &course_through(&detour), speed, v_now, cfg.dt)
+        } else {
+            give_way_ahead(&along, obstacles, constraints, n, cfg.dt, speed, v_now)
+        };
         let mut reference = Track::new(
             self.trajectory.as_ref(),
             self.clock,
@@ -456,25 +470,14 @@ impl Controller for SocFollower {
             prep.pos_tol,
         );
         self.debug.guides.clear();
-        let mut detour: Vec<(f64, f64)> = Vec::new();
-        let ahead = match &self.trajectory {
-            Some(traj) => build_timed_reference(traj, self.clock, n, cfg.dt),
-            None => build_reference(&self.base.path, &self.cursor.cum, prep.proj.arc_length, n, cfg.dt, speed, 0.0),
-        };
         let path_ahead: Vec<(f64, f64)> = {
             let far = along.reference(2 * n, cfg.dt, speed);
             (0..far.x.len()).map(|i| (far.x[i], far.y[i])).collect()
         };
         if !obstacles.is_empty() {
-            let points = match pick_detour(&ahead, obstacles, robot_radius(constraints), cfg.dt, &mut self.side) {
-                Some(g) => {
-                    detour = (0..g.x.len()).map(|i| (g.x[i], g.y[i])).collect();
-                    left_by(&ahead, &g)
-                }
-                None => Vec::new(),
-            };
+            let points = picked.as_ref().map_or(Vec::new(), |g| left_by(&ahead, g));
             if self.debug_level >= DebugLevel::Basic {
-                self.debug.guides = guide_paths(&ahead, obstacles, robot_radius(constraints), cfg.dt);
+                self.debug.guides = guide_paths(&ahead, obstacles, robot_radius(constraints), cfg.dt, Swerve::of(constraints, speed));
             }
             reference.relax_with(&detour_relax(&points, (speed * cfg.dt).max(0.3)));
         }
