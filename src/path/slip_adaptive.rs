@@ -15,9 +15,9 @@
 //! turned round, where the steered axle trails and the steering flips sign.
 
 use crate::controller::{Controller, ControllerBase};
-use crate::core::kinematics::{finalize, finalize_holonomic, is_ackermann, is_holonomic, path_speed, wheelbase};
+use crate::core::kinematics::{actuation_delay, finalize, finalize_holonomic, is_ackermann, is_holonomic, path_speed, wheelbase};
 use crate::core::math::{normalize_angle, yaw_of};
-use crate::core::path::{PathCursor, curvature_at_projection, sample, speed_cap};
+use crate::core::path::{PathCursor, curvature_at_arc_length, curvature_at_projection, sample, speed_cap};
 use crate::pred::mppi::{prepare, signed_speed_at};
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use std::f64::consts::PI;
@@ -135,10 +135,16 @@ impl Controller for SlipAdaptiveFollower {
             && signed_speed_at(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length).is_some_and(|v| v < 0.0);
         let direction = if reverse { -1.0 } else { 1.0 };
 
-        let kappa = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &prep.proj);
+        let here = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &prep.proj);
         let nominal = speed_cap(&self.base.path.speeds, &prep.proj)
             .map_or(constraints.max_linear_velocity, |s| s.abs().min(constraints.max_linear_velocity));
-        let speed = path_speed(nominal, kappa, self.base.status.distance_to_goal, prep.pos_tol, cfg.kp_linear, constraints);
+        let speed = path_speed(nominal, here, self.base.status.distance_to_goal, prep.pos_tol, cfg.kp_linear, constraints);
+        let preview = speed * actuation_delay(constraints);
+        let kappa = if preview > 1e-3 {
+            curvature_at_arc_length(&self.base.path.waypoints, &self.cursor.cum, prep.proj.arc_length + preview)
+        } else {
+            here
+        };
 
         if is_holonomic(constraints.steering_type) {
             let yaw = yaw_of(&state.pose);

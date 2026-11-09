@@ -249,6 +249,20 @@ pub fn curvature_at_projection(waypoints: &[Pose], cum: &[f64], proj: &PathProje
     k0 + (k1 - k0) * proj.t
 }
 
+/// Curvature at arc length `s` (clamped to the path), interpolated as
+/// `curvature_at_projection` does.
+pub fn curvature_at_arc_length(waypoints: &[Pose], cum: &[f64], s: f64) -> f64 {
+    let n = cum.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let s = s.clamp(0.0, cum[n - 1]);
+    let segment = cum.partition_point(|c| *c <= s).saturating_sub(1).min(n - 2);
+    let t = ((s - cum[segment]) / (cum[segment + 1] - cum[segment]).max(1e-9)).clamp(0.0, 1.0);
+    let (k0, k1) = (curvature_at(waypoints, cum, segment), curvature_at(waypoints, cum, segment + 1));
+    k0 + (k1 - k0) * t
+}
+
 /// Speed cap from `Path::speeds` at the projection, if the path carries
 /// per-waypoint speeds.
 pub fn speed_cap(speeds: &[f64], proj: &PathProjection) -> Option<f64> {
