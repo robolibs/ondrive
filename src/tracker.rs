@@ -898,22 +898,28 @@ fn detour_target(
     let target_step = ((to - from).max(0.0) / (speed * DETOUR_DT)).round() as usize;
     let reach = crate::core::obstacles::robot_radius(constraints);
     let mut n = (target_step + DETOUR_RAMP).clamp(2, 80);
-    let mut reference = crate::pred::mppi::build_reference(path, cum, from, n, DETOUR_DT, speed, 0.0);
-    let crossing = |o: &crate::types::Obstacle, r: &crate::pred::mppi::Reference| crate::pred::mppi::crosses(o, r, DETOUR_DT, reach);
+    let moving = |o: &crate::types::Obstacle| {
+        use crate::core::obstacles::modes_at;
+        let (Some(now), Some(soon)) = (modes_at(o, 0.0, DETOUR_DT).next(), modes_at(o, 1.0, DETOUR_DT).next()) else {
+            return false;
+        };
+        (soon.x - now.x).hypot(soon.y - now.y) > MOVING_SPEED
+    };
+    if obstacles.iter().any(moving) {
+        n = n.max((CROSSING_LOOKOUT_S / DETOUR_DT).ceil() as usize).min(80);
+    }
+    let reference = crate::pred::mppi::build_reference(path, cum, from, n, DETOUR_DT, speed, 0.0);
+    let crossing = |o: &crate::types::Obstacle| crate::pred::mppi::crosses(o, &reference, DETOUR_DT, reach);
     let kept: Vec<crate::types::Obstacle> = if can_turn_in_place(constraints.steering_type) {
         obstacles.to_vec()
     } else {
-        obstacles.iter().filter(|o| !crossing(o, &reference)).cloned().collect()
+        obstacles.iter().filter(|o| !crossing(o)).cloned().collect()
     };
     if kept.is_empty() {
         *side = 0.0;
         return None;
     }
     let obstacles = kept.as_slice();
-    if obstacles.iter().any(|o| crossing(o, &reference)) {
-        n = n.max((CROSSING_LOOKOUT_S / DETOUR_DT).ceil() as usize).min(80);
-        reference = crate::pred::mppi::build_reference(path, cum, from, n, DETOUR_DT, speed, 0.0);
-    }
     let behind = crate::pred::mppi::pass_behind(obstacles, &reference, DETOUR_DT, reach);
     let mut best: Option<(f64, f64, Point)> = None;
     for s in [1.0, -1.0] {
@@ -942,8 +948,10 @@ fn detour_target(
 
 /// Seconds between the points of a point controller's detour.
 const DETOUR_DT: f64 = 0.2;
-/// Seconds of path a point controller's detour spans while traffic crosses.
+/// Seconds of path a point controller's detour spans while traffic moves.
 const CROSSING_LOOKOUT_S: f64 = 12.0;
+/// Speed, m/s, above which an obstacle counts as moving.
+const MOVING_SPEED: f64 = 0.1;
 /// Share of the top speed below which a point controller's detour does not
 /// take the robot's speed to fall.
 const DETOUR_SPEED_FLOOR: f64 = 0.3;
