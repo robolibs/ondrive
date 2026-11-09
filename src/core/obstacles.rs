@@ -364,6 +364,11 @@ pub fn yield_share(
         if arc_on(&nominal, 0.0, true) >= 0.0 {
             return 0.0;
         }
+        let (x0, y0, th0) = course(0.0);
+        let contact = nominal.clearance_at(0.0, x0, y0, th0);
+        if contact < 0.0 {
+            return shares.iter().copied().find(|s| arc_on(&nominal, *s, false) >= contact - 1e-6).unwrap_or(0.0);
+        }
         shares.iter().copied().chain([0.0]).max_by(|a, b| room(*a).total_cmp(&room(*b))).unwrap_or(0.0)
     })
 }
@@ -382,5 +387,57 @@ pub fn arc_course((x, y, yaw): (f64, f64, f64), kappa: f64) -> impl Fn(f64) -> (
             let th = yaw + kappa * d;
             (x + (th.sin() - yaw.sin()) / kappa, y - (th.cos() - yaw.cos()) / kappa, th)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Footprint, GaussianMode};
+
+    fn crossing(x: f64, y: f64, vy: f64) -> WorldConstraints {
+        let steps = 40;
+        let mode = GaussianMode {
+            weight: 1.0,
+            mean_x: vec![x; steps + 1],
+            mean_y: (0..=steps).map(|k| y + vy * k as f64 * 0.2).collect(),
+            std_x: vec![0.0; steps + 1],
+            std_y: vec![0.0; steps + 1],
+        };
+        WorldConstraints { obstacles: vec![Obstacle { id: 0, radius: 0.6, modes: vec![mode], dt: 0.2 }], ..Default::default() }
+    }
+
+    fn constraints() -> RobotConstraints {
+        let mut c = RobotConstraints::default();
+        c.max_linear_velocity = 1.5;
+        c.max_linear_acceleration = 0.5;
+        c.footprint = Footprint::Disc { radius: 0.8 };
+        c
+    }
+
+    fn share_with(world: &WorldConstraints, v_now: f64) -> f64 {
+        let c = constraints();
+        let checker = CollisionChecker::new(Some(world), &c, 0.1).with_spread(1.0);
+        yield_share(&checker, &arc_course((0.0, 0.0, 0.0), 0.0), 1.2, v_now, 1.5, 0.5, &[1.0, 0.6, 0.3])
+    }
+
+    #[test]
+    fn keeps_going_past_traffic_that_clears_first() {
+        assert_eq!(share_with(&crossing(8.0, -4.0, 1.0), 1.0), 1.0);
+    }
+
+    #[test]
+    fn slows_for_traffic_meeting_it_at_the_crossing() {
+        assert!(share_with(&crossing(3.0, -2.5, 1.0), 1.0) < 1.0);
+    }
+
+    #[test]
+    fn stands_while_in_contact_ahead() {
+        assert_eq!(share_with(&crossing(1.0, -0.5, 0.4), 0.3), 0.0);
+    }
+
+    #[test]
+    fn drives_clear_of_contact_behind() {
+        assert_eq!(share_with(&crossing(-0.9, -0.9, 0.0), 0.3), 1.0);
     }
 }
