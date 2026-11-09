@@ -32,7 +32,7 @@ use rand::{SeedableRng, rngs::StdRng};
 /// Clearance below which obstacles start contributing cost.
 const OBSTACLE_INFLUENCE: f64 = 1.0;
 /// Extra clearance treated as contact.
-const OBSTACLE_SAFETY_MARGIN: f64 = 0.2;
+const OBSTACLE_SAFETY_MARGIN: f64 = 0.6;
 
 /// Share of the gap to the best guide that the centre of the final samples
 /// moves, `1 - alpha` of SVG-MPPI with alpha 0.1.
