@@ -69,7 +69,7 @@ pub struct MppiConfig {
     pub smoothing: bool,
     /// Sample the noise as integrated control rates (Smooth MPPI) rather
     /// than correlated controls.
-    #[serde(default)]
+    #[serde(default = "default_smooth_sampling")]
     pub smooth_sampling: bool,
     /// Obstacle critics against each step's predicted obstacles and the
     /// grid: `weight_collision` for every step in
@@ -86,6 +86,10 @@ pub struct MppiConfig {
 
 fn default_safety_margin() -> f64 {
     0.3
+}
+
+pub(crate) fn default_smooth_sampling() -> bool {
+    true
 }
 
 impl Default for MppiConfig {

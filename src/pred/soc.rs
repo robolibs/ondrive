@@ -89,7 +89,7 @@ pub struct SocConfig {
     pub noise_correlation: f64,
     /// Sample the final noise as integrated control rates (Smooth MPPI)
     /// rather than correlated controls.
-    #[serde(default)]
+    #[serde(default = "crate::pred::mppi::default_smooth_sampling")]
     pub smooth_sampling: bool,
     /// Effective-sample-size shares below and above which the temperature
     /// rises and falls.
