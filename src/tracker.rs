@@ -622,10 +622,11 @@ impl Tracker {
                 (idx, cap) = target(segment, cum[segment] + ahead);
             }
             self.projection_segment = segment;
+            let round_crossing = can_turn_in_place(self.constraints.steering_type) && self.kind != TrackerKind::Apf;
             let detour = world
                 .filter(|w| !w.obstacles.is_empty())
                 .and_then(|w| {
-                    detour_target(path, cum, proj.arc_length, cum[idx], state.pose.point, tol, &w.obstacles, &self.constraints, speed_now, &mut self.detour_side)
+                    detour_target(path, cum, proj.arc_length, cum[idx], state.pose.point, tol, &w.obstacles, &self.constraints, speed_now, round_crossing, &mut self.detour_side)
                 });
             if let Some(point) = detour {
                 self.aiming_at_end = false;
@@ -908,8 +909,8 @@ fn blocked(waypoints: &[Pose], idx: usize, checker: &CollisionChecker) -> bool {
 /// Where a point controller heads while obstacles block the path between
 /// arc lengths `from` (the robot) and `to` (its target): the target moved
 /// onto the cheaper detour round the obstacles' predictions (behind the
-/// traffic crossing the path on a machine that turns in place, which on
-/// any other is left to give way to), the robot taken to drive the path at
+/// traffic crossing the path when `round_crossing`, else left to give way
+/// to), the robot taken to drive the path at
 /// `speed_now` (no slower than a share of its top speed), or the detour's
 /// widest point when that comes first and is still ahead of `robot` by
 /// more than `tol`. `side` (+1 left, −1 right, 0 none) is the side last
@@ -926,6 +927,7 @@ fn detour_target(
     obstacles: &[crate::types::Obstacle],
     constraints: &RobotConstraints,
     speed_now: f64,
+    round_crossing: bool,
     side: &mut f64,
 ) -> Option<Point> {
     use crate::pred::mpc::{DETOUR_MARGIN, DETOUR_RAMP, SIDE_SWITCH_COST};
@@ -946,7 +948,7 @@ fn detour_target(
     }
     let reference = crate::pred::mppi::build_reference(path, cum, from, n, DETOUR_DT, speed, 0.0);
     let crossing = |o: &crate::types::Obstacle| crate::pred::mppi::crosses(o, &reference, DETOUR_DT, reach);
-    let kept: Vec<crate::types::Obstacle> = if can_turn_in_place(constraints.steering_type) {
+    let kept: Vec<crate::types::Obstacle> = if round_crossing {
         obstacles.to_vec()
     } else {
         obstacles.iter().filter(|o| !crossing(o)).cloned().collect()
