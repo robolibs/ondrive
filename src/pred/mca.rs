@@ -5,11 +5,12 @@
 //! Gaussian-mixture prediction at that point's time, that falls within the
 //! combined radius of an obstacle and one of the discs covering the robot.
 //! Obstacles combine as independent events. The cost adds a soft term
-//! proportional to that probability and, above `risk_threshold`, a hard term
-//! that is larger the sooner the collision would come, so a batch whose every
-//! rollout is at risk still prefers the one that brakes or turns away. The
-//! reference speed inside the rollouts drops as the plan's imminent risk
-//! rises.
+//! proportional to that probability with the discs grown by
+//! `robot_radius_margin` and, when the bare discs' probability passes
+//! `risk_threshold`, a hard term that is larger the sooner the collision
+//! would come, so a batch whose every rollout is at risk still prefers the
+//! one that brakes or turns away. The reference speed inside the rollouts
+//! drops as the plan's imminent risk from moving obstacles rises.
 //!
 //! Without obstacles this is exactly MPPI.
 
@@ -115,8 +116,11 @@ impl McaConfig {
     }
 }
 
-/// Horizon steps whose collision probability drives the risk slowdown.
+/// Horizon steps whose collision probability with moving obstacles drives
+/// the risk slowdown.
 const IMMINENT_STEPS: usize = 5;
+/// Metres per second above which an obstacle counts as moving.
+const MOVING_SPEED: f64 = 0.1;
 
 /// `m` standard-normal points from the Halton sequence (bases 2 and 3)
 /// through the Box–Muller transform.
@@ -252,18 +256,29 @@ impl Controller for McaFollower {
         let (n, step) = (n.max(1), step.max(1e-3));
         let cfg = &self.mca_config;
         let margin = cfg.robot_radius_margin.max(0.0);
-        let discs: Vec<(f64, f64)> = footprint_discs(constraints).into_iter().map(|(x, r)| (x, r + margin)).collect();
+        let bare = footprint_discs(constraints);
+        let discs: Vec<(f64, f64)> = bare.iter().map(|&(x, r)| (x, r + margin)).collect();
         let modes: Vec<Vec<Vec<ModeAt>>> = (0..n)
             .map(|i| obstacles.iter().map(|o| modes_at(o, (i + 1) as f64 * step, step).collect()).collect())
             .collect();
         let normals = &self.normals;
-        let probability = |i: usize, x: f64, y: f64, yaw: f64| -> f64 {
+        let moving: Vec<bool> = obstacles
+            .iter()
+            .map(|o| match (modes_at(o, 0.0, step).next(), modes_at(o, 1.0, step).next()) {
+                (Some(a), Some(b)) => (b.x - a.x).hypot(b.y - a.y) > MOVING_SPEED,
+                _ => false,
+            })
+            .collect();
+        let probability_of = |i: usize, x: f64, y: f64, yaw: f64, only_moving: bool, footprint: &[(f64, f64)]| -> f64 {
             let (s, c) = yaw.sin_cos();
             let mut survive = 1.0;
-            for obstacle in &modes[i.min(n - 1)] {
+            for (k, obstacle) in modes[i.min(n - 1)].iter().enumerate() {
+                if only_moving && !moving[k] {
+                    continue;
+                }
                 let (mut p, mut total) = (0.0, 0.0);
                 for m in obstacle {
-                    let hit = discs
+                    let hit = footprint
                         .iter()
                         .map(|(dx, r)| hit_probability(m, x + c * dx, y + s * dx, *r, normals))
                         .fold(0.0_f64, f64::max);
@@ -279,12 +294,13 @@ impl Controller for McaFollower {
         let checker = CollisionChecker::new(world, constraints, margin).with_step(step);
         let (soft, hard, threshold) = (cfg.weight_soft_risk, cfg.weight_hard_risk, cfg.risk_threshold);
         let extra = |i: usize, x: f64, y: f64, yaw: f64| -> f64 {
-            let mut p = probability(i, x, y, yaw);
+            let mut p = probability_of(i, x, y, yaw, false, &discs);
+            let mut p_hit = probability_of(i, x, y, yaw, false, &bare);
             if has_grid && checker.grid_clearance(x, y, yaw) < 0.0 {
-                p = 1.0;
+                (p, p_hit) = (1.0, 1.0);
             }
             let urgency = (n - i.min(n)) as f64 / n as f64;
-            soft * p + if p > threshold { hard * urgency } else { 0.0 }
+            soft * p + if p_hit > threshold { hard * urgency } else { 0.0 }
         };
 
         let plan = self.mppi.predicted_trajectory();
@@ -292,7 +308,7 @@ impl Controller for McaFollower {
             .windows(2)
             .take(IMMINENT_STEPS)
             .enumerate()
-            .map(|(i, w)| probability(i, w[1].x, w[1].y, (w[1].y - w[0].y).atan2(w[1].x - w[0].x)))
+            .map(|(i, w)| probability_of(i, w[1].x, w[1].y, (w[1].y - w[0].y).atan2(w[1].x - w[0].x), true, &discs))
             .fold(0.0_f64, f64::max);
         let ref_scale = (1.0 - cfg.risk_slowdown_gain.max(0.0) * risk).clamp(cfg.min_velocity_scale.clamp(0.0, 1.0), 1.0);
 
