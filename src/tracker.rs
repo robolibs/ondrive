@@ -512,7 +512,9 @@ impl Tracker {
             let tol = cfg.goal_tolerance;
             let ahead = cfg.lookahead_distance.max(2.0 * tol);
             let overshoot = (proj.distance.powi(2) - proj.lateral_error.powi(2)).max(0.0).sqrt();
-            if self.lap.is_none() && proj.beyond_end && proj.lateral_error.abs() < 2.0 * tol && overshoot < ahead {
+            let circle = (1.0 / crate::core::kinematics::max_curvature(&self.constraints)).max(2.0 * tol);
+            let passed = proj.lateral_error.abs() < 2.0 * tol && overshoot < ahead || proj.distance < circle;
+            if self.lap.is_none() && proj.beyond_end && passed {
                 self.path_completed = true;
                 return Ok(None);
             }
