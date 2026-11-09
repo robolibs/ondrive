@@ -15,7 +15,7 @@
 //! turned round, where the steered axle trails and the steering flips sign.
 
 use crate::controller::{Controller, ControllerBase};
-use crate::core::kinematics::{actuation_delay, finalize, finalize_holonomic, is_ackermann, is_holonomic, path_speed, wheelbase};
+use crate::core::kinematics::{actuation_delay, finalize, finalize_holonomic, is_ackermann, is_holonomic, max_curvature, path_speed, wheelbase};
 use crate::core::math::{normalize_angle, yaw_of};
 use crate::core::path::{PathCursor, curvature_at_arc_length, curvature_at_projection, sample, speed_cap};
 use crate::pred::mppi::{prepare, signed_speed_at};
@@ -95,6 +95,13 @@ impl SlipAdaptiveFollower {
 /// `CHAINED_BLEND`: the law holds only well inside a quarter turn.
 const CHAINED_LIMIT: f64 = 0.6;
 const CHAINED_BLEND: f64 = 0.4;
+/// Share of the platform's tightest curvature beyond which the path ahead
+/// hands over to pure pursuit, which cuts what it cannot follow, fully past
+/// `TIGHT_BLEND` more.
+const TIGHT_LIMIT: f64 = 0.8;
+const TIGHT_BLEND: f64 = 0.4;
+/// Metres between the path curvatures read ahead for the speed.
+const CURVATURE_SCAN: f64 = 0.5;
 
 /// Curvature of the motion that brings lateral error `y` and heading error
 /// `theta2` (both measured against the slid direction of travel) onto a
@@ -138,7 +145,12 @@ impl Controller for SlipAdaptiveFollower {
         let here = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &prep.proj);
         let nominal = speed_cap(&self.base.path.speeds, &prep.proj)
             .map_or(constraints.max_linear_velocity, |s| s.abs().min(constraints.max_linear_velocity));
-        let speed = path_speed(nominal, here, self.base.status.distance_to_goal, prep.pos_tol, cfg.kp_linear, constraints);
+        let a_max = constraints.max_linear_acceleration.abs().max(0.1);
+        let braking = nominal * nominal / (2.0 * a_max) + nominal * actuation_delay(constraints);
+        let sharpest = (0..=(braking / CURVATURE_SCAN).ceil() as usize)
+            .map(|i| curvature_at_arc_length(&self.base.path.waypoints, &self.cursor.cum, prep.proj.arc_length + i as f64 * CURVATURE_SCAN))
+            .fold(here, |a, k| if k.abs() > a.abs() { k } else { a });
+        let speed = path_speed(nominal, sharpest, self.base.status.distance_to_goal, prep.pos_tol, cfg.kp_linear, constraints);
         let preview = speed * actuation_delay(constraints);
         let kappa = if preview > 1e-3 {
             curvature_at_arc_length(&self.base.path.waypoints, &self.cursor.cum, prep.proj.arc_length + preview)
@@ -185,7 +197,9 @@ impl Controller for SlipAdaptiveFollower {
         let across = -s * dx + c * dy;
         let pursuit = 2.0 * across / (along * along + across * across).max(1e-6);
         let bearing = across.atan2(along).abs().max(theta2.abs());
-        let blend = ((bearing - CHAINED_LIMIT) / CHAINED_BLEND).clamp(0.0, 1.0);
+        let k_max = max_curvature(constraints);
+        let tight = if k_max.is_finite() && k_max > 0.0 { ((kappa.abs() / k_max - TIGHT_LIMIT) / TIGHT_BLEND).clamp(0.0, 1.0) } else { 0.0 };
+        let blend = ((bearing - CHAINED_LIMIT) / CHAINED_BLEND).clamp(0.0, 1.0).max(tight);
         let curvature = (1.0 - blend) * chained + blend * pursuit;
         self.base.status.cross_track_error = y;
         self.base.status.heading_error = theta;
