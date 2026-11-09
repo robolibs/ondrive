@@ -113,7 +113,7 @@ impl Default for MppiConfig {
             ess_low: 0.01,
             ess_high: 0.05,
             smoothing: true,
-            smooth_sampling: false,
+            smooth_sampling: true,
             weight_collision: 2000.0,
             weight_repulsion: 400.0,
             repulsion_distance: 1.0,

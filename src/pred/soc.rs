@@ -21,7 +21,7 @@ use crate::core::path::PathCursor;
 use crate::pred::mppi::{
     Along, CostWeights, Model, Track, build_reference, build_timed_reference, command_from_controls, current_lateral_speed, give_way_ahead,
     correlated_noise, current_speed, detour_relax, effective_sample_size, guide_paths, left_by, pick_detour, pursue, savitzky_golay,
-    importance_weights, prepare, speed_at_arc_length, update_turn_in_place,
+    importance_weights, integrated_noise, prepare, speed_at_arc_length, update_turn_in_place,
 };
 use crate::types::{
     DebugFrame, DebugLevel, Goal, Obstacle, Path, RobotConstraints, RobotState, Trajectory, VelocityCommand, WorldConstraints,
@@ -87,6 +87,10 @@ pub struct SocConfig {
 
     /// Share of each step's sampling noise carried over from the step before.
     pub noise_correlation: f64,
+    /// Sample the final noise as integrated control rates (Smooth MPPI)
+    /// rather than correlated controls.
+    #[serde(default)]
+    pub smooth_sampling: bool,
     /// Effective-sample-size shares below and above which the temperature
     /// rises and falls.
     pub ess_low: f64,
@@ -126,6 +130,7 @@ impl Default for SocConfig {
             kernel_bandwidth: 1.0,
             use_covariance_adaptation: true,
             noise_correlation: 0.7,
+            smooth_sampling: false,
             ess_low: 0.01,
             ess_high: 0.05,
             turn_first_activation_deg: 60.0,
@@ -595,9 +600,15 @@ impl Controller for SocFollower {
         let mut accel_lat = vec![0.0; n];
         for j in 0..k {
             let mut control_cost = 0.0;
-            correlated_noise(&mut unit_s, 1.0, rho, &mut self.rng);
-            correlated_noise(&mut unit_a, 1.0, rho, &mut self.rng);
-            correlated_noise(&mut unit_al, 1.0, rho, &mut self.rng);
+            if cfg.smooth_sampling {
+                integrated_noise(&mut unit_s, 1.0, &mut self.rng);
+                integrated_noise(&mut unit_a, 1.0, &mut self.rng);
+                integrated_noise(&mut unit_al, 1.0, &mut self.rng);
+            } else {
+                correlated_noise(&mut unit_s, 1.0, rho, &mut self.rng);
+                correlated_noise(&mut unit_a, 1.0, rho, &mut self.rng);
+                correlated_noise(&mut unit_al, 1.0, rho, &mut self.rng);
+            }
             for t in 0..n {
                 steer[t] = (base_s[t] + std_s[t] * unit_s[t]).clamp(-sb, sb);
                 accel[t] = (base_a[t] + std_a[t] * unit_a[t]).clamp(-ab, ab);
