@@ -40,6 +40,9 @@ const GUIDE_PULL: f64 = 0.9;
 /// Index of the guide that starts as the previous plan braked to a stop,
 /// followed whenever it is the cheapest.
 const BRAKE_GUIDE: usize = 1;
+/// Index of the guide that pursues the detour round the obstacles ahead,
+/// followed whenever it is the cheapest.
+const DETOUR_GUIDE: usize = 3;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SocConfig {
@@ -505,9 +508,10 @@ impl Controller for SocFollower {
             }
         }
         // A fourth guide pursues the detour round the obstacles ahead.
-        if k_guide >= 4 && detour.len() > 1 {
-            pursue(&model, &detour, speed, &mut guides_s[3], &mut guides_a[3], &mut guides_al[3]);
-            model.clamp_controls(&mut guides_s[3], &mut guides_a[3], &mut guides_al[3]);
+        let has_detour = k_guide > DETOUR_GUIDE && detour.len() > 1;
+        if has_detour {
+            pursue(&model, &detour, speed, &mut guides_s[DETOUR_GUIDE], &mut guides_a[DETOUR_GUIDE], &mut guides_al[DETOUR_GUIDE]);
+            model.clamp_controls(&mut guides_s[DETOUR_GUIDE], &mut guides_a[DETOUR_GUIDE], &mut guides_al[DETOUR_GUIDE]);
         }
 
         if cfg.svgd_iterations > 0 {
@@ -527,7 +531,7 @@ impl Controller for SocFollower {
             .enumerate()
             .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i)
-            .filter(|&i| (i == BRAKE_GUIDE && k_guide >= 3) || guide_costs[i] < cfg.guide_switch * guide_costs[0])
+            .filter(|&i| (i == BRAKE_GUIDE && k_guide >= 3) || (i == DETOUR_GUIDE && has_detour) || guide_costs[i] < cfg.guide_switch * guide_costs[0])
             .unwrap_or(0);
 
         let mut std_s = vec![cfg.steering_noise.max(1e-6); n];
