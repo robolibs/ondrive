@@ -429,7 +429,9 @@ impl Tracker {
         // A machine standing while told to move is commanded more, at the
         // acceleration limit, until it moves or reaches `BREAKAWAY_SPEED`.
         let speed = v.hypot(vy);
-        let standing = state.velocity_valid && state.velocity.linear.hypot(state.velocity.lateral) < STANDING_SPEED;
+        let standing = state.velocity_valid
+            && state.velocity.linear.hypot(state.velocity.lateral) < STANDING_SPEED
+            && state.velocity.angular.abs() < STANDING_TURN;
         self.stalled_for = if standing && speed > 1e-3 { self.stalled_for + dt } else { 0.0 };
         if self.stalled_for > STALL_S
             && let Some((pv, _, pvy)) = self.last_command
@@ -438,9 +440,10 @@ impl Tracker {
             let ramp = (pv.hypot(pvy) + a).min(BREAKAWAY_SPEED);
             if ramp > speed {
                 let s = ramp / speed;
+                let w_max = c.max_angular_velocity.abs();
                 v *= s;
                 vy *= s;
-                w *= s;
+                w = if w_max > 0.0 { (w * s).clamp(-w_max, w_max) } else { w * s };
             }
         }
 
@@ -947,6 +950,8 @@ const DETOUR_SPEED_FLOOR: f64 = 0.3;
 
 /// Measured speed, m/s, below which a machine counts as standing.
 const STANDING_SPEED: f64 = 0.05;
+/// Measured turn rate, rad/s, below which a machine counts as standing.
+const STANDING_TURN: f64 = 0.05;
 /// Seconds a machine stands while told to move before its command is ramped.
 const STALL_S: f64 = 1.0;
 /// Speed, m/s, the stall ramp goes up to.
@@ -1098,5 +1103,28 @@ impl Lap {
             unrolled.speeds.extend_from_slice(&ring.speeds[1..]);
         }
         Some(Self { source: path.clone(), ring, length, unrolled })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stall_ramp_never_spins_a_machine_past_its_turn_rate() {
+        let mut t = Tracker::new(TrackerKind::Mpc);
+        let mut c = RobotConstraints::default();
+        c.steering_type = crate::types::SteeringType::SkidSteer;
+        c.max_linear_velocity = 1.0;
+        c.max_angular_velocity = 1.5;
+        c.max_linear_acceleration = 1.0;
+        c.max_angular_acceleration = 3.0;
+        t.init(c);
+        let state = RobotState { velocity_valid: true, ..Default::default() };
+        let turn = VelocityCommand { valid: true, linear_velocity: 0.002, angular_velocity: 1.0, ..Default::default() };
+        for _ in 0..100 {
+            let cmd = t.limit(turn.clone(), &state, 0.05, None);
+            assert!(cmd.angular_velocity.abs() <= 1.5 + 1e-9, "w {}", cmd.angular_velocity);
+        }
     }
 }

@@ -300,18 +300,8 @@ pub fn obstacle_barrier(
 }
 
 pub fn footprint_discs(constraints: &RobotConstraints) -> Vec<(f64, f64)> {
-    let (front, back, half_width) = match &constraints.footprint {
-        crate::types::Footprint::Polygon { points } if points.len() >= 3 => {
-            let front = points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
-            let back = points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
-            let half = points.iter().map(|p| p.1.abs()).fold(0.0_f64, f64::max);
-            (front, back, half)
-        }
-        crate::types::Footprint::Disc { radius } if *radius > 0.0 => return vec![(0.0, *radius)],
-        _ if constraints.robot_length > 0.0 && constraints.robot_width > 0.0 => {
-            (0.5 * constraints.robot_length, -0.5 * constraints.robot_length, 0.5 * constraints.robot_width)
-        }
-        _ => return vec![(0.0, robot_radius(constraints))],
+    let Some((back, front, half_width)) = footprint_extent(constraints) else {
+        return vec![(0.0, robot_radius(constraints))];
     };
     let length = (front - back).max(1e-3);
     let width = (2.0 * half_width).max(1e-3);
@@ -319,6 +309,24 @@ pub fn footprint_discs(constraints: &RobotConstraints) -> Vec<(f64, f64)> {
     let half_step = 0.5 * length / n as f64;
     let radius = half_width.hypot(half_step);
     (0..n).map(|i| (back + half_step * (2 * i + 1) as f64, radius)).collect()
+}
+
+/// The footprint's extent along the heading, `(back, front)` metres from
+/// the pose, and its half width; `None` for a disc footprint or none set.
+pub fn footprint_extent(constraints: &RobotConstraints) -> Option<(f64, f64, f64)> {
+    match &constraints.footprint {
+        crate::types::Footprint::Polygon { points } if points.len() >= 3 => {
+            let front = points.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+            let back = points.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+            let half = points.iter().map(|p| p.1.abs()).fold(0.0_f64, f64::max);
+            Some((back, front, half))
+        }
+        crate::types::Footprint::Disc { radius } if *radius > 0.0 => None,
+        _ if constraints.robot_length > 0.0 && constraints.robot_width > 0.0 => {
+            Some((-0.5 * constraints.robot_length, 0.5 * constraints.robot_length, 0.5 * constraints.robot_width))
+        }
+        _ => None,
+    }
 }
 
 /// The fastest of `shares` of `speed` that keeps `checker`'s obstacles, as
