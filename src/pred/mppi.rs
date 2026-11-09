@@ -1071,6 +1071,17 @@ impl MppiFollower {
                 }
                 // Pure pursuit of the detour round the obstacles ahead.
                 3 if self.guide.len() > 1 => pursue(&model, &self.guide, v_ref, &mut steer, &mut accel, &mut accel_lat),
+                // The previous steering, closing on the reference speed at
+                // full acceleration.
+                4 => {
+                    steer.copy_from_slice(&self.mean_steering);
+                    let mut v = model.v0;
+                    for t in 0..n {
+                        accel[t] = ((v_ref - v) / model.dt).clamp(-ab, ab);
+                        accel_lat[t] = 0.0;
+                        v += accel[t] * model.dt;
+                    }
+                }
                 _ if working.smooth_sampling => {
                     integrated_noise(&mut steer, sigma_s, &mut self.rng);
                     integrated_noise(&mut accel, sigma_a, &mut self.rng);
