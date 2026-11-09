@@ -85,7 +85,7 @@ pub struct MppiConfig {
 }
 
 fn default_safety_margin() -> f64 {
-    0.3
+    0.6
 }
 
 pub(crate) fn default_smooth_sampling() -> bool {
