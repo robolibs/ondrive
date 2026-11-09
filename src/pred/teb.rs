@@ -378,6 +378,7 @@ impl TebFollower {
         s0: f64,
         constraints: &RobotConstraints,
         checker: &CollisionChecker,
+        cusp: f64,
     ) {
         let n = self.teb_config.n_poses.max(3);
         let step = self.nominal_step(constraints);
@@ -392,7 +393,7 @@ impl TebFollower {
         b.y[0] = state.pose.point.y;
         b.yaw[0] = state.pose.rotation.to_euler().yaw;
         for i in 1..n {
-            let s = s0 + i as f64 * step;
+            let s = (s0 + i as f64 * step).min(cusp);
             let (p, h) = self.sample_band_pose(s, i, checker);
             b.x[i] = p.x;
             b.y[i] = p.y;
@@ -403,14 +404,16 @@ impl TebFollower {
         self.band_initialised = true;
     }
 
-    /// Re-anchor pose 0 to the robot, drop every pose the robot has passed
-    /// and keep the first interval consistent with the current speed.
+    /// Re-anchor pose 0 to the robot, drop every pose the robot has passed,
+    /// add new ones no further than arc length `cusp`, and keep the first
+    /// interval consistent with the current speed.
     fn advance_band(
         &mut self,
         state: &RobotState,
         constraints: &RobotConstraints,
         checker: &CollisionChecker,
         v_now: f64,
+        cusp: f64,
     ) {
         let n = self.band.x.len();
         let step = self.nominal_step(constraints);
@@ -429,7 +432,7 @@ impl TebFollower {
             self.band.y.remove(1);
             self.band.yaw.remove(1);
             self.band.dt.remove(0);
-            self.band.tail_s += step;
+            self.band.tail_s = (self.band.tail_s + step).min(cusp);
             let (p, h) = self.sample_band_pose(self.band.tail_s, n - 1, checker);
             self.band.x.push(p.x);
             self.band.y.push(p.y);
@@ -579,10 +582,13 @@ impl Controller for TebFollower {
         let v_now = current_speed(state, self.last_v);
         let vy_now = if holonomic { current_lateral_speed(state, self.last_vy) } else { 0.0 };
         let n = self.teb_config.n_poses.max(3);
+        let release = (0.5 * prep.pos_tol).max(0.05);
+        let cusp = crate::core::path::cusp_after(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length + release)
+            .unwrap_or(f64::INFINITY);
         if !self.band_initialised || self.band.x.len() != n {
-            self.initialise_band(state, prep.proj.arc_length, constraints, &checker);
+            self.initialise_band(state, prep.proj.arc_length, constraints, &checker, cusp);
         } else {
-            self.advance_band(state, constraints, &checker, v_now);
+            self.advance_band(state, constraints, &checker, v_now, cusp);
         }
 
         let (v_lo, v_hi) = speed_bounds(constraints, prep.allow_reverse);
@@ -651,7 +657,8 @@ impl Controller for TebFollower {
         }
 
         let forward = (dx * yaw0.cos() + dy * yaw0.sin()).signum();
-        let v = (forward * length / span).clamp(v_now - a_max * dt, v_now + a_max * dt);
+        let stop = (2.0 * a_max * (cusp - prep.proj.arc_length).max(0.0)).sqrt();
+        let v = (forward * length / span).clamp(-stop, stop).clamp(v_now - a_max * dt, v_now + a_max * dt);
         let share = self.give_way(state, prep.proj.arc_length, constraints, world, (v, w));
         let (v, w) = (v * share, w * share);
 
