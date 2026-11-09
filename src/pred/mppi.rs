@@ -74,6 +74,14 @@ pub struct MppiConfig {
     pub weight_collision: f64,
     pub weight_repulsion: f64,
     pub repulsion_distance: f64,
+    /// Room, metres, beyond the footprint that the obstacle critics count
+    /// as contact.
+    #[serde(default = "default_safety_margin")]
+    pub safety_margin: f64,
+}
+
+fn default_safety_margin() -> f64 {
+    0.3
 }
 
 impl Default for MppiConfig {
@@ -104,6 +112,7 @@ impl Default for MppiConfig {
             weight_collision: 2000.0,
             weight_repulsion: 400.0,
             repulsion_distance: 1.0,
+            safety_margin: default_safety_margin(),
         }
     }
 }
@@ -1149,7 +1158,7 @@ impl Controller for MppiFollower {
         let (n, step) = self.plan_for(constraints);
         let (n, step) = (n.max(1), step.max(1e-3));
         let (collision, repulsion, reach) = (cfg.weight_collision, cfg.weight_repulsion, cfg.repulsion_distance.max(1e-3));
-        let checker = CollisionChecker::new(world, constraints, 0.0).with_step(step).with_spread(1.0);
+        let checker = CollisionChecker::new(world, constraints, cfg.safety_margin.max(0.0)).with_step(step).with_spread(1.0);
         let critic = |i: usize, x: f64, y: f64, yaw: f64| -> f64 {
             let d = checker.clearance_at((i + 1) as f64 * step, x, y, yaw);
             if d < 0.0 {
