@@ -189,7 +189,14 @@ impl Problem<'_> {
             let (pw, pwdt) = prev_w.unwrap_or((self.w_start, dt));
             let alpha = (w - pw) / (0.5 * (pwdt + dt));
             let speed = v.abs().max(TURN_CHANGE_SPEED_FLOOR);
-            let steering = speed * self.steer_per_wheelbase + (w.abs() / speed) * a_max;
+            let alpha_max = self.constraints.max_angular_acceleration.abs();
+            let steering = if self.steer_per_wheelbase.is_finite() {
+                speed * self.steer_per_wheelbase + (w.abs() / speed) * a_max
+            } else if alpha_max > 0.0 {
+                alpha_max
+            } else {
+                f64::INFINITY
+            };
             let alpha_over = (alpha.abs() - steering).max(0.0);
             cost += c.weight_acceleration_limit * alpha_over * alpha_over;
             prev_w = Some((w, dt));
