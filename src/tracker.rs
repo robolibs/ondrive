@@ -104,6 +104,9 @@ pub struct Tracker {
     last_command: Option<(f64, f64, f64)>,
     /// Seconds the machine has stood while commanded to move.
     stalled_for: f64,
+    /// Goal pose `(x, y, yaw)` the installed path was planned to, when the
+    /// tracker planned it for a goal on its own.
+    planned_for: Option<(f64, f64, f64)>,
     /// Control barrier filter on the final command against moving obstacles.
     safety: crate::core::safety::SafetyConfig,
 }
@@ -132,6 +135,7 @@ impl Tracker {
             last_steering: None,
             last_command: None,
             stalled_for: 0.0,
+            planned_for: None,
             safety: crate::core::safety::SafetyConfig { enabled: !kind.avoids_obstacles(), ..Default::default() },
         }
     }
@@ -164,11 +168,15 @@ impl Tracker {
 
     pub fn clear_goal(&mut self) {
         self.goal = None;
+        if self.planned_for.take().is_some() {
+            self.path = None;
+        }
     }
 
     /// Install a path. A closed path (`Path::is_closed`) is driven lap after
     /// lap and never completes.
     pub fn set_path(&mut self, path: Path) {
+        self.planned_for = None;
         self.trajectory = None;
         self.clock = 0.0;
         self.clock_origin = None;
@@ -352,6 +360,7 @@ impl Tracker {
         }
 
         self.next_lap(state);
+        self.plan_to_goal(state);
         let goal = match self.resolve_goal(state, world) {
             Ok(Some(g)) => g,
             Ok(None) => return stop("Path completed"),
@@ -534,6 +543,33 @@ impl Tracker {
             let unrolled = lap.unrolled.clone();
             self.drive(unrolled);
         }
+    }
+
+    /// For a path-following kind given a goal and no path of its own, plan
+    /// the shortest Dubins path from `state` to the goal, turning no
+    /// tighter than the platform can (`PLANNED_TURN_RADIUS` for one that
+    /// turns in place), and drive it; planned again when the goal moves.
+    fn plan_to_goal(&mut self, state: &RobotState) {
+        let Some(goal) = &self.goal else {
+            return;
+        };
+        if self.kind.is_point_controller() || self.trajectory.is_some() || (self.path.is_some() && self.planned_for.is_none()) {
+            return;
+        }
+        let target = &goal.target_pose;
+        let key = (target.point.x, target.point.y, target.rotation.to_euler().yaw);
+        if self.planned_for == Some(key) {
+            return;
+        }
+        let k = crate::core::kinematics::max_curvature(&self.constraints);
+        let radius = if k.is_finite() && k > 0.0 { 1.0 / k } else { PLANNED_TURN_RADIUS };
+        let start = (state.pose.point.x, state.pose.point.y, state.pose.rotation.to_euler().yaw);
+        let waypoints = crate::core::dubins::dubins_path(start, key, radius, PLANNED_STEP)
+            .into_iter()
+            .map(|(x, y, yaw)| Pose { point: Point::new(x, y, target.point.z), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, yaw)) })
+            .collect();
+        self.drive(Path { waypoints, speeds: Vec::new(), is_closed: false });
+        self.planned_for = Some(key);
     }
 
     fn resolve_goal(
@@ -952,6 +988,11 @@ const DETOUR_DT: f64 = 0.2;
 const CROSSING_LOOKOUT_S: f64 = 12.0;
 /// Speed, m/s, above which an obstacle counts as moving.
 const MOVING_SPEED: f64 = 0.1;
+/// Turning radius, metres, of a path planned to a goal for a platform that
+/// turns in place.
+const PLANNED_TURN_RADIUS: f64 = 0.5;
+/// Metres between the poses of a path planned to a goal.
+const PLANNED_STEP: f64 = 0.1;
 /// Share of the top speed below which a point controller's detour does not
 /// take the robot's speed to fall.
 const DETOUR_SPEED_FLOOR: f64 = 0.3;
@@ -1117,6 +1158,25 @@ impl Lap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_follower_given_only_a_goal_plans_a_path_to_it() {
+        let mut t = Tracker::new(TrackerKind::PurePursuit);
+        let mut c = RobotConstraints::default();
+        c.wheelbase = 0.65;
+        c.max_steering_angle = 0.46;
+        c.max_linear_velocity = 1.0;
+        t.init(c);
+        let target = Pose { point: Point::new(6.0, 3.0, 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, 1.57)) };
+        t.set_goal(Goal { target_pose: target, target_velocity: None, tolerance_position: 0.3, tolerance_orientation: 0.3 });
+        let state = RobotState { velocity_valid: true, allow_move: true, ..Default::default() };
+        let cmd = t.tick(&state, 0.05, None);
+        assert!(cmd.valid, "{}", cmd.status_message);
+        let path = t.path().expect("a planned path");
+        let end = path.waypoints.last().unwrap();
+        assert!(end.point.distance_to_2d(target.point) < 1e-6);
+        assert!(cmd.linear_velocity > 0.0);
+    }
 
     #[test]
     fn a_stall_ramp_never_spins_a_machine_past_its_turn_rate() {

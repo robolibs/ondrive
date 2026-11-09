@@ -1,4 +1,5 @@
 pub mod curves;
+pub mod dubins;
 pub mod error;
 pub mod kinematics;
 pub mod math;
