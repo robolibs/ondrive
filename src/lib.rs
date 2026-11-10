@@ -42,5 +42,6 @@ pub use crate::point::{
 };
 pub use crate::pred::{
     DwaConfig, DwaFollower, IlqrConfig, IlqrFollower, McaConfig, McaFollower, MpcConfig,
-    MpcFollower, MppiConfig, MppiFollower, SocConfig, SocFollower, TebConfig, TebFollower,
+    MpcFollower, MppiConfig, MppiFollower, SocConfig, SocFollower, TebConfig, TebFollower, VelocityObstacleConfig,
+    VelocityObstacleFollower,
 };

@@ -11,7 +11,7 @@ use crate::point::{
     ApfFollower, CarrotFollower, PidFollower, PoseReachFollower, PoseRegulatorFollower,
 };
 use crate::pred::{
-    DwaFollower, IlqrFollower, McaFollower, MpcFollower, MppiFollower, SocFollower, TebFollower,
+    DwaFollower, IlqrFollower, McaFollower, MpcFollower, MppiFollower, SocFollower, TebFollower, VelocityObstacleFollower,
 };
 use crate::types::{
     ControllerConfig, ControllerStatus, Goal, OutputUnits, Path, RobotConstraints, RobotState, Trajectory,
@@ -42,6 +42,7 @@ pub enum TrackerKind {
     Apf,
     Ilc,
     SlipAdaptive,
+    VelocityObstacle,
 }
 
 impl TrackerKind {
@@ -1153,6 +1154,7 @@ fn make_controller(kind: TrackerKind) -> Box<dyn Controller> {
         TrackerKind::Apf => Box::new(ApfFollower::new()),
         TrackerKind::Ilc => Box::new(IlcFollower::default()),
         TrackerKind::SlipAdaptive => Box::new(SlipAdaptiveFollower::new()),
+        TrackerKind::VelocityObstacle => Box::new(VelocityObstacleFollower::new()),
     }
 }
 

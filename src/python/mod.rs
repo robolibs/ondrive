@@ -50,6 +50,7 @@ fn kind_from_str(s: &str) -> PyResult<TrackerKind> {
         "apf" => TrackerKind::Apf,
         "ilc" => TrackerKind::Ilc,
         "slip_adaptive" => TrackerKind::SlipAdaptive,
+        "velocity_obstacle" => TrackerKind::VelocityObstacle,
         other => {
             return Err(PyValueError::new_err(format!(
                 "unknown tracker kind: {other}"
@@ -81,6 +82,7 @@ fn kind_to_str(k: TrackerKind) -> &'static str {
         TrackerKind::Apf => "apf",
         TrackerKind::Ilc => "ilc",
         TrackerKind::SlipAdaptive => "slip_adaptive",
+        TrackerKind::VelocityObstacle => "velocity_obstacle",
     }
 }
 
@@ -1220,6 +1222,7 @@ fn available_tracker_kinds() -> Vec<&'static str> {
         "apf",
         "ilc",
         "slip_adaptive",
+        "velocity_obstacle",
     ]
 }
 
