@@ -1,8 +1,9 @@
 //! Control barrier function safety filter (Ames et al. 2019) on the final
 //! `(v, ω)` command against moving obstacles. Every footprint disc and
 //! obstacle mode gives a barrier `h`, the gap between them less the mode's
-//! spread and a margin, held to `ḣ ≥ −γ·h` with each mode moving at its
-//! predicted velocity (the time-varying CBF of moving obstacles). A disc
+//! spread and a margin, held to `ḣ ≥ −min(γ·h, √(2·a·h))` with each mode
+//! moving at its predicted velocity (the time-varying CBF of moving
+//! obstacles), `a` the platform's acceleration limit taken as its braking. A disc
 //! offset along the body makes `ω` enter `ḣ`, so the filter steers as well
 //! as brakes. The command closest to the nominal one, by speed and a
 //! weighted turn rate, is found exactly: with two inputs, the optimum of the
@@ -66,6 +67,10 @@ pub fn filter(
     let (x, y) = (pose.point.x, pose.point.y);
     let yaw = pose.rotation.to_euler().yaw;
     let (s, c) = yaw.sin_cos();
+    let brake = constraints.max_linear_acceleration.abs();
+    let v_max = constraints.max_linear_velocity.abs();
+    let range = if brake > 0.0 { cfg.range.max(v_max * v_max / (2.0 * brake) + STOP_ROOM) } else { cfg.range };
+    let closing = |h: f64| if brake > 0.0 && h > 0.0 { (cfg.gamma * h).min((2.0 * brake * h).sqrt()) } else { cfg.gamma * h };
     let mut planes = Vec::new();
     for (d, r) in footprint_discs(constraints) {
         let (px, py) = (x + d * c, y + d * s);
@@ -78,13 +83,13 @@ pub fn filter(
             let (dx, dy) = (px - ox, py - oy);
             let dist = dx.hypot(dy).max(1e-6);
             let h = dist - r - now.radius - cfg.spread * now.std_x.max(now.std_y) - cfg.margin;
-            if h > cfg.range {
+            if h > range {
                 continue;
             }
             let (nx, ny) = (dx / dist, dy / dist);
             let along = nx * c + ny * s;
             let across = -nx * s + ny * c;
-            planes.push(Halfplane { a_v: along, a_w: d * across, b: nx * ovx + ny * ovy - cfg.gamma * h - vy * across });
+            planes.push(Halfplane { a_v: along, a_w: d * across, b: nx * ovx + ny * ovy - closing(h) - vy * across });
         }
     }
     if planes.iter().all(|p| p.slack(nominal.0, nominal.1) >= -1e-9) {
@@ -147,6 +152,9 @@ fn closest(planes: &[Halfplane], nominal: (f64, f64), turn_weight: f64) -> (f64,
 
 /// Seconds over which an obstacle's velocity is read from its prediction.
 const VELOCITY_DT: f64 = 0.2;
+/// Metres past the stopping distance from top speed at which the filter
+/// starts to watch an obstacle.
+const STOP_ROOM: f64 = 1.0;
 
 #[cfg(test)]
 mod tests {
@@ -190,6 +198,20 @@ mod tests {
         let cfg = SafetyConfig { enabled: true, ..SafetyConfig::default() };
         let (v, _) = filter(&cfg, &constraints(), &pose(0.0, 0.0, 0.0), (1.0, 0.0), 0.0, Some(&world(1.6, 0.0, 0.0, 0.0))).unwrap();
         assert!(v <= 0.5 + 1e-6, "v {v}");
+    }
+
+    #[test]
+    fn brakes_early_for_a_platform_that_brakes_slowly() {
+        let cfg = SafetyConfig { enabled: true, ..SafetyConfig::default() };
+        let mut c = constraints();
+        c.max_linear_velocity = 2.0;
+        c.max_linear_acceleration = 0.6;
+        let at = pose(0.0, 0.0, 0.0);
+        let (v, _) = filter(&cfg, &c, &at, (2.0, 0.0), 0.0, Some(&world(4.0, 0.0, 0.0, 0.0))).unwrap();
+        let (_, r) = footprint_discs(&c).into_iter().fold((0.0, 0.0_f64), |a, d| if d.0 >= a.0 { d } else { a });
+        let h = 4.0 - r - 0.5 - cfg.margin;
+        assert!(v <= (2.0 * 0.6 * h).sqrt() + 1e-6, "v {v} h {h}");
+        assert!(filter(&cfg, &c, &at, (2.0, 0.0), 0.0, Some(&world(5.6, 0.0, 0.0, 0.0))).is_none());
     }
 
     #[test]
