@@ -122,7 +122,8 @@ pub fn heading_speed_scale(heading_error: f64, constraints: &RobotConstraints) -
 
 /// Speed profile for path following: nominal speed reduced for path
 /// curvature and tapered toward the goal so the platform stops inside the
-/// tolerance instead of overshooting.
+/// tolerance instead of overshooting: no faster than `kp_linear` per metre
+/// left, nor than braking at `max_linear_acceleration` stops it in time.
 pub fn path_speed(
     nominal: f64,
     kappa: f64,
@@ -132,8 +133,10 @@ pub fn path_speed(
     constraints: &RobotConstraints,
 ) -> f64 {
     let curvature_scale = 1.0 / (1.0 + 2.0 * kappa.abs() * wheelbase(constraints));
-    let taper = (kp_linear.max(0.1) * (dist_to_goal - 0.5 * goal_tolerance).max(0.0))
-        .max(0.15 * constraints.max_linear_velocity.max(0.0));
+    let left = (dist_to_goal - 0.5 * goal_tolerance).max(0.0);
+    let accel = constraints.max_linear_acceleration;
+    let braking = if accel > 0.0 { (2.0 * accel * left).sqrt() } else { f64::INFINITY };
+    let taper = (kp_linear.max(0.1) * left).min(braking).max(0.15 * constraints.max_linear_velocity.max(0.0));
     (nominal * curvature_scale.max(0.25)).min(taper).max(0.0)
 }
 

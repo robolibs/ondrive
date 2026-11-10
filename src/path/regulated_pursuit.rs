@@ -31,7 +31,8 @@ pub struct RegulatedPursuitConfig {
     /// Lowest speed (m/s) the two regulations may produce.
     pub min_speed: f64,
     /// Remaining path (to its end or the next cusp) over which the speed
-    /// scales down linearly.
+    /// scales down linearly; nearer than braking at
+    /// `max_linear_acceleration` needs, it is capped to stop there.
     pub approach_distance: f64,
     /// Lowest speed (m/s) of that approach.
     pub min_approach_speed: f64,
@@ -343,11 +344,14 @@ impl Controller for RegulatedPursuitFollower {
             let c = checker.clearance(0, state.pose.point.x, state.pose.point.y, yaw);
             if c < rpp.proximity_distance { speed * c.max(0.0) / rpp.proximity_distance } else { speed }
         };
+        let braking = constraints.max_linear_acceleration;
         let approach = |speed: f64| -> f64 {
+            let floor = rpp.min_approach_speed.min(speed);
+            let speed = if braking > 0.0 { speed.min((2.0 * braking * remaining).sqrt()) } else { speed };
             if rpp.approach_distance > 0.0 && remaining < rpp.approach_distance {
-                (speed * remaining / rpp.approach_distance).max(rpp.min_approach_speed.min(speed))
+                (speed * remaining / rpp.approach_distance).max(floor)
             } else {
-                speed
+                speed.max(floor)
             }
         };
         self.base.status.cross_track_error = proj.lateral_error;

@@ -75,7 +75,7 @@ impl Controller for KanayamaFollower {
         let cfg = self.base.config.clone();
         let yaw = yaw_of(&state.pose);
 
-        let (x_r, y_r, yaw_r, v_r, omega_r) = match &self.trajectory {
+        let (x_r, y_r, yaw_r, v_r, omega_r, v_cap) = match &self.trajectory {
             Some(traj) => {
                 let s = traj.sample(self.clock);
                 if s.finished && !is_holonomic(constraints.steering_type) {
@@ -89,7 +89,7 @@ impl Controller for KanayamaFollower {
                     }
                 }
                 let v_r = if s.finished { 0.0 } else { s.speed };
-                (s.pose.point.x, s.pose.point.y, yaw_of(&s.pose), v_r, if s.finished { 0.0 } else { s.yaw_rate })
+                (s.pose.point.x, s.pose.point.y, yaw_of(&s.pose), v_r, if s.finished { 0.0 } else { s.yaw_rate }, f64::INFINITY)
             }
             None => {
                 let s = prep.proj.arc_length;
@@ -100,10 +100,15 @@ impl Controller for KanayamaFollower {
                     .map_or(constraints.max_linear_velocity, |s| s.min(constraints.max_linear_velocity));
                 let stop = self.base.distance_left(&prep.proj, self.cursor.total_length()).min(cusp - s);
                 let v_r = path_speed(nominal, kappa, stop, prep.pos_tol, cfg.kp_linear, constraints);
+                let v_cap = path_speed(constraints.max_linear_velocity, 0.0, stop, prep.pos_tol, cfg.kp_linear, constraints);
                 let back = prep.allow_reverse && direction_at(&self.base.path.speeds, &prep.proj).is_some_and(|d| d < 0);
                 // A reversing leg is tracked by the body facing against its
                 // direction of travel, at negative speed.
-                if back { (p.x, p.y, normalize_angle(h + PI), -v_r, v_r * kappa) } else { (p.x, p.y, h, v_r, v_r * kappa) }
+                if back {
+                    (p.x, p.y, normalize_angle(h + PI), -v_r, v_r * kappa, v_cap)
+                } else {
+                    (p.x, p.y, h, v_r, v_r * kappa, v_cap)
+                }
             }
         };
 
@@ -119,7 +124,7 @@ impl Controller for KanayamaFollower {
             // e_x, e_y, e_theta are already body-frame errors against the
             // moving reference, so translation and rotation correct
             // independently with no coupling term needed.
-            let vx = v_r * e_theta.cos() + k_x * e_x;
+            let vx = (v_r * e_theta.cos() + k_x * e_x).clamp(-v_cap, v_cap);
             let vy = v_r * e_theta.sin() + k_y * e_y;
             let omega = omega_r + k_theta * e_theta.sin();
             self.base.status.mode = if self.trajectory.is_some() {
@@ -130,7 +135,7 @@ impl Controller for KanayamaFollower {
             return finalize_holonomic(vx, vy, omega, constraints, &cfg, "Kanayama tracking");
         }
 
-        let v = v_r * e_theta.cos() + k_x * e_x;
+        let v = (v_r * e_theta.cos() + k_x * e_x).clamp(-v_cap, v_cap);
         let omega = omega_r + v_r * k_y * e_y + v_r.abs() * k_theta * e_theta.sin();
         self.base.status.mode = if self.trajectory.is_some() { "kanayama_timed".into() } else { "kanayama".into() };
         finalize(v, omega, constraints, &cfg, prep.allow_reverse, "Kanayama tracking")
