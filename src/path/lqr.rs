@@ -2,6 +2,10 @@
 //! `x = [e_lat, theta_e]`, `u = omega - v * kappa_path`:
 //!   e(k+1)     = e - v dt theta_e
 //!   theta(k+1) = theta_e - dt u
+//! On a platform whose steering lags (`actuation_delay` tau > 0) the yaw
+//! rate it turns at, `w = omega_actual - v * kappa_path`, is a third state:
+//!   theta(k+1) = theta_e - dt w
+//!   w(k+1)     = w + dt / tau (u - w)
 //! The Riccati equation is iterated to convergence every tick at the
 //! current linearisation speed; the commanded yaw rate is the path
 //! curvature feedforward plus `-K x`.
@@ -9,13 +13,13 @@
 use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
     path_to_body,
-    can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, is_holonomic,
+    actuation_delay, can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, is_holonomic,
     path_speed, reverse_allowed,
 };
 use crate::core::math::normalize_angle;
 use crate::core::path::{PathCursor, curvature_at_projection, cusp_after, speed_cap};
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
-use nalgebra::{Matrix2, Vector2};
+use nalgebra::{Matrix2, Matrix3, SMatrix, SVector, Vector2, Vector3};
 
 const DARE_MAX_ITERATIONS: usize = 20_000;
 const DARE_TOLERANCE: f64 = 1e-10;
@@ -23,13 +27,13 @@ const MIN_LINEARISATION_SPEED: f64 = 0.1;
 
 /// Iterate `P = A'PA - A'PB (R + B'PB)^-1 B'PA + Q` to a fixed point and
 /// return the gain `K = (R + B'PB)^-1 B'PA`.
-pub fn lqr_gain(
-    p0: Option<Matrix2<f64>>,
-    a: &Matrix2<f64>,
-    b: &Vector2<f64>,
-    q: &Matrix2<f64>,
+pub fn lqr_gain<const N: usize>(
+    p0: Option<SMatrix<f64, N, N>>,
+    a: &SMatrix<f64, N, N>,
+    b: &SVector<f64, N>,
+    q: &SMatrix<f64, N, N>,
     r: f64,
-) -> (Vector2<f64>, Matrix2<f64>) {
+) -> (SVector<f64, N>, SMatrix<f64, N, N>) {
     let mut p = p0.unwrap_or(*q);
     let at = a.transpose();
     for _ in 0..DARE_MAX_ITERATIONS {
@@ -55,6 +59,8 @@ pub struct LqrFollower {
     pub base: ControllerBase,
     cursor: PathCursor,
     last_p: Option<Matrix2<f64>>,
+    last_p_lagged: Option<Matrix3<f64>>,
+    last_omega: f64,
 }
 
 impl LqrFollower {
@@ -153,22 +159,35 @@ impl Controller for LqrFollower {
         let v = path_speed(
             nominal,
             kappa_path,
-            self.base.status.distance_to_goal.min(stop_distance),
+            self.base.distance_left(&proj, length).min(stop_distance),
             pos_tol,
             cfg.kp_linear,
             constraints,
         ) * heading_speed_scale(theta_e, constraints);
         let v_lin = v.abs().max(MIN_LINEARISATION_SPEED);
 
-        let a = Matrix2::new(1.0, -v_lin * dt, 0.0, 1.0);
-        let b = Vector2::new(0.0, -dt);
-        let q = Matrix2::new(cfg.k_cross_track.max(1e-6), 0.0, 0.0, cfg.k_heading.max(1e-6));
-        let (k, p) = lqr_gain(self.last_p, &a, &b, &q, 1.0);
-        self.last_p = Some(p);
-        let x = Vector2::new(e_lat, theta_e);
-        let u = -k.dot(&x);
+        let (q_lat, q_head) = (cfg.k_cross_track.max(1e-6), cfg.k_heading.max(1e-6));
+        let tau = 0.5 * actuation_delay(constraints);
+        let u = if tau > 0.0 {
+            let lag = (dt / tau).min(1.0);
+            let a = Matrix3::new(1.0, -v_lin * dt, 0.0, 0.0, 1.0, -dt, 0.0, 0.0, 1.0 - lag);
+            let b = Vector3::new(0.0, 0.0, lag);
+            let q = Matrix3::new(q_lat, 0.0, 0.0, 0.0, q_head, 0.0, 0.0, 0.0, 0.0);
+            let (k, p) = lqr_gain(self.last_p_lagged, &a, &b, &q, 1.0);
+            self.last_p_lagged = Some(p);
+            let turning = if state.velocity_valid { state.velocity.angular } else { self.last_omega };
+            -k.dot(&Vector3::new(e_lat, theta_e, turning - v * kappa_path))
+        } else {
+            let a = Matrix2::new(1.0, -v_lin * dt, 0.0, 1.0);
+            let b = Vector2::new(0.0, -dt);
+            let q = Matrix2::new(q_lat, 0.0, 0.0, q_head);
+            let (k, p) = lqr_gain(self.last_p, &a, &b, &q, 1.0);
+            self.last_p = Some(p);
+            -k.dot(&Vector2::new(e_lat, theta_e))
+        };
 
         let omega = v * kappa_path + u;
+        self.last_omega = omega;
         self.base.status.mode = if reverse { "lqr_reverse".into() } else { "lqr".into() };
         finalize(sign * v, omega, constraints, &cfg, allow_reverse, "LQR tracking")
     }
@@ -179,6 +198,8 @@ impl Controller for LqrFollower {
         self.base.path_index = 0;
         self.base.status = Default::default();
         self.last_p = None;
+        self.last_p_lagged = None;
+        self.last_omega = 0.0;
     }
 
     fn reset(&mut self) {
