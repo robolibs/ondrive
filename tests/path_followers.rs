@@ -223,7 +223,14 @@ fn every_path_follower_reverses_out_of_a_cusp() {
 #[test]
 fn followers_keep_their_speed_round_the_end_of_a_lap() {
     let radius = 7.5;
-    for kind in [TrackerKind::PurePursuit, TrackerKind::Stanley, TrackerKind::Lqr, TrackerKind::VectorPursuit, TrackerKind::Kanayama] {
+    for kind in [
+        TrackerKind::PurePursuit,
+        TrackerKind::Stanley,
+        TrackerKind::Lqr,
+        TrackerKind::RegulatedPursuit,
+        TrackerKind::VectorPursuit,
+        TrackerKind::Kanayama,
+    ] {
         let mut path = Path::default();
         path.is_closed = true;
         for i in 0..48 {
@@ -240,13 +247,15 @@ fn followers_keep_their_speed_round_the_end_of_a_lap() {
         c.max_steering_angle = 0.46;
         c.max_linear_velocity = 1.0;
         c.max_angular_velocity = 1.5;
+        c.rear_wheelbase = 0.28;
         tracker.init(c);
+        ondrive::smoothen_path(&mut path, 0.25);
         tracker.set_path(path);
 
         let mut state = RobotState { pose: pose(0.0, 0.0, 0.0), allow_move: true, velocity_valid: true, ..Default::default() };
         let (dt, lap) = (0.05, std::f64::consts::TAU * radius);
         let (mut driven, mut slowest) = (0.0, f64::INFINITY);
-        while driven < 1.5 * lap {
+        while driven < 2.5 * lap {
             let cmd = tracker.tick(&state, dt, None);
             assert!(cmd.valid && !tracker.is_path_completed(), "{kind:?} stopped after {driven:.1} m");
             let yaw = state.pose.rotation.to_euler().yaw;

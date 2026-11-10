@@ -544,8 +544,9 @@ impl Tracker {
         (worst > 1e-9).then(|| (c.max_steering_rate / (l * worst)).max(RATE_FLOOR * c.max_linear_velocity))
     }
 
-    /// On a closed path, restart the unrolled laps once the robot is into
-    /// the second.
+    /// On a closed path, restart the unrolled laps once the robot is half
+    /// way round the second, where none of its axles lies near the start
+    /// or the end of the laps it is given.
     fn next_lap(&mut self, state: &RobotState) {
         let (Some(lap), Some(path)) = (&self.lap, &self.path) else {
             return;
@@ -554,7 +555,7 @@ impl Tracker {
             return;
         };
         self.projection_segment = proj.segment;
-        if proj.arc_length >= lap.length {
+        if proj.arc_length >= 1.5 * lap.length {
             let unrolled = lap.unrolled.clone();
             self.drive(unrolled);
         }
@@ -1405,8 +1406,8 @@ fn config_error(c: &ControllerConfig) -> Option<&'static str> {
     (!ok).then_some("controller config must be non-negative where it is a distance, time or tolerance, and not NaN")
 }
 
-/// A closed path driven lap after lap. Controllers get it unrolled to two
-/// laps, and get them again each time the robot starts the second.
+/// A closed path driven lap after lap. Controllers get it unrolled to three
+/// laps, and get them again each time the robot is half way round the second.
 #[derive(Clone, Debug)]
 struct Lap {
     source: Path,
@@ -1439,9 +1440,11 @@ impl Lap {
         }
         let mut unrolled = ring.clone();
         unrolled.is_closed = false;
-        unrolled.waypoints.extend_from_slice(&ring.waypoints[1..]);
-        if with_speeds {
-            unrolled.speeds.extend_from_slice(&ring.speeds[1..]);
+        for _ in 0..2 {
+            unrolled.waypoints.extend_from_slice(&ring.waypoints[1..]);
+            if with_speeds {
+                unrolled.speeds.extend_from_slice(&ring.speeds[1..]);
+            }
         }
         Some(Self { source: path.clone(), ring, length, unrolled })
     }
