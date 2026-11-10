@@ -13,7 +13,7 @@ use crate::core::kinematics::{
 use crate::core::math::{heading_error, normalize_angle};
 use crate::core::obstacles::{CollisionChecker, robot_radius};
 use crate::pred::mppi::{Swerve, build_reference, pick_detour};
-use crate::core::path::{PathCursor, cusp_after, sample, speed_cap};
+use crate::core::path::{PathCursor, cusp_after, direction_at, sample_past, speed_cap};
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
 use std::f64::consts::PI;
@@ -277,28 +277,41 @@ impl Controller for RegulatedPursuitFollower {
             state.pose.point.y - axle_offset * yaw.sin(),
             0.0,
         );
+        // Progress, cusps and arrival go by the robot's pose; the rear axle
+        // chases the lookahead point.
         let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
-        let Some(proj) = self.cursor.project(&self.base.path.waypoints, rear, self.base.path_index) else {
+        let Some(at_robot) = self.cursor.project(&self.base.path.waypoints, state.pose.point, self.base.path_index) else {
             return VelocityCommand::invalid("no path");
         };
-        let proj = self.cursor.past_cusp(&self.base.path.waypoints, &self.base.path.speeds, rear, proj, pos_tol.max(0.1));
-        self.base.path_index = proj.segment;
+        let at_robot =
+            self.cursor.past_cusp(&self.base.path.waypoints, &self.base.path.speeds, state.pose.point, at_robot, pos_tol.max(0.1));
+        self.base.path_index = at_robot.segment;
 
         let length = self.cursor.total_length();
-        if let Some(cmd) = self.base.arrival_on_path(state, goal, constraints, &proj, length) {
+        if let Some(cmd) = self.base.arrival_on_path(state, goal, constraints, &at_robot, length) {
             self.lookahead_point = None;
             return cmd;
         }
+        let proj = if axle_offset > 0.0 {
+            self.cursor
+                .project_on_leg(&self.base.path.waypoints, &self.base.path.speeds, rear, at_robot.segment, at_robot.arc_length)
+                .unwrap_or(at_robot)
+        } else {
+            at_robot
+        };
 
         let measured = if state.velocity_valid { state.velocity.linear.abs() } else { self.last_speed };
         let (floor, regulated_radius) = machine_scale(&rpp, constraints, measured);
         let lookahead = (rpp.lookahead_time * measured).clamp(floor, rpp.max_lookahead.max(floor));
         // The path is followed up to its next cusp at most, as if it ended there.
-        let stop_at = cusp_after(&self.base.path.speeds, &self.cursor.cum, proj.arc_length).unwrap_or(length);
-        let (mut target, _) = sample(
+        let stop_at = cusp_after(&self.base.path.speeds, &self.cursor.cum, at_robot.arc_length).unwrap_or(length);
+        // Reversing, the rear axle leads the pose and aims past the leg's end.
+        let trail = if direction_at(&self.base.path.speeds, &at_robot) == Some(-1) { axle_offset } else { 0.0 };
+        let (mut target, _) = sample_past(
             &self.base.path.waypoints,
             &self.cursor.cum,
-            (proj.arc_length + lookahead).min(stop_at),
+            (proj.arc_length + lookahead).min(stop_at + trail),
+            stop_at,
         );
         let obstacles = world.map_or(&[][..], |w| &w.obstacles[..]);
         if obstacles.is_empty() {
@@ -315,7 +328,7 @@ impl Controller for RegulatedPursuitFollower {
             }
         }
         self.lookahead_point = Some(target);
-        let remaining = (stop_at - proj.arc_length).max(0.0);
+        let remaining = (stop_at - at_robot.arc_length).max(0.0);
 
         let dx = target.x - rear.x;
         let dy = target.y - rear.y;

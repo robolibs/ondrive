@@ -225,6 +225,19 @@ pub fn sample(waypoints: &[Pose], cum: &[f64], s: f64) -> (Point, f64) {
     )
 }
 
+/// `sample` at `s`, carried straight on past `cap` along the heading the
+/// path arrives there with: a point a leading axle aims at for the pose
+/// behind it to reach `cap`.
+pub fn sample_past(waypoints: &[Pose], cum: &[f64], s: f64, cap: f64) -> (Point, f64) {
+    if s <= cap {
+        return sample(waypoints, cum, s);
+    }
+    let (p, _) = sample(waypoints, cum, cap);
+    let (_, h) = sample(waypoints, cum, (cap - 1e-6).max(0.0));
+    let over = s - cap;
+    (Point::new(p.x + over * h.cos(), p.y + over * h.sin(), p.z), h)
+}
+
 /// Heading change, radians, past which a waypoint counts as a cusp for curvature.
 const CUSP_TURN: f64 = 0.75 * std::f64::consts::PI;
 
@@ -388,6 +401,15 @@ impl PathCursor {
     pub fn cusp_ahead(&self, speeds: &[f64], s: f64) -> Option<usize> {
         let c = cusp_after(speeds, &self.cum, s)?;
         Some(self.cum.partition_point(|x| *x < c - 1e-9).min(self.cum.len().saturating_sub(1)))
+    }
+
+    /// Projection of `p`, a point of the robot near its pose projected at
+    /// `around` (arc length `s`), onto the leg holding it: between the
+    /// progress committed past a cusp and the next cusp, searched both ways.
+    pub fn project_on_leg(&self, waypoints: &[Pose], speeds: &[f64], p: Point, around: usize, s: f64) -> Option<PathProjection> {
+        let leg_end = self.cusp_ahead(speeds, s).unwrap_or(waypoints.len().saturating_sub(1));
+        let lookback = around.saturating_sub(self.floor).min(CURSOR_WINDOW);
+        project(waypoints, &self.cum, p, around, lookback, leg_end.saturating_sub(around).max(1))
     }
 }
 

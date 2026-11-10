@@ -10,7 +10,7 @@ use crate::core::kinematics::{
     is_ackermann, is_holonomic, max_curvature, path_speed, reverse_allowed, world_to_body,
 };
 use crate::core::math::{heading_error, normalize_angle};
-use crate::core::path::{PathCursor, cusp_after, sample, sharpest_ahead, speed_cap};
+use crate::core::path::{PathCursor, cusp_after, direction_at, sample_past, sharpest_ahead, speed_cap};
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
 use std::f64::consts::PI;
@@ -114,31 +114,44 @@ impl Controller for VectorPursuitFollower {
 
         let axle_offset = if is_ackermann(constraints.steering_type) { constraints.rear_wheelbase.max(0.0) } else { 0.0 };
         let rear = Point::new(state.pose.point.x - axle_offset * yaw.cos(), state.pose.point.y - axle_offset * yaw.sin(), 0.0);
+        // Progress, cusps and arrival go by the robot's pose; the rear axle
+        // chases the lookahead point.
         let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
-        let Some(proj) = self.cursor.project(&self.base.path.waypoints, rear, self.base.path_index) else {
+        let Some(at_robot) = self.cursor.project(&self.base.path.waypoints, state.pose.point, self.base.path_index) else {
             return VelocityCommand::invalid("no path");
         };
-        let proj = self.cursor.past_cusp(&self.base.path.waypoints, &self.base.path.speeds, rear, proj, pos_tol.max(0.1));
-        self.base.path_index = proj.segment;
+        let at_robot =
+            self.cursor.past_cusp(&self.base.path.waypoints, &self.base.path.speeds, state.pose.point, at_robot, pos_tol.max(0.1));
+        self.base.path_index = at_robot.segment;
 
         let length = self.cursor.total_length();
-        if let Some(cmd) = self.base.arrival_on_path(state, goal, constraints, &proj, length) {
+        if let Some(cmd) = self.base.arrival_on_path(state, goal, constraints, &at_robot, length) {
             self.lookahead_point = None;
             return cmd;
         }
+        let proj = if axle_offset > 0.0 {
+            self.cursor
+                .project_on_leg(&self.base.path.waypoints, &self.base.path.speeds, rear, at_robot.segment, at_robot.arc_length)
+                .unwrap_or(at_robot)
+        } else {
+            at_robot
+        };
 
         let base_lookahead = cfg.lookahead_distance.max(1e-3);
         let kappa_path = sharpest_ahead(&self.base.path.waypoints, &self.cursor.cum, proj.arc_length, base_lookahead, max_curvature(constraints));
         let lookahead = ((base_lookahead + cfg.lookahead_time.max(0.0) * state.velocity.linear.abs())
             / (1.0 + CURVATURE_LOOKAHEAD_GAIN * kappa_path * base_lookahead))
             .clamp(0.5 * base_lookahead, 3.0 * base_lookahead);
-        let mut s_target = proj.arc_length + lookahead;
-        let mut stop_distance = self.base.distance_left(&proj, length);
-        if let Some(cusp) = cusp_after(&self.base.path.speeds, &self.cursor.cum, proj.arc_length) {
-            s_target = s_target.min(cusp);
-            stop_distance = stop_distance.min((cusp - proj.arc_length).max(0.0));
+        let mut stop_distance = self.base.distance_left(&at_robot, length);
+        let mut cap = length;
+        if let Some(cusp) = cusp_after(&self.base.path.speeds, &self.cursor.cum, at_robot.arc_length) {
+            cap = cusp;
+            stop_distance = stop_distance.min((cusp - at_robot.arc_length).max(0.0));
         }
-        let (target, target_heading) = sample(&self.base.path.waypoints, &self.cursor.cum, s_target);
+        // Reversing, the rear axle leads the pose and aims past the leg's end.
+        let trail = if direction_at(&self.base.path.speeds, &at_robot) == Some(-1) { axle_offset } else { 0.0 };
+        let s_target = (proj.arc_length + lookahead).min(cap + trail);
+        let (target, target_heading) = sample_past(&self.base.path.waypoints, &self.cursor.cum, s_target, cap);
         self.lookahead_point = Some(target);
 
         let dx = target.x - rear.x;

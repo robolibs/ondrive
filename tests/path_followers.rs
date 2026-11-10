@@ -167,14 +167,17 @@ fn every_path_follower_reverses_out_of_a_cusp() {
         let a = i as f64 * std::f64::consts::FRAC_PI_2 / 16.0;
         legs.push((24.0 - 9.0 * a.sin(), 9.0 * (1.0 - a.cos()), -1.0));
     }
-    for kind in [
+    for (kind, offset) in [
         TrackerKind::PurePursuit,
         TrackerKind::Stanley,
         TrackerKind::Lqr,
         TrackerKind::RegulatedPursuit,
         TrackerKind::VectorPursuit,
         TrackerKind::Kanayama,
-    ] {
+    ]
+    .into_iter()
+    .flat_map(|kind| [(kind, 0.0), (kind, 1.0)])
+    {
         let mut path = Path::default();
         for i in 0..legs.len() {
             let (nx, ny, _) = legs[(i + 1).min(legs.len() - 1)];
@@ -192,6 +195,7 @@ fn every_path_follower_reverses_out_of_a_cusp() {
         tracker.set_config(cfg);
         let mut c = RobotConstraints::default();
         c.wheelbase = 2.0;
+        c.rear_wheelbase = offset;
         c.max_steering_angle = 0.45;
         c.max_linear_velocity = 2.0;
         c.max_angular_velocity = 1.0;
@@ -203,9 +207,12 @@ fn every_path_follower_reverses_out_of_a_cusp() {
         for _ in 0..2400 {
             let cmd = tracker.tick(&state, dt, None);
             let yaw = state.pose.rotation.to_euler().yaw;
-            state.pose.point.x += cmd.linear_velocity * yaw.cos() * dt;
-            state.pose.point.y += cmd.linear_velocity * yaw.sin() * dt;
-            state.pose.rotation = Quaternion::from_euler(Euler::new(0.0, 0.0, yaw + cmd.angular_velocity * dt));
+            let (rx, ry) = (state.pose.point.x - offset * yaw.cos(), state.pose.point.y - offset * yaw.sin());
+            let (rx, ry) = (rx + cmd.linear_velocity * yaw.cos() * dt, ry + cmd.linear_velocity * yaw.sin() * dt);
+            let turned = yaw + cmd.angular_velocity * dt;
+            state.pose.point.x = rx + offset * turned.cos();
+            state.pose.point.y = ry + offset * turned.sin();
+            state.pose.rotation = Quaternion::from_euler(Euler::new(0.0, 0.0, turned));
             state.velocity.linear = cmd.linear_velocity;
             state.velocity.angular = cmd.angular_velocity;
             worst = worst.max(tracker.get_status().cross_track_error.abs());
@@ -213,10 +220,10 @@ fn every_path_follower_reverses_out_of_a_cusp() {
                 break;
             }
         }
-        assert!(tracker.is_path_completed(), "{kind:?} never finished the reversing leg");
-        assert!(worst < 0.5, "{kind:?} strayed {worst:.2} m off the path");
+        assert!(tracker.is_path_completed(), "{kind:?} (rear axle {offset} m back) never finished the reversing leg");
+        assert!(worst < 0.5, "{kind:?} (rear axle {offset} m back) strayed {worst:.2} m off the path");
         let gap = state.pose.point.distance_to_2d(end.point);
-        assert!(gap < 1.0, "{kind:?} stopped {gap:.2} m from the end");
+        assert!(gap < 1.0, "{kind:?} (rear axle {offset} m back) stopped {gap:.2} m from the end");
     }
 }
 
