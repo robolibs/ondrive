@@ -112,7 +112,12 @@ impl Controller for VelocityObstacleFollower {
         let length = self.cursor.total_length();
         let cap = cusp_after(speeds, cum, s).unwrap_or(length);
         let back = prep.allow_reverse && direction_at(speeds, &prep.proj) == Some(-1);
-        let travel = yaw + if back { PI } else { 0.0 };
+        let body_turn = if back { PI } else { 0.0 };
+        let travel = yaw + body_turn;
+        // An Ackermann machine steers by its rear axle, which moves along its
+        // heading; the pose rides `axle` ahead of it on the body.
+        let axle = if is_ackermann(constraints.steering_type) { constraints.rear_wheelbase.max(0.0) } else { 0.0 };
+        let (rx, ry) = (x - axle * yaw.cos(), y - axle * yaw.sin());
 
         // The command the path asks for: pursuit of the point a lookahead on,
         // taken on the cheaper detour round what blocks the path ahead.
@@ -122,7 +127,7 @@ impl Controller for VelocityObstacleFollower {
         let base_lookahead = cfg.lookahead_distance.max(0.5);
         let bend = sharpest_ahead(waypoints, cum, s, base_lookahead, max_curvature(constraints));
         let lookahead = (base_lookahead / (1.0 + LOOKAHEAD_BEND_GAIN * bend * base_lookahead)).clamp(0.5 * base_lookahead, base_lookahead);
-        let (mut target, _) = sample(waypoints, cum, (s + lookahead).min(cap));
+        let (mut target, mut target_heading) = sample(waypoints, cum, (s + lookahead).min(cap));
         let obstacles = world.map_or(&[][..], |w| &w.obstacles[..]);
         if obstacles.is_empty() {
             self.side = 0.0;
@@ -134,9 +139,13 @@ impl Controller for VelocityObstacleFollower {
             if let Some(g) = pick_detour(&reference, obstacles, room, DETOUR_DT, &mut self.side, Swerve::of(constraints, speed)) {
                 let k = ahead.min(g.x.len() - 1);
                 target = Point::new(g.x[k], g.y[k], 0.0);
+                target_heading = g.yaw[k];
             }
         }
-        let (dx, dy) = (target.x - x, target.y - y);
+        // The rear axle aims where it stands when the pose is at the target,
+        // facing along the way there.
+        let body = target_heading + body_turn;
+        let (dx, dy) = (target.x - axle * body.cos() - rx, target.y - axle * body.sin() - ry);
         let reach = dx.hypot(dy).max(1e-6);
         let alpha = normalize_angle(dy.atan2(dx) - travel);
         let k_lim = if max_curvature(constraints).is_finite() {
@@ -178,15 +187,14 @@ impl Controller for VelocityObstacleFollower {
         // driven straight on after: a turn away, not a circle back.
         let steps = (vo.horizon_s / vo.dt).ceil() as usize;
         let course_of = |speed: f64, curvature: f64| {
-            let turning = arc_course((x, y, travel), curvature);
+            let turning = arc_course((rx, ry, travel), curvature);
             let turned = speed * vo.window_s;
             let (tx, ty, th) = turning(turned);
             move |d: f64| {
-                if d <= turned {
-                    turning(d)
-                } else {
-                    (tx + (d - turned) * th.cos(), ty + (d - turned) * th.sin(), th)
-                }
+                let (cx, cy, ch) =
+                    if d <= turned { turning(d) } else { (tx + (d - turned) * th.cos(), ty + (d - turned) * th.sin(), th) };
+                let body = ch - body_turn;
+                (cx + axle * body.cos(), cy + axle * body.sin(), ch)
             }
         };
         // Already inside the margin, only coming closer still counts.

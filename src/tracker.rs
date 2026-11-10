@@ -95,6 +95,7 @@ impl TrackerKind {
                 | TrackerKind::Ilc
                 | TrackerKind::SlipAdaptive
                 | TrackerKind::Frenet
+                | TrackerKind::VelocityObstacle
         )
     }
 }
