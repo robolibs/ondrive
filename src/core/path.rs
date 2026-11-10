@@ -403,12 +403,22 @@ impl PathCursor {
         Some(self.cum.partition_point(|x| *x < c - 1e-9).min(self.cum.len().saturating_sub(1)))
     }
 
+    /// Waypoint index of the last cusp at or before arc length `s`.
+    pub fn cusp_behind(&self, speeds: &[f64], s: f64) -> Option<usize> {
+        if speeds.len() != self.cum.len() || speeds.len() < 2 {
+            return None;
+        }
+        (0..speeds.len() - 1).rev().find(|&i| self.cum[i] <= s + 1e-9 && (speeds[i] < 0.0) != (speeds[i + 1] < 0.0))
+    }
+
     /// Projection of `p`, a point of the robot near its pose projected at
-    /// `around` (arc length `s`), onto the leg holding it: between the
-    /// progress committed past a cusp and the next cusp, searched both ways.
+    /// `around` (arc length `s`), onto the leg holding it: between the cusp
+    /// (or progress committed past one) behind `s` and the next cusp,
+    /// searched both ways.
     pub fn project_on_leg(&self, waypoints: &[Pose], speeds: &[f64], p: Point, around: usize, s: f64) -> Option<PathProjection> {
         let leg_end = self.cusp_ahead(speeds, s).unwrap_or(waypoints.len().saturating_sub(1));
-        let lookback = around.saturating_sub(self.floor).min(CURSOR_WINDOW);
+        let leg_start = self.floor.max(self.cusp_behind(speeds, s).unwrap_or(0));
+        let lookback = around.saturating_sub(leg_start).min(CURSOR_WINDOW);
         project(waypoints, &self.cum, p, around, lookback, leg_end.saturating_sub(around).max(1))
     }
 }
@@ -431,5 +441,24 @@ mod tests {
         assert!(corner > 2.0, "the corner reads {corner:.2} 1/m");
         assert_eq!(sharpest_ahead(&waypoints, &cum, 5.0, 8.0, 0.5), 0.0);
         assert_eq!(sharpest_ahead(&waypoints, &cum, 0.0, 4.0, f64::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn a_point_on_the_reversing_leg_stays_off_the_leg_before_its_cusp() {
+        let mut waypoints: Vec<Pose> = (0..=20).map(|i| at(0.5 * i as f64, 0.0)).collect();
+        let mut speeds = vec![1.0; waypoints.len()];
+        for i in 1..=20 {
+            let a = 0.05 * i as f64;
+            waypoints.push(at(10.0 - 9.0 * a.sin(), 9.0 * (1.0 - a.cos())));
+            speeds.push(-1.0);
+        }
+        let mut cursor = PathCursor::default();
+        cursor.set_path(&waypoints);
+        let pose = cursor.project(&waypoints, Point::new(8.8, 0.1, 0.0), 18).expect("a projection");
+        assert!(pose.arc_length > 10.0, "the pose projects at {:.2}, before the cusp", pose.arc_length);
+        let rear = cursor
+            .project_on_leg(&waypoints, &speeds, Point::new(7.4, 0.09, 0.0), pose.segment, pose.arc_length)
+            .expect("a projection");
+        assert!(rear.arc_length > 10.0, "the rear axle projects at {:.2}, on the leg before the cusp", rear.arc_length);
     }
 }
