@@ -194,7 +194,7 @@ impl Controller for FlcFollower {
         let v_path = path_speed(
             nominal * (1.0 - 0.5 * steer_ratio),
             kappa_path,
-            self.base.status.distance_to_goal,
+            self.base.distance_left(&prep.proj, self.cursor.total_length()),
             prep.pos_tol,
             cfg.kp_linear,
             constraints,

@@ -98,7 +98,7 @@ impl Controller for KanayamaFollower {
                 let kappa = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &prep.proj);
                 let nominal = speed_cap(&self.base.path.speeds, &prep.proj)
                     .map_or(constraints.max_linear_velocity, |s| s.min(constraints.max_linear_velocity));
-                let stop = self.base.status.distance_to_goal.min(cusp - s);
+                let stop = self.base.distance_left(&prep.proj, self.cursor.total_length()).min(cusp - s);
                 let v_r = path_speed(nominal, kappa, stop, prep.pos_tol, cfg.kp_linear, constraints);
                 let back = prep.allow_reverse && direction_at(&self.base.path.speeds, &prep.proj).is_some_and(|d| d < 0);
                 // A reversing leg is tracked by the body facing against its

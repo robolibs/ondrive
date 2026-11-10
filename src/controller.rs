@@ -204,6 +204,13 @@ impl ControllerBase {
         self.gated_arrival(state, goal, constraints, extra_position_ok, true)
     }
 
+    /// Distance, metres, left to slow down over for a path follower at
+    /// `proj` on its path of `path_length` metres: the rest of the path, or
+    /// the way straight to the goal when that is longer.
+    pub fn distance_left(&self, proj: &PathProjection, path_length: f64) -> f64 {
+        self.status.distance_to_goal.max(path_length - proj.arc_length)
+    }
+
     /// `arrival` for a path follower projected at `proj` on its path of
     /// `path_length` metres. A goal at the path end counts as reached only
     /// once the rest of the path is about as short as the way to the goal.

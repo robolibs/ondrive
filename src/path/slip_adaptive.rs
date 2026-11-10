@@ -150,7 +150,7 @@ impl Controller for SlipAdaptiveFollower {
         let sharpest = (0..=(braking / CURVATURE_SCAN).ceil() as usize)
             .map(|i| curvature_at_arc_length(&self.base.path.waypoints, &self.cursor.cum, prep.proj.arc_length + i as f64 * CURVATURE_SCAN))
             .fold(here, |a, k| if k.abs() > a.abs() { k } else { a });
-        let speed = path_speed(nominal, sharpest, self.base.status.distance_to_goal, prep.pos_tol, cfg.kp_linear, constraints);
+        let speed = path_speed(nominal, sharpest, self.base.distance_left(&prep.proj, self.cursor.total_length()), prep.pos_tol, cfg.kp_linear, constraints);
         let preview = speed * actuation_delay(constraints);
         let kappa = if preview > 1e-3 {
             curvature_at_arc_length(&self.base.path.waypoints, &self.cursor.cum, prep.proj.arc_length + preview)

@@ -219,3 +219,47 @@ fn every_path_follower_reverses_out_of_a_cusp() {
         assert!(gap < 1.0, "{kind:?} stopped {gap:.2} m from the end");
     }
 }
+
+#[test]
+fn followers_keep_their_speed_round_the_end_of_a_lap() {
+    let radius = 7.5;
+    for kind in [TrackerKind::PurePursuit, TrackerKind::Stanley, TrackerKind::Lqr, TrackerKind::VectorPursuit, TrackerKind::Kanayama] {
+        let mut path = Path::default();
+        path.is_closed = true;
+        for i in 0..48 {
+            let a = i as f64 * std::f64::consts::TAU / 48.0;
+            path.waypoints.push(pose(radius * a.sin(), radius * (1.0 - a.cos()), a));
+        }
+        let mut tracker = Tracker::new(kind);
+        let mut cfg = ControllerConfig::default();
+        cfg.goal_tolerance = 0.3;
+        cfg.output_units = OutputUnits::Physical;
+        tracker.set_config(cfg);
+        let mut c = RobotConstraints::default();
+        c.wheelbase = 0.65;
+        c.max_steering_angle = 0.46;
+        c.max_linear_velocity = 1.0;
+        c.max_angular_velocity = 1.5;
+        tracker.init(c);
+        tracker.set_path(path);
+
+        let mut state = RobotState { pose: pose(0.0, 0.0, 0.0), allow_move: true, velocity_valid: true, ..Default::default() };
+        let (dt, lap) = (0.05, std::f64::consts::TAU * radius);
+        let (mut driven, mut slowest) = (0.0, f64::INFINITY);
+        while driven < 1.5 * lap {
+            let cmd = tracker.tick(&state, dt, None);
+            assert!(cmd.valid && !tracker.is_path_completed(), "{kind:?} stopped after {driven:.1} m");
+            let yaw = state.pose.rotation.to_euler().yaw;
+            state.pose.point.x += cmd.linear_velocity * yaw.cos() * dt;
+            state.pose.point.y += cmd.linear_velocity * yaw.sin() * dt;
+            state.pose.rotation = Quaternion::from_euler(Euler::new(0.0, 0.0, yaw + cmd.angular_velocity * dt));
+            state.velocity.linear = cmd.linear_velocity;
+            state.velocity.angular = cmd.angular_velocity;
+            driven += cmd.linear_velocity.abs() * dt;
+            if driven > 0.5 * lap {
+                slowest = slowest.min(cmd.linear_velocity);
+            }
+        }
+        assert!(slowest > 0.5, "{kind:?} slowed to {slowest:.2} m/s going round the end of the lap");
+    }
+}

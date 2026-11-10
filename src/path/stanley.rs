@@ -180,7 +180,7 @@ impl Controller for StanleyFollower {
             let forward = path_speed(
                 nominal,
                 kappa_path,
-                self.base.status.distance_to_goal.min(stop_distance),
+                self.base.distance_left(&at_robot, length).min(stop_distance),
                 pos_tol,
                 cfg.kp_linear,
                 constraints,
@@ -213,7 +213,7 @@ impl Controller for StanleyFollower {
             * path_speed(
                 nominal,
                 kappa_path,
-                self.base.status.distance_to_goal.min(stop_distance),
+                self.base.distance_left(&at_robot, length).min(stop_distance),
                 pos_tol,
                 cfg.kp_linear,
                 constraints,

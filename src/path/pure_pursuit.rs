@@ -138,7 +138,7 @@ impl Controller for PurePursuitFollower {
             / (1.0 + CURVATURE_LOOKAHEAD_GAIN * kappa_path * base_lookahead))
             .clamp(0.5 * base_lookahead, 3.0 * base_lookahead);
         let mut s_target = proj.arc_length + lookahead;
-        let mut stop_distance = self.base.status.distance_to_goal;
+        let mut stop_distance = self.base.distance_left(&proj, length);
         if let Some(cusp) = cusp_after(&self.base.path.speeds, &self.cursor.cum, proj.arc_length) {
             s_target = s_target.min(cusp);
             stop_distance = stop_distance.min((cusp - proj.arc_length).max(0.0));
