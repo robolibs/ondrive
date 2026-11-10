@@ -248,7 +248,7 @@ pub(crate) fn with_body_room(obstacles: &[Obstacle], constraints: &RobotConstrai
 
 /// Whether the prediction of `o` moves less than `CROSSING_MIN_SPEED` over
 /// its first second.
-fn standing(o: &Obstacle) -> bool {
+pub(crate) fn standing(o: &Obstacle) -> bool {
     match (modes_at(o, 0.0, 1.0).next(), modes_at(o, 1.0, 1.0).next()) {
         (Some(now), Some(soon)) => (soon.x - now.x).hypot(soon.y - now.y) < CROSSING_MIN_SPEED,
         _ => true,

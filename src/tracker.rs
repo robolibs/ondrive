@@ -109,6 +109,11 @@ pub struct Tracker {
     planned_for: Option<(f64, f64, f64)>,
     /// Control barrier filter on the final command against moving obstacles.
     safety: crate::core::safety::SafetyConfig,
+    /// The caller's path while the tracker drives it detoured round standing
+    /// obstacles, for a kind that does not avoid them itself.
+    original: Option<Path>,
+    /// Side that detour passes obstacles on: +1 left, −1 right, 0 none.
+    follow_side: f64,
 }
 
 impl Tracker {
@@ -137,6 +142,8 @@ impl Tracker {
             stalled_for: 0.0,
             planned_for: None,
             safety: crate::core::safety::SafetyConfig { enabled: !kind.avoids_obstacles(), ..Default::default() },
+            original: None,
+            follow_side: 0.0,
         }
     }
 
@@ -177,6 +184,8 @@ impl Tracker {
     /// lap and never completes.
     pub fn set_path(&mut self, path: Path) {
         self.planned_for = None;
+        self.original = None;
+        self.follow_side = 0.0;
         self.trajectory = None;
         self.clock = 0.0;
         self.clock_origin = None;
@@ -205,6 +214,7 @@ impl Tracker {
     /// clock restarts and advances by `dt` every tick (or follows
     /// `RobotState::timestamp` when that is provided and increasing).
     pub fn set_trajectory(&mut self, trajectory: Trajectory) {
+        self.original = None;
         self.cursor.set_path(&trajectory.poses);
         self.path_error = path_error(&trajectory.poses, &trajectory.speeds, Some(&trajectory.times));
         self.lap = None;
@@ -310,7 +320,7 @@ impl Tracker {
         self.controller.reset();
         if let Some(trajectory) = self.trajectory.clone() {
             self.set_trajectory(trajectory);
-        } else if let Some(path) = self.path().cloned() {
+        } else if let Some(path) = self.original.clone().or_else(|| self.path().cloned()) {
             self.set_path(path);
         }
         self.waypoint_index = 0;
@@ -361,6 +371,7 @@ impl Tracker {
 
         self.next_lap(state);
         self.plan_to_goal(state);
+        self.steer_round(state, world);
         let goal = match self.resolve_goal(state, world) {
             Ok(Some(g)) => g,
             Ok(None) => return stop("Path completed"),
@@ -570,6 +581,46 @@ impl Tracker {
             .collect();
         self.drive(Path { waypoints, speeds: Vec::new(), is_closed: false });
         self.planned_for = Some(key);
+    }
+
+    /// For a kind that does not avoid obstacles, following a path of the
+    /// caller's, drive that path detoured round the standing obstacles that
+    /// block the body within `follow_lookahead`, on the side `pick_detour`
+    /// takes, when the detour itself is clear; nothing while the path driven
+    /// is clear.
+    fn steer_round(&mut self, state: &RobotState, world: Option<&WorldConstraints>) {
+        if self.kind.avoids_obstacles() || self.goal.is_some() || self.trajectory.is_some() || self.lap.is_some() {
+            return;
+        }
+        let (Some(world), Some(driven)) = (world, self.path.as_ref()) else {
+            return;
+        };
+        let standing: Vec<crate::types::Obstacle> = world.obstacles.iter().filter(|o| crate::pred::mppi::standing(o)).cloned().collect();
+        if standing.is_empty() {
+            return;
+        }
+        let rocks = WorldConstraints { obstacles: standing, ..Default::default() };
+        let checker = CollisionChecker::new(Some(&rocks), &self.constraints, FOLLOW_MARGIN);
+        let ahead = follow_lookahead(&self.constraints);
+        let from = state.pose.point;
+        if !blocked_ahead(driven, from, ahead, &checker) {
+            return;
+        }
+        let base = self.original.clone().unwrap_or_else(|| driven.clone());
+        let cfg = self.controller.get_config();
+        let lead = if matches!(self.kind, TrackerKind::PurePursuit | TrackerKind::VectorPursuit) {
+            cfg.lookahead_distance.max(0.0) + cfg.lookahead_time.max(0.0) * self.constraints.max_linear_velocity.abs()
+        } else {
+            0.0
+        };
+        let Some(path) = detoured(&base, from, ahead, lead, &rocks.obstacles, &self.constraints, &mut self.follow_side) else {
+            return;
+        };
+        if blocked_ahead(&path, from, ahead, &checker) {
+            return;
+        }
+        self.original = Some(base);
+        self.drive(path);
     }
 
     fn resolve_goal(
@@ -986,6 +1037,98 @@ fn detour_target(
 
 /// Seconds between the points of a point controller's detour.
 const DETOUR_DT: f64 = 0.2;
+/// Metres between the points a path follower's detour is planned on and
+/// checked at.
+const FOLLOW_STEP: f64 = 0.25;
+/// Clearance, metres, below which a standing obstacle blocks the body on
+/// the path a follower drives.
+const FOLLOW_MARGIN: f64 = 0.2;
+/// Least metres ahead a follower's path is checked for standing obstacles.
+const FOLLOW_AHEAD: f64 = 15.0;
+/// Metres past the stretch checked over which a follower's detour rejoins
+/// its path.
+const FOLLOW_REJOIN: f64 = 10.0;
+/// Times the stretch a follower's detour is planned on may double to let it settle.
+const FOLLOW_SPANS: usize = 3;
+
+/// Metres ahead a follower's path is checked: `FOLLOW_AHEAD`, or three body
+/// lengths when longer.
+fn follow_lookahead(constraints: &RobotConstraints) -> f64 {
+    let length = crate::core::obstacles::footprint_extent(constraints).map_or(0.0, |(back, front, _)| front - back);
+    FOLLOW_AHEAD.max(3.0 * length)
+}
+
+/// Whether the body, placed along `path` every `FOLLOW_STEP` from the
+/// point nearest `from` for `ahead` metres, meets an obstacle of `checker`.
+fn blocked_ahead(path: &Path, from: Point, ahead: f64, checker: &CollisionChecker) -> bool {
+    let cum = cumulative_lengths(&path.waypoints);
+    let mut cursor = PathCursor::default();
+    cursor.set_path(&path.waypoints);
+    let Some(proj) = cursor.project(&path.waypoints, from, 0) else {
+        return false;
+    };
+    let end = (proj.arc_length + ahead).min(cum.last().copied().unwrap_or(0.0));
+    let mut s = proj.arc_length;
+    while s <= end {
+        let (p, yaw) = sample(&path.waypoints, &cum, s);
+        if checker.clearance_at(0.0, p.x, p.y, yaw) < 0.0 {
+            return true;
+        }
+        s += FOLLOW_STEP;
+    }
+    false
+}
+
+/// `base` from the point nearest `from` on, moved round `obstacles` by
+/// `pick_detour` (its side kept in `side`) with its full shift held `lead`
+/// metres longer before and after each obstacle, up to where it is back
+/// on `base`, then the rest of `base`. The stretch planned starts at `ahead`
+/// and `FOLLOW_REJOIN` metres and doubles, up to `FOLLOW_SPANS` times, until
+/// the detour settles within it. `None` when nothing is to go round, it does
+/// not settle, or `base` carries speeds that reverse.
+#[allow(clippy::too_many_arguments)]
+fn detoured(base: &Path, from: Point, ahead: f64, lead: f64, obstacles: &[crate::types::Obstacle], constraints: &RobotConstraints, side: &mut f64) -> Option<Path> {
+    if base.speeds.iter().any(|v| *v < 0.0) {
+        return None;
+    }
+    let cum = cumulative_lengths(&base.waypoints);
+    let mut cursor = PathCursor::default();
+    cursor.set_path(&base.waypoints);
+    let proj = cursor.project(&base.waypoints, from, 0)?;
+    let along = crate::pred::mppi::Along { path: base, cum: &cum, trajectory: None, clock: 0.0, from: proj.arc_length };
+    let mut swerve = crate::pred::mppi::Swerve::of(constraints, constraints.max_linear_velocity.abs());
+    if let Some((back, front, half)) = swerve.body {
+        swerve.body = Some((back - lead, front + lead, half));
+    }
+    let reach = crate::core::obstacles::robot_radius(constraints);
+    let total = cum.last().copied().unwrap_or(0.0);
+    let mut span = ahead + FOLLOW_REJOIN;
+    for _ in 0..FOLLOW_SPANS {
+        let n = (span / FOLLOW_STEP).ceil() as usize;
+        let reference = along.reference(n, 1.0, FOLLOW_STEP);
+        let g = crate::pred::mppi::pick_detour(&reference, obstacles, reach, 1.0, side, swerve)?;
+        let k = g.x.len().min(reference.x.len());
+        let shifted = |i: usize| (g.x[i] - reference.x[i]).hypot(g.y[i] - reference.y[i]) > 1e-3;
+        let reaches_end = proj.arc_length + span >= total;
+        if shifted(k - 1) && !reaches_end {
+            span *= 2.0;
+            continue;
+        }
+        let last = (0..k).rev().find(|i| shifted(*i)).map_or(0, |i| (i + 1).min(k - 1));
+        let z = base.waypoints.first().map_or(0.0, |w| w.point.z);
+        let mut waypoints: Vec<Pose> = (0..=last)
+            .map(|i| {
+                let (a, b) = (i.saturating_sub(1), (i + 1).min(k - 1));
+                let yaw = (g.y[b] - g.y[a]).atan2(g.x[b] - g.x[a]);
+                Pose { point: Point::new(g.x[i], g.y[i], z), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, yaw)) }
+            })
+            .collect();
+        let end = proj.arc_length + last as f64 * FOLLOW_STEP;
+        waypoints.extend(base.waypoints.iter().zip(&cum).filter(|(_, c)| **c > end + 1e-6).map(|(w, _)| *w));
+        return Some(Path { waypoints, speeds: Vec::new(), is_closed: false });
+    }
+    None
+}
 /// Seconds of path a point controller's detour spans while traffic moves.
 const CROSSING_LOOKOUT_S: f64 = 12.0;
 /// Speed, m/s, above which an obstacle counts as moving.
@@ -1178,6 +1321,30 @@ mod tests {
         let end = path.waypoints.last().unwrap();
         assert!(end.point.distance_to_2d(target.point) < 1e-6);
         assert!(cmd.linear_velocity > 0.0);
+    }
+
+    #[test]
+    fn a_path_follower_drives_round_a_rock_on_its_path() {
+        let mut t = Tracker::new(TrackerKind::PurePursuit);
+        let mut c = RobotConstraints::default();
+        c.wheelbase = 0.65;
+        c.max_steering_angle = 0.46;
+        c.max_linear_velocity = 1.0;
+        c.footprint = crate::types::Footprint::Polygon { points: vec![(0.5, 0.35), (-0.5, 0.35), (-0.5, -0.35), (0.5, -0.35)] };
+        t.init(c);
+        let waypoints: Vec<Pose> = (0..=60)
+            .map(|i| Pose { point: Point::new(0.5 * i as f64, 0.0, 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, 0.0)) })
+            .collect();
+        t.set_path(Path { waypoints, speeds: Vec::new(), is_closed: false });
+        let mode = crate::types::GaussianMode { weight: 1.0, mean_x: vec![10.0; 2], mean_y: vec![0.1; 2], std_x: vec![0.05; 2], std_y: vec![0.05; 2] };
+        let world = WorldConstraints { obstacles: vec![crate::types::Obstacle { id: 0, radius: 0.6, modes: vec![mode], dt: 0.2 }], ..Default::default() };
+        let state = RobotState { velocity_valid: true, allow_move: true, ..Default::default() };
+        assert!(t.tick(&state, 0.05, Some(&world)).valid);
+        let path = t.path().expect("a path");
+        let beside = path.waypoints.iter().filter(|w| (w.point.x - 10.0).abs() < 0.5).map(|w| w.point.y.abs()).fold(0.0_f64, f64::max);
+        assert!(beside > 0.6 + 0.35, "the path passes the rock {beside} m off its centre");
+        let end = path.waypoints.last().unwrap();
+        assert!((end.point.x - 30.0).abs() < 1e-6 && end.point.y.abs() < 1e-6);
     }
 
     #[test]
