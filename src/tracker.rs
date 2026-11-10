@@ -114,6 +114,8 @@ pub struct Tracker {
     original: Option<Path>,
     /// Side that detour passes obstacles on: +1 left, −1 right, 0 none.
     follow_side: f64,
+    /// Seconds since that detour was planned.
+    follow_age: f64,
 }
 
 impl Tracker {
@@ -144,6 +146,7 @@ impl Tracker {
             safety: crate::core::safety::SafetyConfig { enabled: !kind.avoids_obstacles(), ..Default::default() },
             original: None,
             follow_side: 0.0,
+            follow_age: 0.0,
         }
     }
 
@@ -371,7 +374,7 @@ impl Tracker {
 
         self.next_lap(state);
         self.plan_to_goal(state);
-        self.steer_round(state, world);
+        self.steer_round(state, world, dt);
         let goal = match self.resolve_goal(state, world) {
             Ok(Some(g)) => g,
             Ok(None) => return stop("Path completed"),
@@ -385,6 +388,7 @@ impl Tracker {
         let cmd = self
             .controller
             .compute_control(ahead.as_ref().unwrap_or(state), &goal, &self.constraints, dt, world);
+        let cmd = self.give_way(cmd, state, world);
 
         if self.goal.is_none() && self.path.is_some() && self.aiming_at_end && self.controller.get_status().goal_reached {
             self.path_completed = true;
@@ -584,26 +588,36 @@ impl Tracker {
     }
 
     /// For a kind that does not avoid obstacles, following a path of the
-    /// caller's, drive that path detoured round the standing obstacles that
-    /// block the body within `follow_lookahead`, on the side `pick_detour`
-    /// takes, when the detour itself is clear; nothing while the path driven
-    /// is clear.
-    fn steer_round(&mut self, state: &RobotState, world: Option<&WorldConstraints>) {
+    /// caller's, drive that path detoured round the obstacles standing on it
+    /// or moving along it (crossing traffic is left to the safety filter)
+    /// that block the body within `follow_lookahead`, timed at the speed the
+    /// robot drives, on the side `pick_detour` takes, when the detour itself
+    /// is clear. A detour round moving traffic is planned again every
+    /// `FOLLOW_REPLAN_S` as its prediction firms up, and given up for the
+    /// caller's path once nothing is to go round; otherwise nothing while the
+    /// path driven is clear.
+    fn steer_round(&mut self, state: &RobotState, world: Option<&WorldConstraints>, dt_tick: f64) {
         if self.kind.avoids_obstacles() || self.goal.is_some() || self.trajectory.is_some() || self.lap.is_some() {
             return;
         }
         let (Some(world), Some(driven)) = (world, self.path.as_ref()) else {
             return;
         };
-        let standing: Vec<crate::types::Obstacle> = world.obstacles.iter().filter(|o| crate::pred::mppi::standing(o)).cloned().collect();
-        if standing.is_empty() {
+        self.follow_age += dt_tick;
+        let kept: Vec<crate::types::Obstacle> =
+            world.obstacles.iter().filter(|o| crate::pred::mppi::standing(o) || along_path(o, driven)).cloned().collect();
+        if kept.is_empty() {
             return;
         }
-        let rocks = WorldConstraints { obstacles: standing, ..Default::default() };
+        let moving = kept.iter().any(|o| !crate::pred::mppi::standing(o));
+        let rocks = WorldConstraints { obstacles: kept, ..Default::default() };
         let checker = CollisionChecker::new(Some(&rocks), &self.constraints, FOLLOW_MARGIN);
         let ahead = follow_lookahead(&self.constraints);
         let from = state.pose.point;
-        if !blocked_ahead(driven, from, ahead, &checker) {
+        let cruise = state.velocity.linear.abs().max(self.constraints.max_linear_velocity.abs()).max(FOLLOW_SPEED_FLOOR);
+        let dt = FOLLOW_STEP / cruise;
+        let refresh = moving && self.original.is_some() && self.follow_age >= FOLLOW_REPLAN_S;
+        if !refresh && !blocked_ahead(driven, from, ahead, dt, &checker) {
             return;
         }
         let base = self.original.clone().unwrap_or_else(|| driven.clone());
@@ -613,14 +627,55 @@ impl Tracker {
         } else {
             0.0
         };
-        let Some(path) = detoured(&base, from, ahead, lead, &rocks.obstacles, &self.constraints, &mut self.follow_side) else {
-            return;
+        self.follow_age = 0.0;
+        let path = match detoured(&base, from, ahead, lead, dt, &rocks.obstacles, &self.constraints, &mut self.follow_side) {
+            Some(path) => path,
+            None if refresh && !blocked_ahead(&base, from, ahead, dt, &checker) => {
+                self.original = None;
+                self.drive(base);
+                return;
+            }
+            None => return,
         };
-        if blocked_ahead(&path, from, ahead, &checker) {
+        if blocked_ahead(&path, from, ahead, dt, &checker) {
             return;
         }
         self.original = Some(base);
         self.drive(path);
+    }
+
+    /// For a kind that does not avoid obstacles, following a path, `cmd`
+    /// slowed, its curvature kept, by the share of speed that gives way to
+    /// the traffic crossing the path ahead (`give_way_ahead` at the speed
+    /// the robot cruises at); `cmd` itself otherwise.
+    fn give_way(&self, mut cmd: VelocityCommand, state: &RobotState, world: Option<&WorldConstraints>) -> VelocityCommand {
+        if self.kind.avoids_obstacles() || !cmd.valid || self.trajectory.is_some() || self.lap.is_some() {
+            return cmd;
+        }
+        let (Some(world), Some(path)) = (world, self.path.as_ref()) else {
+            return cmd;
+        };
+        let crossing: Vec<crate::types::Obstacle> =
+            world.obstacles.iter().filter(|o| !crate::pred::mppi::standing(o) && !along_path(o, path)).cloned().collect();
+        if crossing.is_empty() {
+            return cmd;
+        }
+        let cum = cumulative_lengths(&path.waypoints);
+        let mut cursor = PathCursor::default();
+        cursor.set_path(&path.waypoints);
+        let Some(proj) = cursor.project(&path.waypoints, state.pose.point, 0) else {
+            return cmd;
+        };
+        let along = crate::pred::mppi::Along { path, cum: &cum, trajectory: None, clock: 0.0, from: proj.arc_length };
+        let cruise = state.velocity.linear.abs().max(self.constraints.max_linear_velocity.abs()).max(FOLLOW_SPEED_FLOOR);
+        let n = (GIVE_WAY_HORIZON_S / GIVE_WAY_STEP).ceil() as usize;
+        let v_now = if state.velocity_valid { state.velocity.linear } else { cmd.linear_velocity };
+        let share = crate::pred::mppi::give_way_ahead(&along, &crossing, &self.constraints, n, GIVE_WAY_STEP, cruise, v_now).clamp(0.0, 1.0);
+        if share < 1.0 {
+            cmd.linear_velocity *= share;
+            cmd.angular_velocity *= share;
+        }
+        cmd
     }
 
     fn resolve_goal(
@@ -1050,6 +1105,17 @@ const FOLLOW_AHEAD: f64 = 15.0;
 const FOLLOW_REJOIN: f64 = 10.0;
 /// Times the stretch a follower's detour is planned on may double to let it settle.
 const FOLLOW_SPANS: usize = 3;
+/// Least speed, m/s, a follower's detour is timed at, so traffic is met
+/// where it will be once the robot drives on.
+const FOLLOW_SPEED_FLOOR: f64 = 0.5;
+/// Seconds after which a follower's detour round moving traffic is planned again.
+const FOLLOW_REPLAN_S: f64 = 1.0;
+/// Least turning radius, metres, a follower's detour swerves with: one that
+/// turns in place still swerves smoothly enough to track.
+const FOLLOW_TURN_RADIUS: f64 = 2.0;
+/// Seconds, and their step, a follower looks ahead to give way to crossing traffic.
+const GIVE_WAY_HORIZON_S: f64 = 8.0;
+const GIVE_WAY_STEP: f64 = 0.2;
 
 /// Metres ahead a follower's path is checked: `FOLLOW_AHEAD`, or three body
 /// lengths when longer.
@@ -1059,8 +1125,9 @@ fn follow_lookahead(constraints: &RobotConstraints) -> f64 {
 }
 
 /// Whether the body, placed along `path` every `FOLLOW_STEP` from the
-/// point nearest `from` for `ahead` metres, meets an obstacle of `checker`.
-fn blocked_ahead(path: &Path, from: Point, ahead: f64, checker: &CollisionChecker) -> bool {
+/// point nearest `from` for `ahead` metres, each `dt` seconds after the
+/// last, meets an obstacle of `checker` where it is predicted then.
+fn blocked_ahead(path: &Path, from: Point, ahead: f64, dt: f64, checker: &CollisionChecker) -> bool {
     let cum = cumulative_lengths(&path.waypoints);
     let mut cursor = PathCursor::default();
     cursor.set_path(&path.waypoints);
@@ -1071,7 +1138,8 @@ fn blocked_ahead(path: &Path, from: Point, ahead: f64, checker: &CollisionChecke
     let mut s = proj.arc_length;
     while s <= end {
         let (p, yaw) = sample(&path.waypoints, &cum, s);
-        if checker.clearance_at(0.0, p.x, p.y, yaw) < 0.0 {
+        let t = (s - proj.arc_length) / FOLLOW_STEP * dt;
+        if checker.clearance_at(t, p.x, p.y, yaw) < 0.0 {
             return true;
         }
         s += FOLLOW_STEP;
@@ -1079,7 +1147,26 @@ fn blocked_ahead(path: &Path, from: Point, ahead: f64, checker: &CollisionChecke
     false
 }
 
-/// `base` from the point nearest `from` on, moved round `obstacles` by
+/// Whether `o` moves more along `path`, at the waypoint nearest it, than
+/// across it.
+fn along_path(o: &crate::types::Obstacle, path: &Path) -> bool {
+    use crate::core::obstacles::modes_at;
+    let (Some(now), Some(soon)) = (modes_at(o, 0.0, 1.0).next(), modes_at(o, 1.0, 1.0).next()) else {
+        return false;
+    };
+    let Some(nearest) = path.waypoints.iter().min_by(|a, b| {
+        let d = |w: &&Pose| (w.point.x - now.x).hypot(w.point.y - now.y);
+        d(a).total_cmp(&d(b))
+    }) else {
+        return false;
+    };
+    let (s, c) = nearest.rotation.to_euler().yaw.sin_cos();
+    let (vx, vy) = (soon.x - now.x, soon.y - now.y);
+    (vx * c + vy * s).abs() > (-vx * s + vy * c).abs()
+}
+
+/// `base` from the point nearest `from` on, driven a point every `dt`
+/// seconds, moved round `obstacles` where they are predicted then by
 /// `pick_detour` (its side kept in `side`) with its full shift held `lead`
 /// metres longer before and after each obstacle, up to where it is back
 /// on `base`, then the rest of `base`. The stretch planned starts at `ahead`
@@ -1087,7 +1174,7 @@ fn blocked_ahead(path: &Path, from: Point, ahead: f64, checker: &CollisionChecke
 /// the detour settles within it. `None` when nothing is to go round, it does
 /// not settle, or `base` carries speeds that reverse.
 #[allow(clippy::too_many_arguments)]
-fn detoured(base: &Path, from: Point, ahead: f64, lead: f64, obstacles: &[crate::types::Obstacle], constraints: &RobotConstraints, side: &mut f64) -> Option<Path> {
+fn detoured(base: &Path, from: Point, ahead: f64, lead: f64, dt: f64, obstacles: &[crate::types::Obstacle], constraints: &RobotConstraints, side: &mut f64) -> Option<Path> {
     if base.speeds.iter().any(|v| *v < 0.0) {
         return None;
     }
@@ -1097,6 +1184,7 @@ fn detoured(base: &Path, from: Point, ahead: f64, lead: f64, obstacles: &[crate:
     let proj = cursor.project(&base.waypoints, from, 0)?;
     let along = crate::pred::mppi::Along { path: base, cum: &cum, trajectory: None, clock: 0.0, from: proj.arc_length };
     let mut swerve = crate::pred::mppi::Swerve::of(constraints, constraints.max_linear_velocity.abs());
+    swerve.radius = swerve.radius.max(FOLLOW_TURN_RADIUS);
     if let Some((back, front, half)) = swerve.body {
         swerve.body = Some((back - lead, front + lead, half));
     }
@@ -1105,8 +1193,8 @@ fn detoured(base: &Path, from: Point, ahead: f64, lead: f64, obstacles: &[crate:
     let mut span = ahead + FOLLOW_REJOIN;
     for _ in 0..FOLLOW_SPANS {
         let n = (span / FOLLOW_STEP).ceil() as usize;
-        let reference = along.reference(n, 1.0, FOLLOW_STEP);
-        let g = crate::pred::mppi::pick_detour(&reference, obstacles, reach, 1.0, side, swerve)?;
+        let reference = along.reference(n, dt, FOLLOW_STEP / dt);
+        let g = crate::pred::mppi::pick_detour(&reference, obstacles, reach, dt, side, swerve)?;
         let k = g.x.len().min(reference.x.len());
         let shifted = |i: usize| (g.x[i] - reference.x[i]).hypot(g.y[i] - reference.y[i]) > 1e-3;
         let reaches_end = proj.arc_length + span >= total;
@@ -1345,6 +1433,35 @@ mod tests {
         assert!(beside > 0.6 + 0.35, "the path passes the rock {beside} m off its centre");
         let end = path.waypoints.last().unwrap();
         assert!((end.point.x - 30.0).abs() < 1e-6 && end.point.y.abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_path_follower_swerves_for_traffic_coming_down_its_path() {
+        let mut t = Tracker::new(TrackerKind::Stanley);
+        let mut c = RobotConstraints::default();
+        c.wheelbase = 0.65;
+        c.max_steering_angle = 0.46;
+        c.max_linear_velocity = 1.0;
+        c.footprint = crate::types::Footprint::Polygon { points: vec![(0.5, 0.35), (-0.5, 0.35), (-0.5, -0.35), (0.5, -0.35)] };
+        t.init(c);
+        let waypoints: Vec<Pose> = (0..=80)
+            .map(|i| Pose { point: Point::new(0.5 * i as f64, 0.0, 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, 0.0)) })
+            .collect();
+        t.set_path(Path { waypoints, speeds: Vec::new(), is_closed: false });
+        let (steps, dt) = (30, 0.2);
+        let mode = crate::types::GaussianMode {
+            weight: 1.0,
+            mean_x: (0..=steps).map(|k| 14.0 - 0.6 * k as f64 * dt).collect(),
+            mean_y: vec![0.1; steps + 1],
+            std_x: vec![0.05; steps + 1],
+            std_y: vec![0.05; steps + 1],
+        };
+        let world = WorldConstraints { obstacles: vec![crate::types::Obstacle { id: 0, radius: 0.5, modes: vec![mode], dt }], ..Default::default() };
+        let state = RobotState { velocity_valid: true, allow_move: true, ..Default::default() };
+        assert!(t.tick(&state, 0.05, Some(&world)).valid);
+        let path = t.path().expect("a path");
+        let widest = path.waypoints.iter().map(|w| w.point.y.abs()).fold(0.0_f64, f64::max);
+        assert!(widest > 0.5 + 0.35, "the path keeps {widest} m off the oncoming traffic");
     }
 
     #[test]
