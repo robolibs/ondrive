@@ -13,6 +13,7 @@ use ondrive::{
     StanleyFollower, SteeringType, TebConfig, TebFollower, Tracker, TrackerKind, CarrotFollower,
     IlqrConfig, IlqrFollower, KanayamaFollower, PoseReachFollower, PoseRegulatorFollower,
     RegulatedPursuitFollower, VectorPursuitFollower, ApfFollower, IlcFollower, SlipAdaptiveFollower, VelocityObstacleFollower,
+    FrenetFollower,
 };
 use std::f64::consts::{FRAC_PI_2, PI};
 
@@ -92,7 +93,8 @@ const PATH_KINDS: [TrackerKind; 16] = [
     TrackerKind::Dwa,
 ];
 
-const ALL_KINDS: [TrackerKind; 22] = [
+const ALL_KINDS: [TrackerKind; 23] = [
+    TrackerKind::Frenet,
     TrackerKind::VelocityObstacle,
     TrackerKind::SlipAdaptive,
     TrackerKind::Ilc,
@@ -135,6 +137,7 @@ fn make(kind: TrackerKind) -> Box<dyn Controller> {
         TrackerKind::Ilc => Box::new(IlcFollower::default()),
         TrackerKind::SlipAdaptive => Box::new(SlipAdaptiveFollower::new()),
         TrackerKind::VelocityObstacle => Box::new(VelocityObstacleFollower::new()),
+        TrackerKind::Frenet => Box::new(FrenetFollower::new()),
         TrackerKind::Ilqr => {
             let mut c = IlqrConfig::default();
             c.horizon_steps = 12;

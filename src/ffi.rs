@@ -92,6 +92,7 @@ pub const ONDRIVE_KIND_APF: u32 = 18;
 pub const ONDRIVE_KIND_ILC: u32 = 19;
 pub const ONDRIVE_KIND_SLIP_ADAPTIVE: u32 = 20;
 pub const ONDRIVE_KIND_VELOCITY_OBSTACLE: u32 = 21;
+pub const ONDRIVE_KIND_FRENET: u32 = 22;
 
 pub const ONDRIVE_STEERING_DIFFERENTIAL: u32 = 0;
 pub const ONDRIVE_STEERING_ACKERMANN: u32 = 1;
@@ -125,6 +126,7 @@ fn kind_from_u32(v: u32) -> Option<TrackerKind> {
         ONDRIVE_KIND_ILC => TrackerKind::Ilc,
         ONDRIVE_KIND_SLIP_ADAPTIVE => TrackerKind::SlipAdaptive,
         ONDRIVE_KIND_VELOCITY_OBSTACLE => TrackerKind::VelocityObstacle,
+        ONDRIVE_KIND_FRENET => TrackerKind::Frenet,
         _ => return None,
     })
 }
@@ -1023,6 +1025,7 @@ pub extern "C" fn ondrive_tracker_kind(h: *const OndriveTracker) -> u32 {
         TrackerKind::Ilc => ONDRIVE_KIND_ILC,
         TrackerKind::SlipAdaptive => ONDRIVE_KIND_SLIP_ADAPTIVE,
         TrackerKind::VelocityObstacle => ONDRIVE_KIND_VELOCITY_OBSTACLE,
+        TrackerKind::Frenet => ONDRIVE_KIND_FRENET,
     }
 }
 

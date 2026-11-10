@@ -11,7 +11,8 @@ use crate::point::{
     ApfFollower, CarrotFollower, PidFollower, PoseReachFollower, PoseRegulatorFollower,
 };
 use crate::pred::{
-    DwaFollower, IlqrFollower, McaFollower, MpcFollower, MppiFollower, SocFollower, TebFollower, VelocityObstacleFollower,
+    DwaFollower, FrenetFollower, IlqrFollower, McaFollower, MpcFollower, MppiFollower, SocFollower, TebFollower,
+    VelocityObstacleFollower,
 };
 use crate::types::{
     ControllerConfig, ControllerStatus, Goal, OutputUnits, Path, RobotConstraints, RobotState, Trajectory,
@@ -43,6 +44,7 @@ pub enum TrackerKind {
     Ilc,
     SlipAdaptive,
     VelocityObstacle,
+    Frenet,
 }
 
 impl TrackerKind {
@@ -77,10 +79,10 @@ impl TrackerKind {
         )
     }
 
-    /// Whether the controller tracks the path as drawn, by a steering law,
-    /// and so is handed it with its corners rounded to what the platform
-    /// can turn; Regulated Pure Pursuit, which slows into corners on its
-    /// own, keeps them sharp.
+    /// Whether the controller tracks the path as drawn, by a steering law
+    /// or in the path's own frame, and so is handed it with its corners
+    /// rounded to what the platform can turn; Regulated Pure Pursuit, which
+    /// slows into corners on its own, keeps them sharp.
     pub fn rounds_corners(self) -> bool {
         matches!(
             self,
@@ -92,6 +94,7 @@ impl TrackerKind {
                 | TrackerKind::Flc
                 | TrackerKind::Ilc
                 | TrackerKind::SlipAdaptive
+                | TrackerKind::Frenet
         )
     }
 }
@@ -1155,6 +1158,7 @@ fn make_controller(kind: TrackerKind) -> Box<dyn Controller> {
         TrackerKind::Ilc => Box::new(IlcFollower::default()),
         TrackerKind::SlipAdaptive => Box::new(SlipAdaptiveFollower::new()),
         TrackerKind::VelocityObstacle => Box::new(VelocityObstacleFollower::new()),
+        TrackerKind::Frenet => Box::new(FrenetFollower::new()),
     }
 }
 

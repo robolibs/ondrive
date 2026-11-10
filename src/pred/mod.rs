@@ -1,4 +1,5 @@
 pub mod dwa;
+pub mod frenet;
 pub mod ilqr;
 pub mod mca;
 pub mod mpc;
@@ -8,6 +9,7 @@ pub mod teb;
 pub mod vo;
 
 pub use dwa::{DwaConfig, DwaFollower};
+pub use frenet::{FrenetConfig, FrenetFollower};
 pub use ilqr::{IlqrConfig, IlqrFollower};
 pub use mca::{McaConfig, McaFollower};
 pub use mpc::{MpcConfig, MpcFollower};

@@ -41,7 +41,7 @@ pub use crate::point::{
     PoseRegulatorFollower,
 };
 pub use crate::pred::{
-    DwaConfig, DwaFollower, IlqrConfig, IlqrFollower, McaConfig, McaFollower, MpcConfig,
+    DwaConfig, DwaFollower, FrenetConfig, FrenetFollower, IlqrConfig, IlqrFollower, McaConfig, McaFollower, MpcConfig,
     MpcFollower, MppiConfig, MppiFollower, SocConfig, SocFollower, TebConfig, TebFollower, VelocityObstacleConfig,
     VelocityObstacleFollower,
 };
