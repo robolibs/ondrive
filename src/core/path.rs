@@ -346,6 +346,9 @@ pub struct PathCursor {
     /// First segment projections may land on: progress committed past a
     /// cusp does not slide back over it.
     pub floor: usize,
+    /// Whether a projection that jumped onto the leg after a cusp not yet
+    /// reached is taken back onto the leg before it.
+    pub hold_cusps: bool,
 }
 
 const CURSOR_WINDOW: usize = 64;
@@ -388,6 +391,14 @@ impl PathCursor {
     /// comes within `reach` of it, straight or along the path, with
     /// progress committed past the cusp.
     pub fn past_cusp(&mut self, waypoints: &[Pose], speeds: &[f64], p: Point, proj: PathProjection, reach: f64) -> PathProjection {
+        let committed = self.cum.get(self.floor).copied().unwrap_or(0.0);
+        let proj = match self.cusp_ahead(speeds, committed) {
+            Some(k) if self.hold_cusps && proj.arc_length > self.cum[k] + 1e-9 => {
+                let start = self.floor.min(k.saturating_sub(1));
+                project(waypoints, &self.cum, p, start, 0, (k - start).max(1)).unwrap_or(proj)
+            }
+            _ => proj,
+        };
         let Some(k) = self.cusp_ahead(speeds, proj.arc_length) else {
             return proj;
         };
@@ -442,6 +453,28 @@ mod tests {
         assert!(corner > 2.0, "the corner reads {corner:.2} 1/m");
         assert_eq!(sharpest_ahead(&waypoints, &cum, 5.0, 8.0, 0.5), 0.0);
         assert_eq!(sharpest_ahead(&waypoints, &cum, 0.0, 4.0, f64::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn a_pose_short_of_a_cusp_stays_on_the_leg_before_it() {
+        let mut waypoints: Vec<Pose> = (0..=20).map(|i| at(0.5 * i as f64, 0.0)).collect();
+        let mut speeds = vec![1.0; waypoints.len()];
+        for i in 1..=20 {
+            let a = 0.05 * i as f64;
+            waypoints.push(at(10.0 - 9.0 * a.sin(), 9.0 * (1.0 - a.cos())));
+            speeds.push(-1.0);
+        }
+        let mut cursor = PathCursor::default();
+        cursor.set_path(&waypoints);
+        cursor.hold_cusps = true;
+        let p = Point::new(8.8, 0.1, 0.0);
+        let raw = cursor.project(&waypoints, p, 18).expect("a projection");
+        let held = cursor.past_cusp(&waypoints, &speeds, p, raw, 0.3);
+        assert!(held.arc_length < 10.0, "the pose 1.2 m short of the cusp projects at {:.2}, past it", held.arc_length);
+        let near = Point::new(9.9, 0.0, 0.0);
+        let raw = cursor.project(&waypoints, near, held.segment).expect("a projection");
+        let passed = cursor.past_cusp(&waypoints, &speeds, near, raw, 0.3);
+        assert!(passed.arc_length >= 10.0, "the pose at the cusp projects at {:.2}, before it", passed.arc_length);
     }
 
     #[test]
