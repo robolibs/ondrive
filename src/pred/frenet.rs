@@ -40,6 +40,15 @@ const MAX_HEADING_ERROR: f64 = 1.2;
 const WEIGHT_STRAIN: f64 = 10.0;
 /// Points along the path each shift's shape is judged at.
 const SHAPE_SAMPLES: usize = 50;
+/// Time constant, seconds, of the sideslip estimate, the largest it
+/// reports, radians, and the speed, m/s, below which it holds.
+const SLIP_TIME: f64 = 0.5;
+const MAX_SLIP: f64 = 0.35;
+const SLIP_SPEED: f64 = 0.2;
+/// Time constant, seconds, over which the shortfall of curvature is
+/// averaged, and the largest it may be as a share of the tightest.
+const BIAS_TIME: f64 = 3.0;
+const MAX_BIAS: f64 = 0.5;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FrenetConfig {
@@ -99,6 +108,11 @@ pub struct FrenetFollower {
     plan: Vec<Point>,
     offset: f64,
     last_speed: f64,
+    sideslip: f64,
+    /// Whether the leg reverses and the curvature of travel commanded last
+    /// tick, and how far the curvature falls short of the commands.
+    last_command: Option<(bool, f64)>,
+    bias: f64,
     debug_level: DebugLevel,
 }
 
@@ -215,10 +229,29 @@ impl Controller for FrenetFollower {
         // The robot in the path's frame: offset, slope and second derivative.
         let kappa0 = curvature_at_projection(waypoints, cum, &at);
         let d0 = at.lateral_error;
-        let err = normalize_angle(travel - at.heading).clamp(-MAX_HEADING_ERROR, MAX_HEADING_ERROR);
+        // The rear axle's sideslip, low-passed: the angle its travel makes
+        // with the heading.
+        let forward = if back { -state.velocity.linear } else { state.velocity.linear };
+        if state.velocity_valid && forward > SLIP_SPEED {
+            let side = if back { -1.0 } else { 1.0 } * (state.velocity.lateral - state.velocity.angular * axle);
+            let gain = (dt / SLIP_TIME).min(1.0);
+            self.sideslip = (self.sideslip + gain * (side.atan2(forward) - self.sideslip)).clamp(-MAX_SLIP, MAX_SLIP);
+        }
+        let err = normalize_angle(travel + self.sideslip - at.heading).clamp(-MAX_HEADING_ERROR, MAX_HEADING_ERROR);
         let squeeze = (1.0 - kappa0 * d0).max(0.1);
         let d0p = squeeze * err.tan();
         let k_now = if state.velocity_valid && v_now > 0.1 { state.velocity.angular / v_now } else { kappa0 };
+        // How far the curvature falls short of the one commanded, low-passed
+        // over the leg: what a slope or slip takes off each command.
+        match self.last_command {
+            Some((was_back, commanded)) if was_back == back => {
+                if state.velocity_valid && v_now > SLIP_SPEED {
+                    let gain = (dt / BIAS_TIME).min(1.0);
+                    self.bias = (self.bias + gain * (commanded - k_now - self.bias)).clamp(-MAX_BIAS * k_lim, MAX_BIAS * k_lim);
+                }
+            }
+            _ => self.bias = 0.0,
+        }
         let d0pp = (squeeze / err.cos().powi(2) * (k_now * squeeze / err.cos() - kappa0)).clamp(-2.0 * k_lim, 2.0 * k_lim);
 
         // The lattice: offsets either side, the one held and the last chosen,
@@ -351,8 +384,10 @@ impl Controller for FrenetFollower {
             2.0 * alpha.sin() / dx.hypot(dy).max(1e-6)
         }
         .clamp(-k_lim, k_lim);
+        let curvature = (curvature + self.bias).clamp(-k_lim, k_lim);
         let speed = chosen.speed.min(path_speed(nominal, curvature, left0, prep.pos_tol, cfg.kp_linear, constraints));
         self.last_speed = speed;
+        self.last_command = Some((back, curvature));
         self.base.status.mode = mode.into();
         let direction = if back { -1.0 } else { 1.0 };
         finalize(direction * speed, speed * curvature, constraints, &cfg, prep.allow_reverse, "Frenet tracking")
@@ -387,6 +422,9 @@ impl Controller for FrenetFollower {
         self.plan.clear();
         self.offset = 0.0;
         self.last_speed = 0.0;
+        self.sideslip = 0.0;
+        self.last_command = None;
+        self.bias = 0.0;
     }
 
     fn reset(&mut self) {
