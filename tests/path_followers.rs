@@ -127,3 +127,35 @@ fn stanley_follows_sine_path() {
     assert!(reached, "stanley did not reach final waypoint (t={t:.2})");
     assert!(max_cte < 1.2, "cross-track error too large: {max_cte:.3}");
 }
+
+#[test]
+fn stanley_stops_with_the_robot_at_the_goal() {
+    let path = straight_path(41);
+    let final_wp = *path.waypoints.last().unwrap();
+
+    let mut tracker = Tracker::new(TrackerKind::Stanley);
+    let mut cfg = ControllerConfig::default();
+    cfg.goal_tolerance = 0.75;
+    cfg.angular_tolerance = 1.0;
+    cfg.output_units = OutputUnits::Physical;
+    tracker.set_config(cfg);
+
+    let mut c = RobotConstraints::default();
+    c.max_linear_velocity = 2.0;
+    c.max_angular_velocity = 1.0;
+    c.wheelbase = 2.0;
+    tracker.init(c);
+
+    tracker.set_path(path);
+    tracker.set_goal(Goal {
+        target_pose: final_wp,
+        tolerance_position: 0.75,
+        tolerance_orientation: 1.0,
+        ..Default::default()
+    });
+
+    let (reached, end, t, _) = simulate(&mut tracker, pose(0.0, 0.0, 0.0), 4000, 0.05);
+    assert!(reached, "stanley did not reach the goal (t={t:.2})");
+    let gap = end.point.distance_to_2d(final_wp.point);
+    assert!(gap < 0.75, "stanley stopped {gap:.2} m from the goal");
+}

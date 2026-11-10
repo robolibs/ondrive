@@ -170,7 +170,20 @@ impl Controller for StanleyFollower {
         };
         let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
         let length = self.cum.last().copied().unwrap_or(0.0);
-        if let Some(cmd) = self.base.arrival_on_path(state, goal, constraints, &proj, length) {
+        let at_robot = if ackermann {
+            project(
+                &self.base.path.waypoints,
+                &self.cum,
+                state.pose.point,
+                self.base.path_index,
+                SEARCH_WINDOW,
+                SEARCH_WINDOW,
+            )
+        } else {
+            None
+        };
+        let arrival_proj = at_robot.as_ref().unwrap_or(&proj);
+        if let Some(cmd) = self.base.arrival_on_path(state, goal, constraints, arrival_proj, length) {
             return cmd;
         }
 
