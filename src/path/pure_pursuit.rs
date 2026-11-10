@@ -5,19 +5,19 @@
 use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
     can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, holonomic_point_command,
-    is_ackermann, is_holonomic, path_speed, reverse_allowed, world_to_body,
+    is_ackermann, is_holonomic, max_curvature, path_speed, reverse_allowed, world_to_body,
 };
 use crate::core::math::{heading_error, normalize_angle};
 use crate::core::path::{
-    PathCursor, curvature_at_projection, cusp_after, sample, speed_cap,
+    PathCursor, cusp_after, sample, sharpest_ahead, speed_cap,
 };
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
 use std::f64::consts::PI;
 
 /// Lookahead shrink per unit of path curvature (metres of lookahead per
-/// unit curvature), keeping tight bends from being cut.
-const CURVATURE_LOOKAHEAD_GAIN: f64 = 0.5;
+/// unit curvature of the sharpest bend within reach), keeping bends from being cut.
+const CURVATURE_LOOKAHEAD_GAIN: f64 = 1.0;
 
 #[derive(Clone, Debug, Default)]
 pub struct PurePursuitFollower {
@@ -133,7 +133,7 @@ impl Controller for PurePursuitFollower {
         }
 
         let base_lookahead = cfg.lookahead_distance.max(1e-3);
-        let kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &proj).abs();
+        let kappa_path = sharpest_ahead(&self.base.path.waypoints, &self.cursor.cum, proj.arc_length, base_lookahead, max_curvature(constraints));
         let lookahead = ((base_lookahead + cfg.lookahead_time.max(0.0) * state.velocity.linear.abs())
             / (1.0 + CURVATURE_LOOKAHEAD_GAIN * kappa_path * base_lookahead))
             .clamp(0.5 * base_lookahead, 3.0 * base_lookahead);

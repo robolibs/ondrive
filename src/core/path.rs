@@ -270,6 +270,19 @@ pub fn curvature_at_arc_length(waypoints: &[Pose], cum: &[f64], s: f64) -> f64 {
     k0 + (k1 - k0) * t
 }
 
+/// Points sampled by `sharpest_ahead`.
+const SHARPEST_SAMPLES: usize = 16;
+
+/// Sharpest curvature, unsigned, of the path over the `reach` metres on
+/// from arc length `s` among the bends no sharper than `followable`;
+/// sharper ones are corners a robot cuts whatever it aims at.
+pub fn sharpest_ahead(waypoints: &[Pose], cum: &[f64], s: f64, reach: f64, followable: f64) -> f64 {
+    (0..=SHARPEST_SAMPLES)
+        .map(|i| curvature_at_arc_length(waypoints, cum, s + reach * i as f64 / SHARPEST_SAMPLES as f64).abs())
+        .filter(|k| *k <= followable)
+        .fold(0.0, f64::max)
+}
+
 /// Speed cap from `Path::speeds` at the projection, if the path carries
 /// per-waypoint speeds.
 pub fn speed_cap(speeds: &[f64], proj: &PathProjection) -> Option<f64> {
@@ -375,5 +388,26 @@ impl PathCursor {
     pub fn cusp_ahead(&self, speeds: &[f64], s: f64) -> Option<usize> {
         let c = cusp_after(speeds, &self.cum, s)?;
         Some(self.cum.partition_point(|x| *x < c - 1e-9).min(self.cum.len().saturating_sub(1)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datapod::{Euler, Quaternion};
+
+    fn at(x: f64, y: f64) -> Pose {
+        Pose { point: Point::new(x, y, 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, 0.0)) }
+    }
+
+    #[test]
+    fn the_sharpest_bend_ahead_skips_corners_too_sharp_to_follow() {
+        let mut waypoints: Vec<Pose> = (0..=20).map(|i| at(0.5 * i as f64, 0.0)).collect();
+        waypoints.extend((1..=20).map(|i| at(10.0, 0.5 * i as f64)));
+        let cum = cumulative_lengths(&waypoints);
+        let corner = sharpest_ahead(&waypoints, &cum, 5.0, 8.0, f64::INFINITY);
+        assert!(corner > 2.0, "the corner reads {corner:.2} 1/m");
+        assert_eq!(sharpest_ahead(&waypoints, &cum, 5.0, 8.0, 0.5), 0.0);
+        assert_eq!(sharpest_ahead(&waypoints, &cum, 0.0, 4.0, f64::INFINITY), 0.0);
     }
 }
