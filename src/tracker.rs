@@ -75,6 +75,24 @@ impl TrackerKind {
             TrackerKind::Mpc | TrackerKind::Mppi | TrackerKind::Mca | TrackerKind::Soc | TrackerKind::Ilqr | TrackerKind::SlipAdaptive
         )
     }
+
+    /// Whether the controller tracks the path as drawn, by a steering law,
+    /// and so is handed it with its corners rounded to what the platform
+    /// can turn; Regulated Pure Pursuit, which slows into corners on its
+    /// own, keeps them sharp.
+    pub fn rounds_corners(self) -> bool {
+        matches!(
+            self,
+            TrackerKind::PurePursuit
+                | TrackerKind::Stanley
+                | TrackerKind::Lqr
+                | TrackerKind::Kanayama
+                | TrackerKind::VectorPursuit
+                | TrackerKind::Flc
+                | TrackerKind::Ilc
+                | TrackerKind::SlipAdaptive
+        )
+    }
 }
 
 pub struct Tracker {
@@ -200,6 +218,11 @@ impl Tracker {
 
     /// Hand `path` to the cursor and the controller, with progress at its start.
     fn drive(&mut self, path: Path) {
+        let path = if self.kind.rounds_corners() && is_ackermann(self.constraints.steering_type) {
+            round_corners(&path, 1.0 / crate::core::kinematics::max_curvature(&self.constraints))
+        } else {
+            path
+        };
         self.cursor.set_path(&path.waypoints);
         self.path = Some(path.clone());
         self.waypoint_index = 0;
@@ -891,6 +914,79 @@ impl Tracker {
 /// Turn, radians, below which a waypoint is a bend smoothed through rather
 /// than a corner (or cusp) kept sharp.
 const SMOOTH_TURN: f64 = 0.5;
+/// Turn, radians, past which a waypoint is a cusp the path reverses at,
+/// not a corner to round.
+const REVERSAL_TURN: f64 = 0.75 * std::f64::consts::PI;
+/// Spacing, metres, of the points laid along a rounded corner.
+const ROUNDING_STEP: f64 = 0.25;
+
+/// `path` with each corner sharper than `SMOOTH_TURN` (not a cusp) rounded
+/// by an arc of `radius`, or tighter where its legs are too short, tangent
+/// to both legs: the corners a platform turning no tighter than `radius`
+/// can drive as drawn.
+fn round_corners(path: &Path, radius: f64) -> Path {
+    let w = &path.waypoints;
+    let n = w.len();
+    if n < 3 || !radius.is_finite() || radius <= 0.0 {
+        return path.clone();
+    }
+    let cum = cumulative_lengths(w);
+    let with_speeds = path.speeds.len() == n;
+    let corners: Vec<(usize, f64)> = (1..n - 1)
+        .filter_map(|i| {
+            let turn = crate::core::math::normalize_angle(segment_heading(w, i) - segment_heading(w, i - 1));
+            let reverses = with_speeds && (path.speeds[i - 1] < 0.0) != (path.speeds[i + 1] < 0.0);
+            (turn.abs() > SMOOTH_TURN && turn.abs() < REVERSAL_TURN && !reverses).then_some((i, turn))
+        })
+        .collect();
+    if corners.is_empty() {
+        return path.clone();
+    }
+    let total = cum[n - 1];
+    let mut out = Path { waypoints: Vec::with_capacity(n), speeds: Vec::new(), is_closed: path.is_closed };
+    let mut next = 0;
+    for (k, &(i, turn)) in corners.iter().enumerate() {
+        let s = cum[i];
+        let before = if k == 0 { s } else { 0.5 * (s - cum[corners[k - 1].0]) };
+        let after = if k + 1 == corners.len() { total - s } else { 0.5 * (cum[corners[k + 1].0] - s) };
+        let tangent = (radius * (0.5 * turn.abs()).tan()).min(before).min(after);
+        while next < n && cum[next] < s - tangent {
+            out.waypoints.push(w[next]);
+            if with_speeds {
+                out.speeds.push(path.speeds[next]);
+            }
+            next += 1;
+        }
+        let (start, heading) = sample(w, &cum, s - tangent);
+        let arc_radius = tangent / (0.5 * turn.abs()).tan().max(1e-9);
+        let side = turn.signum();
+        let (cx, cy) = (start.x - side * arc_radius * heading.sin(), start.y + side * arc_radius * heading.cos());
+        let steps = ((arc_radius * turn.abs() / ROUNDING_STEP).ceil() as usize).max(2);
+        let back = with_speeds && path.speeds[i] < 0.0;
+        for j in 0..=steps {
+            let a = turn * j as f64 / steps as f64;
+            let (dx, dy) = (start.x - cx, start.y - cy);
+            let (sa, ca) = a.sin_cos();
+            let point = Point::new(cx + dx * ca - dy * sa, cy + dx * sa + dy * ca, w[i].point.z);
+            let yaw = heading + a + if back { std::f64::consts::PI } else { 0.0 };
+            out.waypoints.push(Pose { point, rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, yaw)) });
+            if with_speeds {
+                out.speeds.push(path.speeds[i]);
+            }
+        }
+        while next < n && cum[next] <= s + tangent {
+            next += 1;
+        }
+    }
+    while next < n {
+        out.waypoints.push(w[next]);
+        if with_speeds {
+            out.speeds.push(path.speeds[next]);
+        }
+        next += 1;
+    }
+    out
+}
 
 /// Turn of the path at `b`, between `a` before it and `c` after it, in the
 /// ground plane.
@@ -1501,6 +1597,61 @@ mod tests {
         let mut path = Path { waypoints: vec![flat(0.0, 0.0), flat(10.0, 0.0), flat(10.0, 10.0)], speeds: Vec::new(), is_closed: false };
         smoothen_path(&mut path, 0.5);
         assert!(path.waypoints.iter().all(|w| w.point.y.abs() < 1e-9 || (w.point.x - 10.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn rounding_turns_a_square_corner_into_an_arc_of_the_radius() {
+        let path = Path { waypoints: vec![flat(0.0, 0.0), flat(10.0, 0.0), flat(10.0, 10.0)], speeds: Vec::new(), is_closed: false };
+        let rounded = round_corners(&path, 3.0);
+        let (first, last) = (rounded.waypoints[0].point, rounded.waypoints.last().unwrap().point);
+        assert!(first.distance_to_2d(Point::new(0.0, 0.0, 0.0)) < 1e-9 && last.distance_to_2d(Point::new(10.0, 10.0, 0.0)) < 1e-9);
+        let nearest = rounded.waypoints.iter().map(|w| w.point.distance_to_2d(Point::new(10.0, 0.0, 0.0))).fold(f64::INFINITY, f64::min);
+        assert!((nearest - 3.0 * (std::f64::consts::SQRT_2 - 1.0)).abs() < 0.02, "the arc passes {nearest:.3} m from the corner");
+        let off_circle = rounded
+            .waypoints
+            .iter()
+            .filter(|w| w.point.x > 7.0 && w.point.y < 3.0)
+            .map(|w| (w.point.x - 7.0).hypot(w.point.y - 3.0) - 3.0)
+            .fold(0.0_f64, |m, d| m.max(d.abs()));
+        assert!(off_circle < 1e-6, "the arc strays {off_circle:.3} m off its circle");
+    }
+
+    #[test]
+    fn a_kanayama_follower_drives_an_ackermann_machine_round_a_square_corner() {
+        let mut t = Tracker::new(TrackerKind::Kanayama);
+        let mut cfg = crate::types::ControllerConfig::default();
+        cfg.goal_tolerance = 0.75;
+        cfg.output_units = crate::types::OutputUnits::Physical;
+        t.set_config(cfg);
+        let mut c = RobotConstraints::default();
+        c.wheelbase = 2.7;
+        c.max_steering_angle = 0.6;
+        c.max_linear_velocity = 2.0;
+        c.max_angular_velocity = 1.0;
+        t.init(c);
+        let mut waypoints: Vec<Pose> = (0..=40).map(|i| flat(0.5 * i as f64, 0.0)).collect();
+        waypoints.extend((1..=40).map(|i| flat(20.0, 0.5 * i as f64)));
+        t.set_path(Path { waypoints, speeds: Vec::new(), is_closed: false });
+        let mut state = RobotState { allow_move: true, velocity_valid: true, ..Default::default() };
+        let (dt, mut worst) = (0.05, 0.0_f64);
+        for _ in 0..3000 {
+            let cmd = t.tick(&state, dt, None);
+            let yaw = state.pose.rotation.to_euler().yaw;
+            state.pose.point.x += cmd.linear_velocity * yaw.cos() * dt;
+            state.pose.point.y += cmd.linear_velocity * yaw.sin() * dt;
+            state.pose.rotation = Quaternion::from_euler(Euler::new(0.0, 0.0, yaw + cmd.angular_velocity * dt));
+            state.velocity.linear = cmd.linear_velocity;
+            state.velocity.angular = cmd.angular_velocity;
+            let (x, y) = (state.pose.point.x, state.pose.point.y);
+            let first = if x <= 20.0 { y.abs() } else { (x - 20.0).hypot(y) };
+            let second = if y >= 0.0 { (x - 20.0).abs() } else { (x - 20.0).hypot(y) };
+            worst = worst.max(first.min(second));
+            if t.is_path_completed() || !cmd.valid {
+                break;
+            }
+        }
+        assert!(t.is_path_completed(), "the follower stalled at ({:.1}, {:.1})", state.pose.point.x, state.pose.point.y);
+        assert!(worst < 1.5, "the follower strayed {worst:.2} m off the corner");
     }
 
     #[test]
