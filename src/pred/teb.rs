@@ -314,7 +314,7 @@ impl TebFollower {
         let pose = (state.pose.point.x, state.pose.point.y, state.pose.rotation.to_euler().yaw);
         let (v, w) = command;
         let course = crate::core::obstacles::arc_course(pose, if v.abs() > 1e-9 { w / v } else { 0.0 });
-        give_way_share(&reference, &world.obstacles, constraints, &course, v, v, step)
+        give_way_share(&reference, &world.obstacles, constraints, &course, v, v, step, crate::pred::mppi::GIVE_WAY_MARGIN)
     }
 
     fn detour_guide(&mut self, from: f64, constraints: &RobotConstraints, obstacles: &[Obstacle]) -> Option<Vec<Pose>> {

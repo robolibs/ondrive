@@ -915,13 +915,13 @@ impl MppiFollower {
         let share = match &plan.guide {
             Some(g) => {
                 self.guide = (0..g.x.len()).map(|i| (g.x[i], g.y[i])).collect();
-                give_way_share(&along.reference(n, step, paced), obstacles, constraints, &course_through(&self.guide), paced, v, step)
+                give_way_share(&along.reference(n, step, paced), obstacles, constraints, &course_through(&self.guide), paced, v, step, GIVE_WAY_MARGIN)
             }
-            None => give_way_ahead(&along, obstacles, constraints, n, step, paced, v),
+            None => give_way_ahead(&along, obstacles, constraints, n, step, paced, v, GIVE_WAY_MARGIN),
         };
         let planned: Vec<(f64, f64)> = self.predicted_trajectory.iter().map(|p| (p.x, p.y)).collect();
         let share = if planned.len() >= 2 {
-            share.min(give_way_share(&along.reference(n, step, paced), obstacles, constraints, &course_through(&planned), paced, v, step))
+            share.min(give_way_share(&along.reference(n, step, paced), obstacles, constraints, &course_through(&planned), paced, v, step, GIVE_WAY_MARGIN))
         } else {
             share
         };
@@ -1608,7 +1608,7 @@ pub(crate) fn correlated_noise(out: &mut [f64], sigma: f64, rho: f64, rng: &mut 
 
 /// Share of `speed` along `course`, setting off at `v_now`, that gives way
 /// to the obstacles crossing `reference` (one point per `step`):
-/// `yield_share` against those alone.
+/// `yield_share` against those alone, keeping `margin` beyond the footprint.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn give_way_share(
     reference: &Reference,
@@ -1618,6 +1618,7 @@ pub(crate) fn give_way_share(
     speed: f64,
     v_now: f64,
     step: f64,
+    margin: f64,
 ) -> f64 {
     let crossing = WorldConstraints {
         obstacles: obstacles.iter().filter(|o| crosses(o, reference, step, robot_radius(constraints))).cloned().collect(),
@@ -1626,7 +1627,7 @@ pub(crate) fn give_way_share(
     if crossing.obstacles.is_empty() {
         return 1.0;
     }
-    let checker = CollisionChecker::new(Some(&crossing), constraints, GIVE_WAY_MARGIN).with_spread(1.0);
+    let checker = CollisionChecker::new(Some(&crossing), constraints, margin).with_spread(1.0);
     let decel = constraints.max_linear_acceleration.abs();
     yield_share(&checker, course, speed, v_now, GIVE_WAY_LOOKOUT_S, decel, &GIVE_WAY_SHARES)
 }
@@ -1653,7 +1654,8 @@ impl Along<'_> {
 
 /// Share of `speed`, setting off at `v_now`, that gives way to traffic
 /// crossing the next `n` steps of `step` of `along`: `give_way_share` for
-/// driving on along it.
+/// driving on along it, keeping `margin` beyond the footprint.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn give_way_ahead(
     along: &Along,
     obstacles: &[Obstacle],
@@ -1662,13 +1664,14 @@ pub(crate) fn give_way_ahead(
     step: f64,
     speed: f64,
     v_now: f64,
+    margin: f64,
 ) -> f64 {
     if obstacles.is_empty() {
         return 1.0;
     }
     let ahead = along.reference(((GIVE_WAY_COURSE_S / step).ceil() as usize).max(n), step, speed);
     let course = polyline_course((0..ahead.x.len()).map(|i| (ahead.x[i], ahead.y[i], ahead.yaw[i])).collect());
-    give_way_share(&along.reference(n, step, speed), obstacles, constraints, &course, speed, v_now, step)
+    give_way_share(&along.reference(n, step, speed), obstacles, constraints, &course, speed, v_now, step, margin)
 }
 
 /// How far `(x, y)` sits sideways of where `guide` starts, across

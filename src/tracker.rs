@@ -670,7 +670,8 @@ impl Tracker {
         let cruise = state.velocity.linear.abs().max(self.constraints.max_linear_velocity.abs()).max(FOLLOW_SPEED_FLOOR);
         let n = (GIVE_WAY_HORIZON_S / GIVE_WAY_STEP).ceil() as usize;
         let v_now = if state.velocity_valid { state.velocity.linear } else { cmd.linear_velocity };
-        let share = crate::pred::mppi::give_way_ahead(&along, &crossing, &self.constraints, n, GIVE_WAY_STEP, cruise, v_now).clamp(0.0, 1.0);
+        let share = crate::pred::mppi::give_way_ahead(&along, &crossing, &self.constraints, n, GIVE_WAY_STEP, cruise, v_now, FOLLOW_GIVE_WAY_MARGIN)
+            .clamp(0.0, 1.0);
         if share < 1.0 {
             cmd.linear_velocity *= share;
             cmd.angular_velocity *= share;
@@ -1116,6 +1117,8 @@ const FOLLOW_TURN_RADIUS: f64 = 2.0;
 /// Seconds, and their step, a follower looks ahead to give way to crossing traffic.
 const GIVE_WAY_HORIZON_S: f64 = 8.0;
 const GIVE_WAY_STEP: f64 = 0.2;
+/// Room, metres, a follower keeps beyond its footprint from crossing traffic.
+const FOLLOW_GIVE_WAY_MARGIN: f64 = 0.7;
 
 /// Metres ahead a follower's path is checked: `FOLLOW_AHEAD`, or three body
 /// lengths when longer.
@@ -1462,6 +1465,52 @@ mod tests {
         let path = t.path().expect("a path");
         let widest = path.waypoints.iter().map(|w| w.point.y.abs()).fold(0.0_f64, f64::max);
         assert!(widest > 0.5 + 0.35, "the path keeps {widest} m off the oncoming traffic");
+    }
+
+    #[test]
+    fn a_path_follower_waits_clear_of_traffic_crossing_its_path() {
+        let mut t = Tracker::new(TrackerKind::PurePursuit);
+        let mut c = RobotConstraints::default();
+        c.wheelbase = 0.65;
+        c.max_steering_angle = 0.46;
+        c.max_linear_velocity = 1.0;
+        c.footprint = crate::types::Footprint::Polygon { points: vec![(0.5, 0.35), (-0.5, 0.35), (-0.5, -0.35), (0.5, -0.35)] };
+        t.init(c);
+        let waypoints: Vec<Pose> = (0..=80)
+            .map(|i| Pose { point: Point::new(0.5 * i as f64, 0.0, 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, 0.0)) })
+            .collect();
+        t.set_path(Path { waypoints, speeds: Vec::new(), is_closed: false });
+        let (steps, dt, radius, speed) = (30, 0.2, 0.5, 0.8);
+        let mover = |time: f64| (8.0, -6.4 + speed * time);
+        let mut state = RobotState { velocity_valid: true, allow_move: true, ..Default::default() };
+        let (mut clock, mut closest) = (0.0, f64::INFINITY);
+        while clock < 60.0 && state.pose.point.x < 20.0 {
+            let mode = crate::types::GaussianMode {
+                weight: 1.0,
+                mean_x: (0..=steps).map(|k| mover(clock + k as f64 * dt).0).collect(),
+                mean_y: (0..=steps).map(|k| mover(clock + k as f64 * dt).1).collect(),
+                std_x: vec![0.05; steps + 1],
+                std_y: vec![0.05; steps + 1],
+            };
+            let world = WorldConstraints { obstacles: vec![crate::types::Obstacle { id: 0, radius, modes: vec![mode], dt }], ..Default::default() };
+            let cmd = t.tick(&state, 0.05, Some(&world));
+            assert!(cmd.valid, "{}", cmd.status_message);
+            let yaw = state.pose.rotation.to_euler().yaw;
+            state.pose.point.x += cmd.linear_velocity * yaw.cos() * 0.05;
+            state.pose.point.y += cmd.linear_velocity * yaw.sin() * 0.05;
+            state.pose.rotation = Quaternion::from_euler(Euler::new(0.0, 0.0, yaw + cmd.angular_velocity * 0.05));
+            state.velocity.linear = cmd.linear_velocity;
+            state.velocity.angular = cmd.angular_velocity;
+            clock += 0.05;
+            let (mx, my) = mover(clock);
+            let (dx, dy) = (mx - state.pose.point.x, my - state.pose.point.y);
+            let (s, co) = state.pose.rotation.to_euler().yaw.sin_cos();
+            let (fx, fy) = (dx * co + dy * s, -dx * s + dy * co);
+            let gap = (fx - fx.clamp(-0.5, 0.5)).hypot(fy - fy.clamp(-0.35, 0.35)) - radius;
+            closest = closest.min(gap);
+        }
+        assert!(state.pose.point.x >= 20.0, "the follower stalled at x = {:.1}", state.pose.point.x);
+        assert!(closest > 0.6, "the follower passed {closest:.2} m from the crossing traffic");
     }
 
     #[test]
