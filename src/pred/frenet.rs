@@ -182,12 +182,13 @@ impl Controller for FrenetFollower {
         let back = prep.allow_reverse && direction_at(speeds, &prep.proj) == Some(-1);
         let travel = yaw + if back { PI } else { 0.0 };
         let body_turn = if back { PI } else { 0.0 };
-        // Reversing, an Ackermann machine is planned for by its rear axle,
-        // which leads and moves as the plan does, run on past the leg's end
-        // for the pose trailing it to reach there.
-        let lead = if back && is_ackermann(constraints.steering_type) { constraints.rear_wheelbase.max(0.0) } else { 0.0 };
-        let (rx, ry) = (x0 - lead * yaw.cos(), y0 - lead * yaw.sin());
-        let at = if lead > 0.0 {
+        // An Ackermann machine is planned for by its rear axle, which moves
+        // along its heading as the plan does; reversing, the plan runs on
+        // past the leg's end for the pose trailing the axle to reach there.
+        let axle = if is_ackermann(constraints.steering_type) { constraints.rear_wheelbase.max(0.0) } else { 0.0 };
+        let lead = if back { axle } else { 0.0 };
+        let (rx, ry) = (x0 - axle * yaw.cos(), y0 - axle * yaw.sin());
+        let at = if axle > 0.0 {
             self.cursor
                 .project_on_leg(waypoints, speeds, Point::new(rx, ry, 0.0), prep.proj.segment, prep.proj.arc_length)
                 .unwrap_or(prep.proj)
@@ -288,7 +289,7 @@ impl Controller for FrenetFollower {
                     heading = (y - py).atan2(x - px);
                 }
                 (px, py) = (x, y);
-                let (bx, by) = (x - lead * heading.cos(), y - lead * heading.sin());
+                let (bx, by) = (x + axle * (heading - body_turn).cos(), y + axle * (heading - body_turn).sin());
                 if let Some(points) = trace.as_deref_mut() {
                     points.push(Point::new(bx, by, 0.0));
                 }
