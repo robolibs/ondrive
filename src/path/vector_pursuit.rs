@@ -121,7 +121,7 @@ impl Controller for VectorPursuitFollower {
             return VelocityCommand::invalid("no path");
         };
         let at_robot =
-            self.cursor.past_cusp(&self.base.path.waypoints, &self.base.path.speeds, state.pose.point, at_robot, pos_tol.max(0.1));
+            self.cursor.past_cusp(&self.base.path.waypoints, &self.base.path.speeds, state.pose.point, at_robot, crate::controller::cusp_reach(pos_tol, state, constraints));
         self.base.path_index = at_robot.segment;
 
         let length = self.cursor.total_length();

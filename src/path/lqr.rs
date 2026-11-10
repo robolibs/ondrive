@@ -96,7 +96,7 @@ impl Controller for LqrFollower {
         let Some(proj) = self.cursor.project(&self.base.path.waypoints, state.pose.point, self.base.path_index) else {
             return VelocityCommand::invalid("no path");
         };
-        let proj = self.cursor.past_cusp(&self.base.path.waypoints, &self.base.path.speeds, state.pose.point, proj, pos_tol.max(0.1));
+        let proj = self.cursor.past_cusp(&self.base.path.waypoints, &self.base.path.speeds, state.pose.point, proj, crate::controller::cusp_reach(pos_tol, state, constraints));
         self.base.path_index = proj.segment;
         let stop_distance = cusp_after(&self.base.path.speeds, &self.cursor.cum, proj.arc_length)
             .map_or(f64::INFINITY, |c| c - proj.arc_length);

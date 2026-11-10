@@ -688,7 +688,7 @@ pub(crate) fn prepare(
         return Err(VelocityCommand::invalid("no path"));
     };
     let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
-    proj = cursor.past_cusp(&base.path.waypoints, &base.path.speeds, state.pose.point, proj, pos_tol.max(0.1));
+    proj = cursor.past_cusp(&base.path.waypoints, &base.path.speeds, state.pose.point, proj, crate::controller::cusp_reach(pos_tol, state, constraints));
     base.path_index = proj.segment;
     if let Some(cmd) = base.arrival_on_path(state, goal, constraints, &proj, cursor.total_length()) {
         return Err(cmd);

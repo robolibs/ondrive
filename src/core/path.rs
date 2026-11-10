@@ -385,12 +385,13 @@ impl PathCursor {
     }
 
     /// `proj` of `p`, carried onto the leg leaving the next cusp once `p`
-    /// comes within `reach` of it, with progress committed past the cusp.
+    /// comes within `reach` of it, straight or along the path, with
+    /// progress committed past the cusp.
     pub fn past_cusp(&mut self, waypoints: &[Pose], speeds: &[f64], p: Point, proj: PathProjection, reach: f64) -> PathProjection {
         let Some(k) = self.cusp_ahead(speeds, proj.arc_length) else {
             return proj;
         };
-        if waypoints[k].point.distance_to_2d(p) >= reach {
+        if waypoints[k].point.distance_to_2d(p) >= reach && self.cum[k] - proj.arc_length >= reach {
             return proj;
         }
         self.commit(k);

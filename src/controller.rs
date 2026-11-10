@@ -134,6 +134,18 @@ pub struct GoalCheck {
     pub orientation_tolerance: f64,
 }
 
+/// Share of top speed under which a robot counts as stopped at a cusp.
+const STOPPED_AT_CUSP: f64 = 0.1;
+
+/// Distance from a cusp within which the robot counts as there: half the
+/// position tolerance while it moves, all of it once stopped or when its
+/// speed is not reported.
+pub fn cusp_reach(pos_tol: f64, state: &RobotState, constraints: &RobotConstraints) -> f64 {
+    let stopped = STOPPED_AT_CUSP * constraints.max_linear_velocity.abs();
+    let moving = state.velocity_valid && state.velocity.linear.abs() >= stopped.max(0.05);
+    (if moving { 0.5 * pos_tol } else { pos_tol }).max(0.1)
+}
+
 /// Goal tolerances override config tolerances when set (> 0). An
 /// orientation tolerance of `PI` or more disables the orientation check.
 pub fn effective_tolerances(goal: &Goal, cfg: &ControllerConfig) -> (f64, f64) {
