@@ -61,6 +61,10 @@ pub struct SocConfig {
     /// Share of the previous plan's cost a guide must come under to pull
     /// the final samples toward it instead of the previous plan.
     pub guide_switch: f64,
+    /// `guide_switch` while obstacles are in view; lower holds the plan through
+    /// traffic rather than swapping between near-equal ways round it.
+    #[serde(default = "default_guide_switch_traffic")]
+    pub guide_switch_traffic: f64,
 
     pub temperature: f64,
     pub guide_temperature: f64,
@@ -105,6 +109,10 @@ pub struct SocConfig {
     pub decel_distance: f64,
 }
 
+fn default_guide_switch_traffic() -> f64 {
+    0.95
+}
+
 impl Default for SocConfig {
     fn default() -> Self {
         Self {
@@ -113,6 +121,7 @@ impl Default for SocConfig {
             guide_samples: 32,
             num_samples: 512,
             guide_switch: 0.95,
+            guide_switch_traffic: default_guide_switch_traffic(),
             temperature: 1.0,
             guide_temperature: 1.0,
             steering_noise: 0.5,
@@ -557,12 +566,13 @@ impl Controller for SocFollower {
         if keep {
             (self.debug.costs, self.debug.rollouts) = rolled.into_iter().unzip();
         }
+        let switch = if obstacles.is_empty() { cfg.guide_switch } else { cfg.guide_switch_traffic };
         let best = guide_costs
             .iter()
             .enumerate()
             .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i)
-            .filter(|&i| (i == BRAKE_GUIDE && k_guide >= 3) || (i == DETOUR_GUIDE && has_detour) || guide_costs[i] < cfg.guide_switch * guide_costs[0])
+            .filter(|&i| (i == BRAKE_GUIDE && k_guide >= 3) || (i == DETOUR_GUIDE && has_detour) || guide_costs[i] < switch * guide_costs[0])
             .unwrap_or(0);
 
         let mut std_s = vec![cfg.steering_noise.max(1e-6); n];
