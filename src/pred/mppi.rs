@@ -694,6 +694,12 @@ pub(crate) fn current_speed(state: &RobotState, last_commanded: f64) -> f64 {
     }
 }
 
+/// Speed a command integrates from: `last_commanded` while the measured
+/// `v_now` stays within `slack` of it, else `v_now`.
+pub(crate) fn held_speed(v_now: f64, last_commanded: f64, slack: f64) -> f64 {
+    if (v_now - last_commanded).abs() <= slack { last_commanded } else { v_now }
+}
+
 /// Lateral-speed feedback, analogous to `current_speed`. Only meaningful on
 /// a holonomic platform; callers pass 0.0 as the fallback otherwise.
 pub(crate) fn current_lateral_speed(state: &RobotState, last_commanded: f64) -> f64 {
@@ -2188,6 +2194,14 @@ mod tests {
         let left = left_by(&reference, &guide);
         assert_eq!(left.len(), 2);
         assert!((left[0].2 - 1.0).abs() < 1e-12 && (left[1].2 + 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn held_speed_keeps_the_last_command_unless_the_measurement_strays() {
+        assert_eq!(super::held_speed(1.2, 1.0, 0.3), 1.0);
+        assert_eq!(super::held_speed(0.8, 1.0, 0.3), 1.0);
+        assert_eq!(super::held_speed(0.2, 1.0, 0.3), 0.2);
+        assert_eq!(super::held_speed(-0.5, 0.0, 0.3), -0.5);
     }
 
     #[test]
