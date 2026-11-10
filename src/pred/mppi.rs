@@ -200,10 +200,14 @@ impl Swerve {
     /// `(back, front, half width, room)` of the body a detour keeps `reach`
     /// from (the disc's radius plus the room kept): the capsule, keeping
     /// what `reach` adds to the disc's radius but at least
-    /// `DETOUR_BODY_MARGIN`, else the pose with all of `reach`.
+    /// `DETOUR_BODY_MARGIN` and `BODY_ROOM_SHARE` of its width, else the
+    /// pose with all of `reach`.
     fn keep(&self, reach: f64) -> (f64, f64, f64, f64) {
         match self.body {
-            Some((back, front, half)) => (back, front, half, (reach - self.disc).max(DETOUR_BODY_MARGIN)),
+            Some((back, front, half)) => {
+                let room = (reach - self.disc).max(DETOUR_BODY_MARGIN).max(BODY_ROOM_SHARE * 2.0 * half);
+                (back, front, half, room)
+            }
             None => (0.0, 0.0, 0.0, reach),
         }
     }
@@ -215,6 +219,9 @@ const SWERVE_ROOM: f64 = 1.5;
 /// Least room, metres, a detour keeps beside the body: past the margin the
 /// obstacle critics count as contact.
 const DETOUR_BODY_MARGIN: f64 = 0.45;
+/// Share of the body's width a detour keeps beside it at least: a wide,
+/// long machine tracks its detour less closely than a small one.
+const BODY_ROOM_SHARE: f64 = 0.4;
 
 impl Reference {
     pub fn lateral_at(&self, i: usize) -> f64 {
