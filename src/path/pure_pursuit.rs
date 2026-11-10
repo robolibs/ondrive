@@ -9,7 +9,7 @@ use crate::core::kinematics::{
 };
 use crate::core::math::{heading_error, normalize_angle};
 use crate::core::path::{
-    PathCursor, cusp_after, direction_at, sample_past, sharpest_ahead, speed_cap,
+    PathCursor, cusp_after, direction_at, sample, sharpest_ahead, speed_cap,
 };
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
@@ -153,10 +153,13 @@ impl Controller for PurePursuitFollower {
             cap = cusp;
             stop_distance = stop_distance.min((cusp - at_robot.arc_length).max(0.0));
         }
-        // Reversing, the rear axle leads the pose and aims past the leg's end.
-        let trail = if direction_at(&self.base.path.speeds, &at_robot) == Some(-1) { axle_offset } else { 0.0 };
-        let s_target = (proj.arc_length + lookahead).min(cap + trail);
-        let (target, _) = sample_past(&self.base.path.waypoints, &self.cursor.cum, s_target, cap);
+        // The rear axle aims where it stands when the pose is on the path at
+        // the lookahead point, facing along it.
+        let back = direction_at(&self.base.path.speeds, &at_robot) == Some(-1);
+        let s_target = (at_robot.arc_length + lookahead).min(cap);
+        let (on_path, heading) = sample(&self.base.path.waypoints, &self.cursor.cum, s_target);
+        let body = if back { heading + PI } else { heading };
+        let target = Point::new(on_path.x - axle_offset * body.cos(), on_path.y - axle_offset * body.sin(), on_path.z);
         self.lookahead_point = Some(target);
 
         let dx = target.x - rear.x;
