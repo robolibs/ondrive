@@ -223,6 +223,38 @@ const DETOUR_BODY_MARGIN: f64 = 0.45;
 /// long machine tracks its detour less closely than a small one.
 const BODY_ROOM_SHARE: f64 = 0.4;
 
+/// Room, metres, a wide body keeps from obstacles past what a small one
+/// keeps: `BODY_ROOM_SHARE` of its width beyond `DETOUR_BODY_MARGIN`, 0 for
+/// a disc or a body narrow enough.
+pub(crate) fn body_room(constraints: &RobotConstraints) -> f64 {
+    footprint_extent(constraints).map_or(0.0, |(_, _, half)| (BODY_ROOM_SHARE * 2.0 * half - DETOUR_BODY_MARGIN).max(0.0))
+}
+
+/// `obstacles` with the radius of each standing one grown by the
+/// `body_room` of the machine of `constraints`.
+pub(crate) fn with_body_room(obstacles: &[Obstacle], constraints: &RobotConstraints) -> Vec<Obstacle> {
+    let room = body_room(constraints);
+    obstacles
+        .iter()
+        .map(|o| {
+            let mut o = o.clone();
+            if room > 0.0 && standing(&o) {
+                o.radius += room;
+            }
+            o
+        })
+        .collect()
+}
+
+/// Whether the prediction of `o` moves less than `CROSSING_MIN_SPEED` over
+/// its first second.
+fn standing(o: &Obstacle) -> bool {
+    match (modes_at(o, 0.0, 1.0).next(), modes_at(o, 1.0, 1.0).next()) {
+        (Some(now), Some(soon)) => (soon.x - now.x).hypot(soon.y - now.y) < CROSSING_MIN_SPEED,
+        _ => true,
+    }
+}
+
 impl Reference {
     pub fn lateral_at(&self, i: usize) -> f64 {
         self.lateral.get(i).copied().unwrap_or(1.0)

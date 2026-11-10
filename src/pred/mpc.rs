@@ -444,12 +444,13 @@ impl Controller for MpcFollower {
         let discs = footprint_discs(constraints);
         let obstacles: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
         let reach = discs.iter().map(|d| d.1).fold(0.0_f64, f64::max);
+        let kept = crate::pred::mppi::with_body_room(obstacles, constraints);
         let checker = CollisionChecker::new(world, constraints, 0.0);
         let grid = world.is_some_and(|w| w.grid.is_some());
         let (step_dt, weight, scale) = (cfg.dt, cfg.weight_obstacle, cfg.obstacle_scale);
         let barrier = |i: usize, x: f64, y: f64, yaw: f64| -> f64 {
             let t = (i + 1) as f64 * step_dt;
-            let mut c = obstacle_barrier(obstacles, &discs, t, step_dt, 1.0, (x, y, yaw), weight, scale).cost;
+            let mut c = obstacle_barrier(&kept, &discs, t, step_dt, 1.0, (x, y, yaw), weight, scale).cost;
             if grid && weight > 0.0 && scale > 0.0 {
                 c += weight * (-checker.grid_clearance(x, y, yaw) / scale).min(30.0).exp();
             }

@@ -531,6 +531,8 @@ impl Controller for IlqrFollower {
         let discs: Vec<(f64, f64)> = footprint.into_iter().map(|(off, r)| (off + model.axle_offset, r)).collect();
         let obstacles: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
         let guides = guided(&mut reference, obstacles, reach, cfg.dt, constraints);
+        let kept = crate::pred::mppi::with_body_room(obstacles, constraints);
+        let obstacles: &[Obstacle] = &kept;
         let problem = Problem { model: &model, reference: &reference, cfg: &cfg, obstacles, discs: discs.clone() };
         let x0 = State::new(model.x0, model.y0, model.yaw0, model.v0, model.vy0, model.steer0.clamp(-model.steer_bound(), model.steer_bound()));
         let warm: Vec<Control> = (0..n).map(|i| Control::new(self.steer[i], self.accel[i], self.accel_lat[i])).collect();
