@@ -159,3 +159,63 @@ fn stanley_stops_with_the_robot_at_the_goal() {
     let gap = end.point.distance_to_2d(final_wp.point);
     assert!(gap < 0.75, "stanley stopped {gap:.2} m from the goal");
 }
+
+#[test]
+fn every_path_follower_reverses_out_of_a_cusp() {
+    let mut legs: Vec<(f64, f64, f64)> = (0..17).map(|i| (1.5 * i as f64, 0.0, 1.0)).collect();
+    for i in 1..=16 {
+        let a = i as f64 * std::f64::consts::FRAC_PI_2 / 16.0;
+        legs.push((24.0 - 9.0 * a.sin(), 9.0 * (1.0 - a.cos()), -1.0));
+    }
+    for kind in [
+        TrackerKind::PurePursuit,
+        TrackerKind::Stanley,
+        TrackerKind::Lqr,
+        TrackerKind::RegulatedPursuit,
+        TrackerKind::VectorPursuit,
+        TrackerKind::Kanayama,
+    ] {
+        let mut path = Path::default();
+        for i in 0..legs.len() {
+            let (nx, ny, _) = legs[(i + 1).min(legs.len() - 1)];
+            let (px, py, _) = legs[i.saturating_sub(1)];
+            let back = if legs[i].2 < 0.0 { std::f64::consts::PI } else { 0.0 };
+            path.waypoints.push(pose(legs[i].0, legs[i].1, (ny - py).atan2(nx - px) + back));
+            path.speeds.push(legs[i].2);
+        }
+        let end = *path.waypoints.last().unwrap();
+        let mut tracker = Tracker::new(kind);
+        let mut cfg = ControllerConfig::default();
+        cfg.goal_tolerance = 0.75;
+        cfg.output_units = OutputUnits::Physical;
+        cfg.allow_reverse = true;
+        tracker.set_config(cfg);
+        let mut c = RobotConstraints::default();
+        c.wheelbase = 2.0;
+        c.max_steering_angle = 0.45;
+        c.max_linear_velocity = 2.0;
+        c.max_angular_velocity = 1.0;
+        tracker.init(c);
+        tracker.set_path(path);
+
+        let mut state = RobotState { pose: pose(0.0, 0.0, 0.0), allow_move: true, velocity_valid: true, ..Default::default() };
+        let (dt, mut worst) = (0.05, 0.0_f64);
+        for _ in 0..2400 {
+            let cmd = tracker.tick(&state, dt, None);
+            let yaw = state.pose.rotation.to_euler().yaw;
+            state.pose.point.x += cmd.linear_velocity * yaw.cos() * dt;
+            state.pose.point.y += cmd.linear_velocity * yaw.sin() * dt;
+            state.pose.rotation = Quaternion::from_euler(Euler::new(0.0, 0.0, yaw + cmd.angular_velocity * dt));
+            state.velocity.linear = cmd.linear_velocity;
+            state.velocity.angular = cmd.angular_velocity;
+            worst = worst.max(tracker.get_status().cross_track_error.abs());
+            if tracker.is_path_completed() || !cmd.valid {
+                break;
+            }
+        }
+        assert!(tracker.is_path_completed(), "{kind:?} never finished the reversing leg");
+        assert!(worst < 0.5, "{kind:?} strayed {worst:.2} m off the path");
+        let gap = state.pose.point.distance_to_2d(end.point);
+        assert!(gap < 1.0, "{kind:?} stopped {gap:.2} m from the end");
+    }
+}

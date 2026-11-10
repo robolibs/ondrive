@@ -688,16 +688,7 @@ pub(crate) fn prepare(
         return Err(VelocityCommand::invalid("no path"));
     };
     let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
-    // Within reach of a cusp, progress carries on along the leg leaving it.
-    if let Some(c) = crate::core::path::cusp_after(&base.path.speeds, &cursor.cum, proj.arc_length) {
-        let k = cursor.cum.partition_point(|s| *s < c - 1e-9).min(base.path.waypoints.len() - 1);
-        if base.path.waypoints[k].point.distance_to_2d(state.pose.point) < pos_tol.max(0.1) {
-            cursor.commit(k);
-            if let Some(next) = cursor.project(&base.path.waypoints, state.pose.point, k) {
-                proj = next;
-            }
-        }
-    }
+    proj = cursor.past_cusp(&base.path.waypoints, &base.path.speeds, state.pose.point, proj, pos_tol.max(0.1));
     base.path_index = proj.segment;
     if let Some(cmd) = base.arrival_on_path(state, goal, constraints, &proj, cursor.total_length()) {
         return Err(cmd);

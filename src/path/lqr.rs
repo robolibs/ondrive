@@ -13,14 +13,13 @@ use crate::core::kinematics::{
     path_speed, reverse_allowed,
 };
 use crate::core::math::normalize_angle;
-use crate::core::path::{cumulative_lengths, curvature_at_projection, project, speed_cap};
+use crate::core::path::{PathCursor, curvature_at_projection, cusp_after, speed_cap};
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use nalgebra::{Matrix2, Vector2};
 
 const DARE_MAX_ITERATIONS: usize = 20_000;
 const DARE_TOLERANCE: f64 = 1e-10;
 const MIN_LINEARISATION_SPEED: f64 = 0.1;
-const SEARCH_WINDOW: usize = 64;
 
 /// Iterate `P = A'PA - A'PB (R + B'PB)^-1 B'PA + Q` to a fixed point and
 /// return the gain `K = (R + B'PB)^-1 B'PA`.
@@ -54,8 +53,7 @@ pub fn lqr_gain(
 #[derive(Clone, Debug, Default)]
 pub struct LqrFollower {
     pub base: ControllerBase,
-    cum: Vec<f64>,
-    started: bool,
+    cursor: PathCursor,
     last_p: Option<Matrix2<f64>>,
 }
 
@@ -80,35 +78,24 @@ impl Controller for LqrFollower {
         if self.base.path.waypoints.is_empty() {
             return VelocityCommand::invalid("no path");
         }
-        if self.cum.len() != self.base.path.waypoints.len() {
-            self.cum = cumulative_lengths(&self.base.path.waypoints);
-            self.started = false;
+        if self.cursor.cum.len() != self.base.path.waypoints.len() {
+            self.cursor.set_path(&self.base.path.waypoints);
             self.base.path_index = 0;
         }
         let cfg = self.base.config.clone();
         let allow_reverse = reverse_allowed(&cfg, state);
         let yaw = state.pose.rotation.to_euler().yaw;
 
-        let window = if self.started {
-            SEARCH_WINDOW
-        } else {
-            usize::MAX
-        };
-        let Some(proj) = project(
-            &self.base.path.waypoints,
-            &self.cum,
-            state.pose.point,
-            self.base.path_index,
-            2,
-            window,
-        ) else {
+        let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
+        let Some(proj) = self.cursor.project(&self.base.path.waypoints, state.pose.point, self.base.path_index) else {
             return VelocityCommand::invalid("no path");
         };
-        self.started = true;
+        let proj = self.cursor.past_cusp(&self.base.path.waypoints, &self.base.path.speeds, state.pose.point, proj, pos_tol.max(0.1));
         self.base.path_index = proj.segment;
+        let stop_distance = cusp_after(&self.base.path.speeds, &self.cursor.cum, proj.arc_length)
+            .map_or(f64::INFINITY, |c| c - proj.arc_length);
 
-        let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
-        let length = self.cum.last().copied().unwrap_or(0.0);
+        let length = self.cursor.cum.last().copied().unwrap_or(0.0);
         if let Some(cmd) = self.base.arrival_on_path(state, goal, constraints, &proj, length) {
             return cmd;
         }
@@ -121,7 +108,7 @@ impl Controller for LqrFollower {
 
         if is_holonomic(constraints.steering_type) {
             self.base.status.mode = "lqr_holonomic".into();
-            let kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cum, &proj);
+            let kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &proj);
             let nominal = speed_cap(&self.base.path.speeds, &proj)
                 .map_or(constraints.max_linear_velocity, |v| {
                     v.min(constraints.max_linear_velocity)
@@ -158,7 +145,7 @@ impl Controller for LqrFollower {
             return finalize(0.0, omega, constraints, &cfg, allow_reverse, "Turning to align");
         }
 
-        let kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cum, &proj);
+        let kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &proj);
         let nominal = speed_cap(&self.base.path.speeds, &proj)
             .map_or(constraints.max_linear_velocity, |v| {
                 v.min(constraints.max_linear_velocity)
@@ -166,7 +153,7 @@ impl Controller for LqrFollower {
         let v = path_speed(
             nominal,
             kappa_path,
-            self.base.status.distance_to_goal,
+            self.base.status.distance_to_goal.min(stop_distance),
             pos_tol,
             cfg.kp_linear,
             constraints,
@@ -187,11 +174,10 @@ impl Controller for LqrFollower {
     }
 
     fn set_path(&mut self, path: Path) {
-        self.cum = cumulative_lengths(&path.waypoints);
+        self.cursor.set_path(&path.waypoints);
         self.base.path = path;
         self.base.path_index = 0;
         self.base.status = Default::default();
-        self.started = false;
         self.last_p = None;
     }
 

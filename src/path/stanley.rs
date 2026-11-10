@@ -11,13 +11,12 @@ use crate::core::kinematics::{
 };
 use crate::core::math::{heading_error, normalize_angle};
 use crate::core::path::{
-    PathProjection, cumulative_lengths, curvature_at_projection, project, speed_cap,
+    PathCursor, PathProjection, curvature_at_projection, project, speed_cap,
 };
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
 use std::f64::consts::PI;
 
-const SEARCH_WINDOW: usize = 64;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct StanleyConfig {
@@ -38,8 +37,7 @@ impl Default for StanleyConfig {
 pub struct StanleyFollower {
     pub base: ControllerBase,
     pub stanley_config: StanleyConfig,
-    cum: Vec<f64>,
-    started: bool,
+    cursor: PathCursor,
 }
 
 impl StanleyFollower {
@@ -47,23 +45,10 @@ impl StanleyFollower {
         Self::default()
     }
 
-    fn project_at(&mut self, p: Point) -> Option<PathProjection> {
-        let window = if self.started {
-            SEARCH_WINDOW
-        } else {
-            usize::MAX
-        };
-        let proj = project(
-            &self.base.path.waypoints,
-            &self.cum,
-            p,
-            self.base.path_index,
-            2,
-            window,
-        )?;
-        self.started = true;
-        self.base.path_index = proj.segment;
-        Some(proj)
+    /// Projection of `p` onto the leg from segment `from` up to waypoint
+    /// `leg_end`: an axle ahead of the robot never lands past the cusp.
+    fn project_on_leg(&self, p: Point, from: usize, leg_end: usize) -> Option<PathProjection> {
+        project(&self.base.path.waypoints, &self.cursor.cum, p, from, 0, leg_end.saturating_sub(from).max(1))
     }
 
     fn chase_goal(
@@ -131,9 +116,8 @@ impl Controller for StanleyFollower {
         if !(dt.is_finite() && dt > 0.0) {
             return VelocityCommand::invalid("dt must be positive and finite");
         }
-        if self.cum.len() != self.base.path.waypoints.len() {
-            self.cum = cumulative_lengths(&self.base.path.waypoints);
-            self.started = false;
+        if self.cursor.cum.len() != self.base.path.waypoints.len() {
+            self.cursor.set_path(&self.base.path.waypoints);
             self.base.path_index = 0;
         }
         let cfg = self.base.config.clone();
@@ -159,33 +143,27 @@ impl Controller for StanleyFollower {
             0.0
         };
         let (s, c) = yaw.sin_cos();
-        let front = Point::new(
-            state.pose.point.x + front_offset * c,
-            state.pose.point.y + front_offset * s,
-            0.0,
-        );
-
-        let Some(mut proj) = self.project_at(front) else {
+        let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
+        let Some(at_robot) = self.cursor.project(&self.base.path.waypoints, state.pose.point, self.base.path_index) else {
             return VelocityCommand::invalid("no path");
         };
-        let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
-        let length = self.cum.last().copied().unwrap_or(0.0);
-        let at_robot = if ackermann {
-            project(
-                &self.base.path.waypoints,
-                &self.cum,
-                state.pose.point,
-                self.base.path_index,
-                SEARCH_WINDOW,
-                SEARCH_WINDOW,
-            )
-        } else {
-            None
-        };
-        let arrival_proj = at_robot.as_ref().unwrap_or(&proj);
-        if let Some(cmd) = self.base.arrival_on_path(state, goal, constraints, arrival_proj, length) {
+        let at_robot =
+            self.cursor.past_cusp(&self.base.path.waypoints, &self.base.path.speeds, state.pose.point, at_robot, pos_tol.max(0.1));
+        self.base.path_index = at_robot.segment;
+        let length = self.cursor.total_length();
+        if let Some(cmd) = self.base.arrival_on_path(state, goal, constraints, &at_robot, length) {
             return cmd;
         }
+        let cusp = self.cursor.cusp_ahead(&self.base.path.speeds, at_robot.arc_length);
+        let leg_end = cusp.unwrap_or(self.base.path.waypoints.len() - 1);
+        let stop_distance = cusp.map_or(f64::INFINITY, |k| self.cursor.cum[k] - at_robot.arc_length);
+        let reverse = match crate::core::path::direction_at(&self.base.path.speeds, &at_robot) {
+            Some(d) => allow_reverse && d < 0,
+            None => allow_reverse && normalize_angle(at_robot.heading - yaw).abs() > PI / 2.0,
+        };
+        let axle = if reverse { -rear_offset } else { front_offset };
+        let reference = Point::new(state.pose.point.x + axle * c, state.pose.point.y + axle * s, 0.0);
+        let proj = self.project_on_leg(reference, at_robot.segment, leg_end).unwrap_or(at_robot);
 
         if is_holonomic(constraints.steering_type) {
             let theta_e = normalize_angle(proj.heading - yaw);
@@ -194,7 +172,7 @@ impl Controller for StanleyFollower {
             self.base.status.goal_reached = false;
             self.base.status.mode = "stanley_holonomic".into();
 
-            let kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cum, &proj);
+            let kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &proj);
             let nominal = speed_cap(&self.base.path.speeds, &proj)
                 .map_or(constraints.max_linear_velocity, |v| {
                     v.min(constraints.max_linear_velocity)
@@ -202,7 +180,7 @@ impl Controller for StanleyFollower {
             let forward = path_speed(
                 nominal,
                 kappa_path,
-                self.base.status.distance_to_goal,
+                self.base.status.distance_to_goal.min(stop_distance),
                 pos_tol,
                 cfg.kp_linear,
                 constraints,
@@ -212,24 +190,8 @@ impl Controller for StanleyFollower {
             return finalize_holonomic(vx, vy, omega, constraints, &cfg, "Following path");
         }
 
-        let mut theta_e = normalize_angle(proj.heading - yaw);
-        let mut direction = 1.0;
-        let reverse = match crate::core::path::direction_at(&self.base.path.speeds, &proj) {
-            Some(d) => allow_reverse && d < 0,
-            None => allow_reverse && theta_e.abs() > PI / 2.0,
-        };
-        if reverse {
-            direction = -1.0;
-            let rear = Point::new(
-                state.pose.point.x - rear_offset * c,
-                state.pose.point.y - rear_offset * s,
-                0.0,
-            );
-            if let Some(p) = self.project_at(rear) {
-                proj = p;
-            }
-            theta_e = normalize_angle(proj.heading - (yaw + PI));
-        }
+        let (direction, theta_e) =
+            if reverse { (-1.0, normalize_angle(proj.heading - (yaw + PI))) } else { (1.0, normalize_angle(proj.heading - yaw)) };
 
         self.base.status.cross_track_error = proj.lateral_error;
         self.base.status.heading_error = theta_e;
@@ -242,7 +204,7 @@ impl Controller for StanleyFollower {
             return finalize(0.0, omega, constraints, &cfg, allow_reverse, "Turning to align");
         }
 
-        let kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cum, &proj);
+        let kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &proj);
         let nominal = speed_cap(&self.base.path.speeds, &proj)
             .map_or(constraints.max_linear_velocity, |v| {
                 v.min(constraints.max_linear_velocity)
@@ -251,7 +213,7 @@ impl Controller for StanleyFollower {
             * path_speed(
                 nominal,
                 kappa_path,
-                self.base.status.distance_to_goal,
+                self.base.status.distance_to_goal.min(stop_distance),
                 pos_tol,
                 cfg.kp_linear,
                 constraints,
@@ -288,11 +250,10 @@ impl Controller for StanleyFollower {
     }
 
     fn set_path(&mut self, path: Path) {
-        self.cum = cumulative_lengths(&path.waypoints);
+        self.cursor.set_path(&path.waypoints);
         self.base.path = path;
         self.base.path_index = 0;
         self.base.status = Default::default();
-        self.started = false;
     }
 
     fn reset(&mut self) {

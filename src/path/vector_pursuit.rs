@@ -114,12 +114,13 @@ impl Controller for VectorPursuitFollower {
 
         let axle_offset = if is_ackermann(constraints.steering_type) { constraints.rear_wheelbase.max(0.0) } else { 0.0 };
         let rear = Point::new(state.pose.point.x - axle_offset * yaw.cos(), state.pose.point.y - axle_offset * yaw.sin(), 0.0);
+        let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
         let Some(proj) = self.cursor.project(&self.base.path.waypoints, rear, self.base.path_index) else {
             return VelocityCommand::invalid("no path");
         };
+        let proj = self.cursor.past_cusp(&self.base.path.waypoints, &self.base.path.speeds, rear, proj, pos_tol.max(0.1));
         self.base.path_index = proj.segment;
 
-        let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
         let length = self.cursor.total_length();
         if let Some(cmd) = self.base.arrival_on_path(state, goal, constraints, &proj, length) {
             self.lookahead_point = None;

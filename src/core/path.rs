@@ -225,8 +225,13 @@ pub fn sample(waypoints: &[Pose], cum: &[f64], s: f64) -> (Point, f64) {
     )
 }
 
+/// Heading change, radians, past which a waypoint counts as a cusp for curvature.
+const CUSP_TURN: f64 = 0.75 * std::f64::consts::PI;
+
 /// Signed curvature of the polyline around waypoint `idx` from the heading
-/// change between its adjacent segments (positive = turning left).
+/// change between its adjacent segments (positive = turning left). At a
+/// cusp, where the path turns back by more than `CUSP_TURN`, the change is
+/// taken against the reversed heading: the body keeps its heading through it.
 pub fn curvature_at(waypoints: &[Pose], cum: &[f64], idx: usize) -> f64 {
     let n = waypoints.len();
     if n < 3 || idx == 0 || idx + 1 >= n {
@@ -238,7 +243,9 @@ pub fn curvature_at(waypoints: &[Pose], cum: &[f64], idx: usize) -> f64 {
     if ds < 1e-9 {
         return 0.0;
     }
-    normalize_angle(h2 - h1) / ds
+    let turn = normalize_angle(h2 - h1);
+    let turn = if turn.abs() > CUSP_TURN { normalize_angle(turn - std::f64::consts::PI) } else { turn };
+    turn / ds
 }
 
 /// Curvature at the projection: interpolates between the curvature at the
@@ -349,5 +356,24 @@ impl PathCursor {
         let proj = project(waypoints, &self.cum, p, hint, lookback, window)?;
         self.started = true;
         Some(proj)
+    }
+
+    /// `proj` of `p`, carried onto the leg leaving the next cusp once `p`
+    /// comes within `reach` of it, with progress committed past the cusp.
+    pub fn past_cusp(&mut self, waypoints: &[Pose], speeds: &[f64], p: Point, proj: PathProjection, reach: f64) -> PathProjection {
+        let Some(k) = self.cusp_ahead(speeds, proj.arc_length) else {
+            return proj;
+        };
+        if waypoints[k].point.distance_to_2d(p) >= reach {
+            return proj;
+        }
+        self.commit(k);
+        self.project(waypoints, p, k).unwrap_or(proj)
+    }
+
+    /// Waypoint index of the first cusp after arc length `s`.
+    pub fn cusp_ahead(&self, speeds: &[f64], s: f64) -> Option<usize> {
+        let c = cusp_after(speeds, &self.cum, s)?;
+        Some(self.cum.partition_point(|x| *x < c - 1e-9).min(self.cum.len().saturating_sub(1)))
     }
 }

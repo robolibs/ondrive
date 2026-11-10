@@ -9,7 +9,7 @@ use crate::core::kinematics::{
 };
 use crate::core::math::{heading_error, normalize_angle};
 use crate::core::path::{
-    cumulative_lengths, curvature_at_projection, cusp_after, project, sample, speed_cap,
+    PathCursor, curvature_at_projection, cusp_after, sample, speed_cap,
 };
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
@@ -18,13 +18,11 @@ use std::f64::consts::PI;
 /// Lookahead shrink per unit of path curvature (metres of lookahead per
 /// unit curvature), keeping tight bends from being cut.
 const CURVATURE_LOOKAHEAD_GAIN: f64 = 0.5;
-const SEARCH_WINDOW: usize = 64;
 
 #[derive(Clone, Debug, Default)]
 pub struct PurePursuitFollower {
     pub base: ControllerBase,
-    cum: Vec<f64>,
-    started: bool,
+    cursor: PathCursor,
     lookahead_point: Option<Point>,
 }
 
@@ -95,9 +93,8 @@ impl Controller for PurePursuitFollower {
         if !(dt.is_finite() && dt > 0.0) {
             return VelocityCommand::invalid("dt must be positive and finite");
         }
-        if self.cum.len() != self.base.path.waypoints.len() {
-            self.cum = cumulative_lengths(&self.base.path.waypoints);
-            self.started = false;
+        if self.cursor.cum.len() != self.base.path.waypoints.len() {
+            self.cursor.set_path(&self.base.path.waypoints);
             self.base.path_index = 0;
         }
         let cfg = self.base.config.clone();
@@ -122,43 +119,31 @@ impl Controller for PurePursuitFollower {
             0.0,
         );
 
-        let window = if self.started {
-            SEARCH_WINDOW
-        } else {
-            usize::MAX
-        };
-        let Some(proj) = project(
-            &self.base.path.waypoints,
-            &self.cum,
-            rear,
-            self.base.path_index,
-            2,
-            window,
-        ) else {
+        let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
+        let Some(proj) = self.cursor.project(&self.base.path.waypoints, rear, self.base.path_index) else {
             return VelocityCommand::invalid("no path");
         };
-        self.started = true;
+        let proj = self.cursor.past_cusp(&self.base.path.waypoints, &self.base.path.speeds, rear, proj, pos_tol.max(0.1));
         self.base.path_index = proj.segment;
 
-        let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
-        let length = self.cum.last().copied().unwrap_or(0.0);
+        let length = self.cursor.cum.last().copied().unwrap_or(0.0);
         if let Some(cmd) = self.base.arrival_on_path(state, goal, constraints, &proj, length) {
             self.lookahead_point = None;
             return cmd;
         }
 
         let base_lookahead = cfg.lookahead_distance.max(1e-3);
-        let kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cum, &proj).abs();
+        let kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &proj).abs();
         let lookahead = ((base_lookahead + cfg.lookahead_time.max(0.0) * state.velocity.linear.abs())
             / (1.0 + CURVATURE_LOOKAHEAD_GAIN * kappa_path * base_lookahead))
             .clamp(0.5 * base_lookahead, 3.0 * base_lookahead);
         let mut s_target = proj.arc_length + lookahead;
         let mut stop_distance = self.base.status.distance_to_goal;
-        if let Some(cusp) = cusp_after(&self.base.path.speeds, &self.cum, proj.arc_length) {
+        if let Some(cusp) = cusp_after(&self.base.path.speeds, &self.cursor.cum, proj.arc_length) {
             s_target = s_target.min(cusp);
             stop_distance = stop_distance.min((cusp - proj.arc_length).max(0.0));
         }
-        let (target, _) = sample(&self.base.path.waypoints, &self.cum, s_target);
+        let (target, _) = sample(&self.base.path.waypoints, &self.cursor.cum, s_target);
         self.lookahead_point = Some(target);
 
         let dx = target.x - rear.x;
@@ -232,11 +217,10 @@ impl Controller for PurePursuitFollower {
     }
 
     fn set_path(&mut self, path: Path) {
-        self.cum = cumulative_lengths(&path.waypoints);
+        self.cursor.set_path(&path.waypoints);
         self.base.path = path;
         self.base.path_index = 0;
         self.base.status = Default::default();
-        self.started = false;
         self.lookahead_point = None;
     }
 

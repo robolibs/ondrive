@@ -10,7 +10,8 @@
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::{actuation_delay, finalize, finalize_holonomic, is_holonomic, path_speed};
 use crate::core::math::{normalize_angle, yaw_of};
-use crate::core::path::{PathCursor, curvature_at_projection, sample, speed_cap};
+use crate::core::path::{PathCursor, curvature_at_projection, cusp_after, direction_at, sample, speed_cap};
+use std::f64::consts::PI;
 use crate::point::PoseRegulatorFollower;
 use crate::pred::mppi::prepare;
 use crate::types::{
@@ -91,12 +92,18 @@ impl Controller for KanayamaFollower {
                 (s.pose.point.x, s.pose.point.y, yaw_of(&s.pose), v_r, if s.finished { 0.0 } else { s.yaw_rate })
             }
             None => {
-                let (p, h) = sample(&self.base.path.waypoints, &self.cursor.cum, prep.proj.arc_length + PREVIEW);
+                let s = prep.proj.arc_length;
+                let cusp = cusp_after(&self.base.path.speeds, &self.cursor.cum, s).unwrap_or(f64::INFINITY);
+                let (p, h) = sample(&self.base.path.waypoints, &self.cursor.cum, (s + PREVIEW).min(cusp));
                 let kappa = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &prep.proj);
                 let nominal = speed_cap(&self.base.path.speeds, &prep.proj)
                     .map_or(constraints.max_linear_velocity, |s| s.min(constraints.max_linear_velocity));
-                let v_r = path_speed(nominal, kappa, self.base.status.distance_to_goal, prep.pos_tol, cfg.kp_linear, constraints);
-                (p.x, p.y, h, v_r, v_r * kappa)
+                let stop = self.base.status.distance_to_goal.min(cusp - s);
+                let v_r = path_speed(nominal, kappa, stop, prep.pos_tol, cfg.kp_linear, constraints);
+                let back = prep.allow_reverse && direction_at(&self.base.path.speeds, &prep.proj).is_some_and(|d| d < 0);
+                // A reversing leg is tracked by the body facing against its
+                // direction of travel, at negative speed.
+                if back { (p.x, p.y, normalize_angle(h + PI), -v_r, v_r * kappa) } else { (p.x, p.y, h, v_r, v_r * kappa) }
             }
         };
 
