@@ -726,6 +726,7 @@ impl Tracker {
             let (mut idx, mut cap) = target(segment, proj.arc_length + ahead);
             if cap < n - 1 && idx == cap && path.waypoints[cap].point.distance_to_2d(state.pose.point) < tol {
                 segment = cap;
+                self.cursor.floor = self.cursor.floor.max(cap);
                 (idx, cap) = target(segment, cum[segment] + ahead);
             }
             self.projection_segment = segment;
@@ -861,8 +862,8 @@ impl Tracker {
     }
 
     /// Densify the current path by inserting interpolated poses so that
-    /// no segment is longer than `max_segment_m`. Linear interpolation for
-    /// positions, slerp for orientations. The controller receives the
+    /// no segment is longer than `max_segment_m`: a spline across bends,
+    /// straight at corners, slerp for orientations. The controller receives the
     /// updated path and its path index is reset to 0.
     pub fn smoothen(&mut self, max_segment_m: f64) {
         if let Some(lap) = &self.lap {
@@ -886,7 +887,37 @@ impl Tracker {
     }
 }
 
-fn densify_path(waypoints: &[Pose], speeds: &[f64], max_segment_m: f64) -> (Vec<Pose>, Vec<f64>) {
+/// Turn, radians, below which a waypoint is a bend smoothed through rather
+/// than a corner (or cusp) kept sharp.
+const SMOOTH_TURN: f64 = 0.5;
+
+/// Turn of the path at `b`, between `a` before it and `c` after it, in the
+/// ground plane.
+fn turn_at(a: Point, b: Point, c: Point) -> f64 {
+    crate::core::math::normalize_angle((c.y - b.y).atan2(c.x - b.x) - (b.y - a.y).atan2(b.x - a.x)).abs()
+}
+
+/// Point at `t` in [0, 1] between `p1` and `p2` on the centripetal
+/// Catmull-Rom spline through `p0..p3`.
+fn catmull_rom(p0: Point, p1: Point, p2: Point, p3: Point, t: f64) -> Point {
+    let knot = |a: Point, b: Point| ((a.x - b.x).powi(2) + (a.y - b.y).powi(2) + (a.z - b.z).powi(2)).sqrt().sqrt().max(1e-6);
+    let (t1, t2) = (knot(p0, p1), knot(p0, p1) + knot(p1, p2));
+    let t3 = t2 + knot(p2, p3);
+    let u = t1 + t * (t2 - t1);
+    let lerp = |a: Point, b: Point, ta: f64, tb: f64| {
+        let w = (u - ta) / (tb - ta);
+        Point::new(a.x + w * (b.x - a.x), a.y + w * (b.y - a.y), a.z + w * (b.z - a.z))
+    };
+    let (a1, a2, a3) = (lerp(p0, p1, 0.0, t1), lerp(p1, p2, t1, t2), lerp(p2, p3, t2, t3));
+    lerp(lerp(a1, a2, 0.0, t2), lerp(a2, a3, t1, t3), t1, t2)
+}
+
+/// `waypoints` with points added so no segment is longer than
+/// `max_segment_m`: along a spline across bends, straight at corners. A
+/// `closed` path is a ring: its ends bend into each other and the segment
+/// closing it is filled too, its first point repeated at the end only when
+/// it already was.
+fn densify_path(waypoints: &[Pose], speeds: &[f64], max_segment_m: f64, closed: bool) -> (Vec<Pose>, Vec<f64>) {
     let mut out = Vec::with_capacity(waypoints.len() * 2);
     let mut out_speeds = Vec::new();
     let has_speeds = speeds.len() == waypoints.len();
@@ -894,35 +925,60 @@ fn densify_path(waypoints: &[Pose], speeds: &[f64], max_segment_m: f64) -> (Vec<
     if has_speeds {
         out_speeds.push(speeds[0]);
     }
-    for i in 0..waypoints.len() - 1 {
+    let n_wp = waypoints.len();
+    let repeated = closed && n_wp > 2 && waypoints[0].point.distance_to_2d(waypoints[n_wp - 1].point) < 1e-9;
+    let m = if repeated { n_wp - 1 } else { n_wp };
+    let ring = closed && m > 2;
+    let reflect = |a: Point, b: Point| Point::new(2.0 * a.x - b.x, 2.0 * a.y - b.y, 2.0 * a.z - b.z);
+    let at = |k: isize| -> Option<Point> {
+        if ring {
+            Some(waypoints[k.rem_euclid(m as isize) as usize].point)
+        } else {
+            (k >= 0 && (k as usize) < n_wp).then(|| waypoints[k as usize].point)
+        }
+    };
+    let bend_at = |k: isize| match (at(k - 1), at(k), at(k + 1)) {
+        (Some(a), Some(b), Some(c)) => turn_at(a, b, c) < SMOOTH_TURN,
+        _ => true,
+    };
+    let segments = if ring { m } else { n_wp - 1 };
+    for i in 0..segments {
+        let next = if ring { (i + 1) % m } else { i + 1 };
         let start = waypoints[i];
-        let end = waypoints[i + 1];
+        let end = waypoints[next];
         let dx = end.point.x - start.point.x;
         let dy = end.point.y - start.point.y;
         let dz = end.point.z - start.point.z;
         let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+        let k = i as isize;
+        let bend = bend_at(k) && bend_at(k + 1);
+        let before = at(k - 1).unwrap_or_else(|| reflect(start.point, end.point));
+        let after = at(k + 2).unwrap_or_else(|| reflect(end.point, start.point));
 
         let n = ((dist / max_segment_m).ceil() as usize).max(1);
         for j in 1..n {
             let t = j as f64 / n as f64;
-            let p = Point::new(
-                start.point.x + t * dx,
-                start.point.y + t * dy,
-                start.point.z + t * dz,
-            );
+            let p = if bend {
+                catmull_rom(before, start.point, end.point, after, t)
+            } else {
+                Point::new(start.point.x + t * dx, start.point.y + t * dy, start.point.z + t * dz)
+            };
             let rot = slerp(start.rotation, end.rotation, t);
             out.push(Pose {
                 point: p,
                 rotation: rot,
             });
             if has_speeds {
-                let magnitude = speeds[i].abs() + t * (speeds[i + 1].abs() - speeds[i].abs());
-                out_speeds.push(if speeds[i + 1] < 0.0 { -magnitude } else { magnitude });
+                let magnitude = speeds[i].abs() + t * (speeds[next].abs() - speeds[i].abs());
+                out_speeds.push(if speeds[next] < 0.0 { -magnitude } else { magnitude });
             }
+        }
+        if next == 0 && !repeated {
+            continue;
         }
         out.push(end);
         if has_speeds {
-            out_speeds.push(speeds[i + 1]);
+            out_speeds.push(speeds[next]);
         }
     }
     (out, out_speeds)
@@ -970,7 +1026,7 @@ pub fn smoothen_path(path: &mut Path, max_segment_m: f64) {
     if path.waypoints.len() < 2 || max_segment_m <= 0.0 {
         return;
     }
-    let (wps, speeds) = densify_path(&path.waypoints, &path.speeds, max_segment_m);
+    let (wps, speeds) = densify_path(&path.waypoints, &path.speeds, max_segment_m, path.is_closed);
     path.waypoints = wps;
     if !speeds.is_empty() {
         path.speeds = speeds;
@@ -1394,6 +1450,55 @@ impl Lap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn flat(x: f64, y: f64) -> Pose {
+        Pose { point: Point::new(x, y, 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, 0.0)) }
+    }
+
+    #[test]
+    fn smoothing_a_coarse_arc_follows_the_arc_with_even_curvature() {
+        let radius = 9.0;
+        let arc: Vec<Pose> = (0..=16)
+            .map(|i| {
+                let a = i as f64 * std::f64::consts::FRAC_PI_2 / 16.0;
+                flat(radius * a.sin(), radius * (1.0 - a.cos()))
+            })
+            .collect();
+        let mut path = Path { waypoints: arc, speeds: Vec::new(), is_closed: false };
+        smoothen_path(&mut path, 0.35);
+        let off = path.waypoints.iter().map(|w| (w.point.x.hypot(w.point.y - radius) - radius).abs()).fold(0.0_f64, f64::max);
+        assert!(off < 0.02, "smoothed points sit {off:.3} m off the arc");
+        let cum = cumulative_lengths(&path.waypoints);
+        let inner = 4..path.waypoints.len() - 4;
+        let kappa: Vec<f64> = inner.map(|i| crate::core::path::curvature_at(&path.waypoints, &cum, i)).collect();
+        let spread = kappa.iter().map(|k| (k - 1.0 / radius).abs()).fold(0.0_f64, f64::max);
+        assert!(spread < 0.03, "curvature strays {spread:.3} from 1/{radius}");
+    }
+
+    #[test]
+    fn smoothing_a_closed_ring_bends_through_its_seam() {
+        let radius = 7.5;
+        let ring: Vec<Pose> = (0..48)
+            .map(|i| {
+                let a = i as f64 * std::f64::consts::TAU / 48.0;
+                flat(radius * a.sin(), radius * (1.0 - a.cos()))
+            })
+            .collect();
+        let mut path = Path { waypoints: ring, speeds: Vec::new(), is_closed: true };
+        smoothen_path(&mut path, 0.25);
+        let off = path.waypoints.iter().map(|w| (w.point.x.hypot(w.point.y - radius) - radius).abs()).fold(0.0_f64, f64::max);
+        assert!(off < 0.01, "smoothed ring sits {off:.3} m off the circle");
+        let (first, last) = (path.waypoints[0].point, path.waypoints.last().unwrap().point);
+        let gap = first.distance_to_2d(last);
+        assert!(gap > 1e-6 && gap < 0.26, "the ring's closing gap is {gap:.3} m");
+    }
+
+    #[test]
+    fn smoothing_keeps_a_square_corner_sharp() {
+        let mut path = Path { waypoints: vec![flat(0.0, 0.0), flat(10.0, 0.0), flat(10.0, 10.0)], speeds: Vec::new(), is_closed: false };
+        smoothen_path(&mut path, 0.5);
+        assert!(path.waypoints.iter().all(|w| w.point.y.abs() < 1e-9 || (w.point.x - 10.0).abs() < 1e-9));
+    }
 
     #[test]
     fn a_path_follower_given_only_a_goal_plans_a_path_to_it() {
