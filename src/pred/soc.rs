@@ -182,8 +182,13 @@ impl Default for SocFollower {
     }
 }
 
+/// Fraction (one in this many) of the guides drawn with no obstacles about,
+/// where there is only the path to find.
+const CLEAR_GUIDE_SHARE: usize = 4;
+
 /// Central-difference gradient of the rollout cost with respect to the
-/// flattened `[s0, a0, al0, s1, a1, al1, ...]` control vector.
+/// flattened `[s0, a0, al0, s1, a1, al1, ...]` control vector; the lateral
+/// channel, which moves only a holonomic platform, is left at zero.
 fn cost_gradient(
     model: &Model,
     reference: &Track,
@@ -196,30 +201,27 @@ fn cost_gradient(
     let n = steer.len();
     let eps = 1e-3;
     let mut grad = vec![0.0; 3 * n];
+    let channels = if model.holonomic { 3 } else { 2 };
     for t in 0..n {
-        let o = steer[t];
-        steer[t] = o + eps;
-        let (cp, _) = reference.rollout(model, steer, accel, accel_lat, w, extra, false);
-        steer[t] = o - eps;
-        let (cm, _) = reference.rollout(model, steer, accel, accel_lat, w, extra, false);
-        steer[t] = o;
-        grad[3 * t] = (cp - cm) / (2.0 * eps);
-
-        let o = accel[t];
-        accel[t] = o + eps;
-        let (cp, _) = reference.rollout(model, steer, accel, accel_lat, w, extra, false);
-        accel[t] = o - eps;
-        let (cm, _) = reference.rollout(model, steer, accel, accel_lat, w, extra, false);
-        accel[t] = o;
-        grad[3 * t + 1] = (cp - cm) / (2.0 * eps);
-
-        let o = accel_lat[t];
-        accel_lat[t] = o + eps;
-        let (cp, _) = reference.rollout(model, steer, accel, accel_lat, w, extra, false);
-        accel_lat[t] = o - eps;
-        let (cm, _) = reference.rollout(model, steer, accel, accel_lat, w, extra, false);
-        accel_lat[t] = o;
-        grad[3 * t + 2] = (cp - cm) / (2.0 * eps);
+        for channel in 0..channels {
+            let mut cost_at = |by: f64| {
+                let control = match channel {
+                    0 => &mut steer[t],
+                    1 => &mut accel[t],
+                    _ => &mut accel_lat[t],
+                };
+                let o = *control;
+                *control = o + by;
+                let (c, _) = reference.rollout(model, steer, accel, accel_lat, w, extra, false);
+                match channel {
+                    0 => steer[t] = o,
+                    1 => accel[t] = o,
+                    _ => accel_lat[t] = o,
+                }
+                c
+            };
+            grad[3 * t + channel] = (cost_at(eps) - cost_at(-eps)) / (2.0 * eps);
+        }
     }
     grad
 }
@@ -512,7 +514,7 @@ impl Controller for SocFollower {
             &mut self.mean_accel_lateral,
         );
 
-        let k_guide = cfg.guide_samples.max(1);
+        let k_guide = if obstacles.is_empty() { (cfg.guide_samples / CLEAR_GUIDE_SHARE).max(DETOUR_GUIDE + 1) } else { cfg.guide_samples }.max(1);
         let guide_std_s = cfg.initial_steer_variance.max(1e-12).sqrt();
         let guide_std_a = cfg.acceleration_noise.max(1e-6);
         let rho = cfg.noise_correlation;
