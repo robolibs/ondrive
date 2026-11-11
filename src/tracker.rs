@@ -685,7 +685,11 @@ impl Tracker {
     /// the traffic crossing the path ahead (`give_way_ahead` at the speed
     /// the robot cruises at); `cmd` itself otherwise.
     fn give_way(&self, mut cmd: VelocityCommand, state: &RobotState, world: Option<&WorldConstraints>) -> VelocityCommand {
-        if self.kind.avoids_obstacles() || !cmd.valid || self.trajectory.is_some() || self.lap.is_some() {
+        // A point controller blind to obstacles gives way to the traffic its
+        // detour does not round: all that crosses, unless it turns in place.
+        let blind = matches!(self.kind, TrackerKind::Pid | TrackerKind::Carrot | TrackerKind::PoseReach | TrackerKind::PoseRegulator)
+            && !can_turn_in_place(self.constraints.steering_type);
+        if (self.kind.avoids_obstacles() && !blind) || !cmd.valid || self.trajectory.is_some() || self.lap.is_some() {
             return cmd;
         }
         let (Some(world), Some(path)) = (world, self.path.as_ref()) else {
