@@ -230,9 +230,9 @@ impl Controller for FrenetFollower {
         let kappa0 = curvature_at_projection(waypoints, cum, &at);
         let d0 = at.lateral_error;
         // The rear axle's sideslip, low-passed: the angle its travel makes
-        // with the heading.
+        // with the heading; a lateral speed of exactly zero is not measured.
         let forward = if back { -state.velocity.linear } else { state.velocity.linear };
-        if state.velocity_valid && forward > SLIP_SPEED {
+        if state.velocity_valid && forward > SLIP_SPEED && state.velocity.lateral != 0.0 {
             let side = if back { -1.0 } else { 1.0 } * (state.velocity.lateral - state.velocity.angular * axle);
             let gain = (dt / SLIP_TIME).min(1.0);
             self.sideslip = (self.sideslip + gain * (side.atan2(forward) - self.sideslip)).clamp(-MAX_SLIP, MAX_SLIP);

@@ -32,7 +32,8 @@ pub struct SlipAdaptiveConfig {
     pub observer_time: f64,
     /// Largest sideslip angle, radians, the observer reports.
     pub max_sideslip: f64,
-    /// Forward speed, m/s, below which the observer holds its estimates.
+    /// Forward speed, m/s, below which the observer holds its estimates; it
+    /// holds them too while the lateral speed reads exactly zero, unmeasured.
     pub observer_speed: f64,
 }
 
@@ -69,7 +70,7 @@ impl SlipAdaptiveFollower {
     fn observe(&mut self, state: &RobotState, constraints: &RobotConstraints, direction: f64, dt: f64) {
         let cfg = &self.slip_config;
         let forward = direction * state.velocity.linear;
-        if !state.velocity_valid || forward < cfg.observer_speed {
+        if !state.velocity_valid || forward < cfg.observer_speed || state.velocity.lateral == 0.0 {
             return;
         }
         let rear = if is_ackermann(constraints.steering_type) { constraints.rear_wheelbase.max(0.0) } else { 0.0 };
