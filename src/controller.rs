@@ -134,6 +134,14 @@ pub struct GoalCheck {
     pub orientation_tolerance: f64,
 }
 
+/// Share of the position tolerance within which a robot has arrived; between
+/// it and the tolerance, it has once it stops closing in.
+const ARRIVED_SHARE: f64 = 0.25;
+/// Metres a tick the distance to the goal must shrink by, or m/s the robot
+/// must head for it at, to count as closing in.
+const CLOSING_STEP: f64 = 1e-3;
+const CLOSING_SPEED: f64 = 0.02;
+
 /// Share of top speed under which a robot counts as stopped at a cusp.
 const STOPPED_AT_CUSP: f64 = 0.1;
 
@@ -185,6 +193,26 @@ pub fn check_goal(current: &Pose, goal: &Goal, cfg: &ControllerConfig) -> GoalCh
         position_tolerance: pos_tol,
         orientation_tolerance: ang_tol,
     }
+}
+
+/// Whether a robot at `state`, `check`ed against `goal` and `previous`
+/// metres from it a tick before, is there: inside the position tolerance,
+/// and within `ARRIVED_SHARE` of it or no longer closing in.
+pub fn settled(check: &GoalCheck, state: &RobotState, goal: &Goal, previous: f64) -> bool {
+    check.position_ok && (check.distance < ARRIVED_SHARE * check.position_tolerance || !closing_in(state, goal, previous, check.distance))
+}
+
+/// Whether the robot at `state` still nears `goal`: by its measured
+/// velocity, or without one, by its distance shrinking from `previous`.
+fn closing_in(state: &RobotState, goal: &Goal, previous: f64, distance: f64) -> bool {
+    if !state.velocity_valid {
+        return distance < previous - CLOSING_STEP;
+    }
+    let yaw = yaw_of(&state.pose);
+    let (dx, dy) = (goal.target_pose.point.x - state.pose.point.x, goal.target_pose.point.y - state.pose.point.y);
+    let (v, vy) = (state.velocity.linear, state.velocity.lateral);
+    let (vx, vy) = (v * yaw.cos() - vy * yaw.sin(), v * yaw.sin() + vy * yaw.cos());
+    (vx * dx + vy * dy) > CLOSING_SPEED * distance.max(1e-9)
 }
 
 /// Kept for API compatibility: `(reached, distance, |yaw error|)` using the
@@ -274,10 +302,11 @@ impl ControllerBase {
         position_allowed: bool,
     ) -> Option<VelocityCommand> {
         let check = check_goal(&state.pose, goal, &self.config);
+        let previous = self.status.distance_to_goal;
         self.status.distance_to_goal = check.distance;
         self.status.heading_error = check.yaw_error;
 
-        let position_ok = (check.position_ok && position_allowed) || extra_position_ok;
+        let position_ok = (position_allowed && settled(&check, state, goal, previous)) || extra_position_ok;
         if !position_ok || pass_through(goal) > 0.0 {
             self.status.goal_reached = false;
             return None;

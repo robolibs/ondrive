@@ -5,8 +5,8 @@
 
 use crate::controller::{Controller, ControllerBase, effective_tolerances, pass_through};
 use crate::core::kinematics::{
-    actuation_delay, axle_offset, can_turn_in_place, finalize, finalize_holonomic, is_holonomic, max_curvature, reverse_allowed,
-    speed_bounds,
+    actuation_delay, axle_offset, can_turn_in_place, finalize, finalize_holonomic, is_holonomic, max_curvature, path_speed,
+    reverse_allowed, speed_bounds,
 };
 use crate::core::math::{heading_error, normalize_angle, yaw_of};
 use crate::core::obstacles::CollisionChecker;
@@ -193,9 +193,10 @@ impl Controller for DwaFollower {
         let y0 = state.pose.point.y;
         let yaw0 = state.pose.rotation.to_euler().yaw;
         let course = normalize_angle(yaw0 + bearing);
+        let (pos_tol, _) = effective_tolerances(goal, &cfg);
         let free_v = preferred
             .min(v_hi)
-            .min((cfg.kp_linear.max(0.1) * dist_to_goal).max(0.15 * v_hi).max(passing));
+            .min(path_speed(v_hi, 0.0, dist_to_goal, pos_tol, cfg.kp_linear, constraints).max(passing));
         let share = give_way(world, constraints, (x0, y0, course), free_v, v_now.abs());
         let v_min = (v_now - a_lin * dt).max(v_lo);
         let v_max = (v_now + a_lin * dt).min(v_hi).min(cruise * share).max(v_min);

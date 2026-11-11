@@ -5,12 +5,12 @@
 //! switching runs at the cusps. Replans when the robot drifts off the
 //! curve or the goal changes.
 
-use crate::controller::{Controller, ControllerBase, check_goal, pass_through};
+use crate::controller::{Controller, ControllerBase, check_goal, pass_through, settled};
 use crate::core::curves::{CurvePath, dubins_all, reeds_shepp_all};
 use crate::core::obstacles::CollisionChecker;
 use crate::core::kinematics::{
     can_turn_in_place, finalize, holonomic_point_command, is_ackermann, is_holonomic,
-    max_curvature, reverse_allowed, stop,
+    max_curvature, path_speed, reverse_allowed, stop,
 };
 use crate::core::math::{normalize_angle, yaw_of};
 use crate::path::PurePursuitFollower;
@@ -361,9 +361,10 @@ impl Controller for PoseReachFollower {
             return VelocityCommand::invalid("dt must be positive and finite");
         }
         let check = check_goal(&state.pose, goal, &self.base.config);
+        let previous = self.base.status.distance_to_goal;
         self.base.status.distance_to_goal = check.distance;
         self.base.status.heading_error = check.yaw_error;
-        if check.reached && pass_through(goal) == 0.0 {
+        if check.reached && settled(&check, state, goal, previous) && pass_through(goal) == 0.0 {
             self.base.status.goal_reached = true;
             self.base.status.mode = "stopped".into();
             return stop("Goal reached");
@@ -463,13 +464,21 @@ impl Controller for PoseReachFollower {
         if !cmd.valid {
             return cmd;
         }
-        let mut omega = cmd.angular_velocity;
+        let (mut v, mut omega) = (cmd.linear_velocity, cmd.angular_velocity);
+        // On the last run the robot slows to stop at the goal, turning the same.
+        if last && v.abs() > 1e-9 {
+            let cfg = &self.base.config;
+            let cap = path_speed(v.abs(), 0.0, check.distance, check.position_tolerance, cfg.kp_linear, constraints);
+            let scale = (cap / v.abs()).min(1.0);
+            v *= scale;
+            omega *= scale;
+        }
         let approach = self.lookahead();
         if last && check.distance < approach {
             let blend = 1.0 - check.distance / approach;
             omega += blend * self.pose_config.k_final_heading * check.yaw_error;
         }
-        finalize(cmd.linear_velocity, omega, constraints, &self.base.config, reverse, &cmd.status_message)
+        finalize(v, omega, constraints, &self.base.config, reverse, &cmd.status_message)
     }
 
     fn set_path(&mut self, _path: Path) {

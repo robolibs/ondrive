@@ -6,7 +6,7 @@
 //! approached in reverse when allowed. A platform that cannot turn in
 //! place is brought to the pose along planned curves (`PoseReachFollower`).
 
-use crate::controller::{Controller, ControllerBase, check_goal, pass_through};
+use crate::controller::{Controller, ControllerBase, check_goal, pass_through, settled};
 use crate::core::kinematics::{
     can_turn_in_place, finalize, finalize_holonomic, is_holonomic, reverse_allowed, stop,
     world_to_body,
@@ -56,10 +56,11 @@ impl Controller for PoseRegulatorFollower {
         let cfg = self.base.config.clone();
         let allow_reverse = reverse_allowed(&cfg, state);
         let check = check_goal(&state.pose, goal, &cfg);
+        let previous = self.base.status.distance_to_goal;
         self.base.status.distance_to_goal = check.distance;
         self.base.status.heading_error = check.yaw_error;
         self.base.status.cross_track_error = 0.0;
-        if check.reached && pass_through(goal) == 0.0 {
+        if check.reached && settled(&check, state, goal, previous) && pass_through(goal) == 0.0 {
             self.base.status.goal_reached = true;
             self.base.status.mode = "stopped".into();
             return stop("Goal reached");
