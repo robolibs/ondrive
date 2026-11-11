@@ -7,7 +7,7 @@ use crate::core::kinematics::{
     path_to_body,
     can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, holonomic_point_command,
     axle_point_offset, braked_for_bends, followable, is_ackermann, is_holonomic, path_speed, reverse_allowed,
-    steering_limit,
+    curvature_to_steering, steering_limit,
     steering_to_curvature,
     wheelbase,
 };
@@ -235,7 +235,10 @@ impl Controller for StanleyFollower {
 
         let omega = if ackermann {
             let dmax = steering_limit(constraints);
-            let delta = (direction * raw).clamp(-dmax, dmax);
+            // Reversing, the axle tracked is not the steered one, so the
+            // bend's own steering is fed forward.
+            let bend_steer = if reverse { curvature_to_steering(followable(kappa_path, constraints), constraints) } else { 0.0 };
+            let delta = (direction * (raw + bend_steer)).clamp(-dmax, dmax);
             v * steering_to_curvature(delta, constraints)
         } else {
             cfg.kp_angular.max(0.1) * raw
