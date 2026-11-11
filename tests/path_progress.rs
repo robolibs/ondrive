@@ -272,3 +272,16 @@ fn predictive_controllers_reverse_through_a_cusp() {
         assert!(end.distance_to_2d(Point::new(5.0, 3.0, 0.0)) < 0.5, "{kind:?}: ended at {end:?}");
     }
 }
+
+#[test]
+fn followers_stop_once_well_past_an_open_path_end() {
+    for kind in [TrackerKind::PurePursuit, TrackerKind::Stanley, TrackerKind::Frenet, TrackerKind::VelocityObstacle, TrackerKind::Mppi] {
+        let mut t = tracker(kind, false, 0.2);
+        t.set_path(polyline(&[(0.0, 0.0), (6.0, 0.0)], false));
+        let state = RobotState { pose: pose(10.0, 0.5, 0.0), allow_move: true, ..Default::default() };
+        let cmd = t.tick(&state, 0.05, None);
+        assert!(cmd.valid, "{kind:?}: {}", cmd.status_message);
+        assert!(cmd.linear_velocity.abs() < 1e-9, "{kind:?}: drove on at {:.2} m/s past the end", cmd.linear_velocity);
+        assert!(!t.is_path_completed(), "{kind:?}: counted 4 m past the end as arrived");
+    }
+}

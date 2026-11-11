@@ -225,7 +225,9 @@ impl ControllerBase {
 
     /// `arrival` for a path follower projected at `proj` on its path of
     /// `path_length` metres. A goal at the path end counts as reached only
-    /// once the rest of the path is about as short as the way to the goal.
+    /// once the rest of the path is about as short as the way to the goal,
+    /// or within twice the tolerance past the path's end; further than a
+    /// lookahead past an open path's end, the robot stops there.
     pub fn arrival_on_path(
         &mut self,
         state: &RobotState,
@@ -236,6 +238,15 @@ impl ControllerBase {
     ) -> Option<VelocityCommand> {
         let (pos_tol, _) = effective_tolerances(goal, &self.config);
         let passed_end = proj.beyond_end && proj.distance < 2.0 * pos_tol;
+        let overshoot = (proj.distance.powi(2) - proj.lateral_error.powi(2)).max(0.0).sqrt();
+        let far_past_end = proj.beyond_end
+            && !self.path.is_closed
+            && overshoot > self.config.lookahead_distance.max(2.0 * pos_tol);
+        if far_past_end && !passed_end {
+            self.status.goal_reached = false;
+            self.status.mode = "past_end".into();
+            return Some(stop("Past the end of the path"));
+        }
         let goal_at_end = self
             .path
             .waypoints
