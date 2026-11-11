@@ -52,7 +52,8 @@ pub struct MppiConfig {
     pub turn_first_release_deg: f64,
 
     /// Distance before the path end and each cusp over which the target
-    /// speed slows to zero.
+    /// speed slows to zero, and after each cusp over which a timed reference
+    /// gathers again.
     pub decel_distance: f64,
 
     /// Share of each noise step carried over from the previous one.
@@ -382,8 +383,9 @@ pub(crate) fn build_reference(
         let signed = signed_speed_at(speeds, cum, s);
         let reverse = signed.is_some_and(|v| v < 0.0);
         let stop = crate::core::path::cusp_after(speeds, cum, s).unwrap_or(total).min(total) - s;
+        let since = crate::core::path::cusp_before(speeds, cum, s).map_or(f64::INFINITY, |c| s - c);
         let taper = if decel_distance > 1e-6 {
-            (stop.max(0.0) / decel_distance).clamp(0.0, 1.0)
+            (stop.max(0.0).min(since) / decel_distance).clamp(0.0, 1.0)
         } else {
             1.0
         };
@@ -717,6 +719,10 @@ pub(crate) fn current_speed(state: &RobotState, last_commanded: f64) -> f64 {
     }
 }
 
+/// Gap, m/s, between the measured and the last commanded speed within which
+/// a command integrates from the last one.
+pub(crate) const HELD_SPEED_SLACK: f64 = 0.3;
+
 /// Speed a command integrates from: `last_commanded` while the measured
 /// `v_now` stays within `slack` of it, else `v_now`.
 pub(crate) fn held_speed(v_now: f64, last_commanded: f64, slack: f64) -> f64 {
@@ -1030,7 +1036,8 @@ impl MppiFollower {
 
         let v_now = current_speed(state, self.last_v);
         let vy_now = current_lateral_speed(state, self.last_vy);
-        let mut model = Model::new(state, constraints, v_now, vy_now, working.dt, prep.allow_reverse);
+        let v_base = held_speed(v_now, self.last_v, HELD_SPEED_SLACK);
+        let mut model = Model::new(state, constraints, v_base, vy_now, working.dt, prep.allow_reverse);
         if !state.velocity_valid {
             model.steer0 = self.last_steer;
         }
@@ -1215,7 +1222,7 @@ impl MppiFollower {
             * speed_scale;
         self.base.status.mode = mode.into();
         let cmd = command_from_controls(
-            v_now,
+            v_base,
             vy_now,
             steer0,
             accel0,
@@ -1233,7 +1240,7 @@ impl MppiFollower {
         self.last_v = if cmd.valid && physical {
             cmd.linear_velocity
         } else {
-            (v_now + accel0 * dt_apply).clamp(-v_cap, v_cap)
+            (v_base + accel0 * dt_apply).clamp(-v_cap, v_cap)
         };
         self.last_vy = if cmd.valid && physical {
             cmd.lateral_velocity

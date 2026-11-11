@@ -42,8 +42,9 @@ pub struct MpcConfig {
     pub turn_first_activation_deg: f64,
     pub turn_first_release_deg: f64,
 
-    /// Distance along the path from the end at which `ref_velocity` starts
-    /// tapering linearly to zero. Set to 0.0 to disable.
+    /// Distance before the path end and each cusp over which `ref_velocity`
+    /// tapers linearly to zero, and after each cusp over which it gathers
+    /// again. Set to 0.0 to disable.
     pub approach_taper_distance: f64,
 
     /// Obstacle barrier `weight_obstacle · exp(−clearance / obstacle_scale)`
@@ -511,8 +512,9 @@ impl Controller for MpcFollower {
             .unwrap_or(f64::INFINITY)
             .min(REF_SPEED_HEADROOM * cfg.ref_velocity.max(0.1));
         self.base.status.mode = "mpc_tracking".into();
+        let v_base = crate::pred::mppi::held_speed(v_now, self.last_v, crate::pred::mppi::HELD_SPEED_SLACK);
         let cmd = command_from_controls(
-            v_now,
+            v_base,
             vy_now,
             steer0,
             accel0,
@@ -526,7 +528,7 @@ impl Controller for MpcFollower {
             prep.epsi,
             "MPC tracking",
         );
-        self.last_v = (v_now + accel0 * dt_apply).clamp(-v_cap, v_cap);
+        self.last_v = (v_base + accel0 * dt_apply).clamp(-v_cap, v_cap);
         self.last_vy = vy_now + accel_lat0 * dt_apply;
         cmd
     }

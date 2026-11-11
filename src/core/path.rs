@@ -346,6 +346,17 @@ pub fn cusp_after(speeds: &[f64], cum: &[f64], s: f64) -> Option<f64> {
     None
 }
 
+/// Arc length of the last cusp at or before `s`, if any.
+pub fn cusp_before(speeds: &[f64], cum: &[f64], s: f64) -> Option<f64> {
+    if speeds.len() != cum.len() || speeds.len() < 2 {
+        return None;
+    }
+    (0..speeds.len() - 1)
+        .rev()
+        .find(|&i| cum[i] <= s + 1e-9 && (speeds[i] < 0.0) != (speeds[i + 1] < 0.0))
+        .map(|i| cum[i])
+}
+
 /// Per-controller projection state: cumulative lengths plus a flag that
 /// widens the first search to the whole path.
 #[derive(Clone, Debug, Default)]

@@ -47,9 +47,6 @@ const BRAKE_GUIDE: usize = 1;
 /// the path when there is none; a detour is followed whenever it is the
 /// cheapest.
 const DETOUR_GUIDE: usize = 3;
-/// Gap, m/s, between the measured and the last commanded speed within which
-/// a command integrates from the last one.
-const HELD_SPEED_SLACK: f64 = 0.3;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SocConfig {
@@ -721,7 +718,7 @@ impl Controller for SocFollower {
             .min(crate::pred::mpc::REF_SPEED_HEADROOM * ref_velocity.max(0.1))
             * share;
         self.base.status.mode = "soc_tracking".into();
-        let v_base = crate::pred::mppi::held_speed(v_now, self.last_v, HELD_SPEED_SLACK);
+        let v_base = crate::pred::mppi::held_speed(v_now, self.last_v, crate::pred::mppi::HELD_SPEED_SLACK);
         let cmd = command_from_controls(
             v_base,
             vy_now,

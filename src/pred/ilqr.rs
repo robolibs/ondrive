@@ -600,8 +600,9 @@ impl Controller for IlqrFollower {
             .unwrap_or(f64::INFINITY)
             .min(crate::pred::mpc::REF_SPEED_HEADROOM * cfg.ref_velocity.max(0.1));
         self.base.status.mode = "ilqr_tracking".into();
+        let v_base = crate::pred::mppi::held_speed(v_now, self.last_v, crate::pred::mppi::HELD_SPEED_SLACK);
         let cmd = command_from_controls(
-            v_now,
+            v_base,
             vy_now,
             steer0,
             accel0,
@@ -615,7 +616,7 @@ impl Controller for IlqrFollower {
             prep.epsi,
             "iLQR tracking",
         );
-        self.last_v = (v_now + accel0 * dt_apply).clamp(-v_cap, v_cap);
+        self.last_v = (v_base + accel0 * dt_apply).clamp(-v_cap, v_cap);
         self.last_vy = vy_now + accel_lat0 * dt_apply;
         cmd
     }
