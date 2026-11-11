@@ -49,6 +49,12 @@ const SLIP_SPEED: f64 = 0.2;
 /// averaged, and the largest it may be as a share of the tightest.
 const BIAS_TIME: f64 = 3.0;
 const MAX_BIAS: f64 = 0.5;
+/// Share of the tightest curvature past which a command counts as at the
+/// limit, its shortfall the machine's and not a disturbance.
+const SATURATED: f64 = 0.98;
+/// Distance, metres, the chosen candidate's curvature is read ahead at
+/// the least when reversing.
+const MIN_PREVIEW: f64 = 0.2;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FrenetConfig {
@@ -245,7 +251,7 @@ impl Controller for FrenetFollower {
         // over the leg: what a slope or slip takes off each command.
         match self.last_command {
             Some((was_back, commanded)) if was_back == back => {
-                if state.velocity_valid && v_now > SLIP_SPEED {
+                if state.velocity_valid && v_now > SLIP_SPEED && commanded.abs() < SATURATED * k_lim {
                     let gain = (dt / BIAS_TIME).min(1.0);
                     self.bias = (self.bias + gain * (commanded - k_now - self.bias)).clamp(-MAX_BIAS * k_lim, MAX_BIAS * k_lim);
                 }
@@ -369,7 +375,7 @@ impl Controller for FrenetFollower {
         // The chosen shift's own curvature `preview_s` of travel on, or with
         // no preview the pursuit of its point one lookahead on.
         let curvature = if fc.preview_s > 0.0 {
-            let sigma = (v_now.max(0.1) * fc.preview_s).min((end - s0).max(0.0));
+            let sigma = (v_now.max(0.1) * fc.preview_s).max(if back { MIN_PREVIEW } else { 0.0 }).min((end - s0).max(0.0));
             let (d, d1, d2) = chosen.shift.at(sigma);
             offset_curvature(bend_at(s0 + sigma), d, d1, d2)
         } else {
