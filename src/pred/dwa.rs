@@ -5,10 +5,10 @@
 
 use crate::controller::{Controller, ControllerBase, effective_tolerances, pass_through};
 use crate::core::kinematics::{
-    can_turn_in_place, finalize, finalize_holonomic, is_holonomic, max_curvature, reverse_allowed,
+    actuation_delay, can_turn_in_place, finalize, finalize_holonomic, is_holonomic, max_curvature, reverse_allowed,
     speed_bounds,
 };
-use crate::core::math::{heading_error, normalize_angle};
+use crate::core::math::{heading_error, normalize_angle, yaw_of};
 use crate::core::obstacles::CollisionChecker;
 use crate::types::{DebugFrame, DebugLevel, Goal, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
@@ -47,7 +47,7 @@ impl Default for DwaConfig {
             weight_velocity: 0.5,
             weight_clearance: 2.0,
             target_velocity: 1.0,
-            obstacle_margin: 0.2,
+            obstacle_margin: 0.3,
             clearance_cap: 1.5,
         }
     }
@@ -214,7 +214,13 @@ impl Controller for DwaFollower {
         let steps = (dwa.predict_time / sim_dt).ceil().max(1.0) as usize;
         let kappa_max = max_curvature(constraints);
         let checker = CollisionChecker::new(world, constraints, 0.0).with_step(sim_dt).with_spread(2.0);
-        let goal_p = goal.target_pose.point;
+        // A carrot to pass is scored one arc's length on along its heading, so
+        // arcs that reach it do not count as overshooting it.
+        let run_on = if passing > 0.0 { passing * dwa.predict_time } else { 0.0 };
+        let (gs, gc) = yaw_of(&goal.target_pose).sin_cos();
+        let goal_p = Point::new(goal.target_pose.point.x + run_on * gc, goal.target_pose.point.y + run_on * gs, 0.0);
+        let reach_goal = dist_to_goal + run_on;
+        let margin = dwa.obstacle_margin + LAG_MARGIN_GAIN * v_now.abs() * actuation_delay(constraints);
         let target_v = free_v * share;
 
         // Against obstacles standing or crossing the course to the goal, while
@@ -227,8 +233,8 @@ impl Controller for DwaFollower {
         let tail = yield_to
             .as_ref()
             .filter(|w| !w.obstacles.is_empty())
-            .map(|w| CollisionChecker::new(Some(w), constraints, 0.0).with_step(sim_dt).with_spread(2.0));
-        let yielding = tail.as_ref().is_some_and(|c| !hit_while_braking(c, (x0, y0, yaw0), v_now.abs(), a_lin, 0, sim_dt));
+            .map(|w| CollisionChecker::new(Some(w), constraints, 0.0).with_step(sim_dt).with_spread(1.0));
+        let yielding = share < 1.0 && tail.as_ref().is_some_and(|c| !hit_while_braking(c, (x0, y0, yaw0), v_now.abs(), a_lin, 0, sim_dt));
         let mut samples: Vec<Sample> = Vec::with_capacity(v_samples * w_samples * vy_samples);
         for vi in 0..v_samples {
             let v = v_min + (v_max - v_min) * vi as f64 / (v_samples - 1) as f64;
@@ -266,12 +272,12 @@ impl Controller for DwaFollower {
                         yaw = normalize_angle(yaw + w * sim_dt);
                         let c = checker.clearance(step, x, y, yaw);
                         min_clearance = min_clearance.min(c);
-                        let entering = c < dwa.obstacle_margin
+                        let entering = c < margin
                             && c < prev_clearance - 1e-9
                             && c < start_clearance;
                         let deeper = c < 0.0 && c < prev_clearance - 1e-9;
                         if deeper || entering {
-                            let boundary = if c < 0.0 { 0.0 } else { dwa.obstacle_margin };
+                            let boundary = if c < 0.0 { 0.0 } else { margin };
                             let remaining = (prev_clearance - boundary).clamp(0.0, step_len);
                             free_distance = Some(travelled + remaining);
                             stop_at = before;
@@ -280,7 +286,7 @@ impl Controller for DwaFollower {
                         travelled += step_len;
                         prev_clearance = c;
                         horizon += step_len;
-                        if horizon >= dist_to_goal {
+                        if horizon >= reach_goal {
                             break;
                         }
                     }
@@ -300,7 +306,7 @@ impl Controller for DwaFollower {
                         }
                         None => {
                             speed_mag * dwa.predict_time
-                                + (min_clearance - dwa.obstacle_margin).clamp(0.0, dwa.clearance_cap)
+                                + (min_clearance - margin).clamp(0.0, dwa.clearance_cap)
                         }
                     };
                     let dx = goal_p.x - x;
@@ -474,6 +480,10 @@ fn give_way(world: Option<&WorldConstraints>, constraints: &RobotConstraints, (x
     let line = crate::core::obstacles::arc_course((x, y, course), 0.0);
     crate::core::obstacles::yield_share(&checker, &line, speed, v_now, GIVE_WAY_LOOKOUT_S, decel, &GIVE_WAY_SHARES)
 }
+
+/// Share of the distance covered during the steering delay added to the
+/// obstacle margin.
+const LAG_MARGIN_GAIN: f64 = 0.25;
 
 /// Whether `o` moves faster than a crawl over the first second of its
 /// prediction.
