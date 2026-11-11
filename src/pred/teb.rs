@@ -14,7 +14,8 @@
 
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::{
-    actuation_delay, finalize, finalize_holonomic, is_ackermann, is_holonomic, max_curvature, speed_bounds, wheelbase,
+    actuation_delay, axle_offset, finalize, finalize_holonomic, is_ackermann, is_holonomic, max_curvature, speed_bounds,
+    wheelbase,
     world_to_body,
 };
 use crate::core::math::{normalize_angle, yaw_of};
@@ -96,6 +97,9 @@ pub struct TebFollower {
     /// Side the band last went round obstacles on: +1 left, −1 right, 0 none.
     side: f64,
     auto_path_goal: Option<(f64, f64, f64)>,
+    /// Distance, metres, the pose rides ahead of the band's points, the axle the
+    /// body turns about.
+    axle: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -126,6 +130,9 @@ struct Problem<'a> {
     steer_per_wheelbase: f64,
     ackermann: bool,
     holonomic: bool,
+    /// Distance, metres, the pose rides ahead of the band's points, the axle the
+    /// body turns about.
+    axle: f64,
     /// Path segment the robot projects onto, where projections start.
     start_segment: usize,
 }
@@ -138,9 +145,15 @@ impl Problem<'_> {
         self.cfg.obstacle_margin + LAG_MARGIN_GAIN * self.v_hi.abs() * actuation_delay(self.constraints)
     }
 
+    /// The pose of a body whose band point, its turning axle, is `(x, y)`.
+    fn pose_of(&self, x: f64, y: f64, yaw: f64) -> (f64, f64) {
+        (x + self.axle * yaw.cos(), y + self.axle * yaw.sin())
+    }
+
     /// Penalty for coming within `margin` of an obstacle as it is predicted
     /// `t` seconds from now.
     fn obstacle_cost(&self, t: f64, x: f64, y: f64, yaw: f64) -> f64 {
+        let (x, y) = self.pose_of(x, y, yaw);
         let c = self.cfg;
         if !self.checker.has_obstacles() {
             return 0.0;
@@ -231,14 +244,8 @@ impl Problem<'_> {
         if !self.waypoints.is_empty() {
             let mut hint = self.start_segment;
             for i in 1..n {
-                if let Some(p) = project(
-                    self.waypoints,
-                    self.cum,
-                    Point::new(b.x[i], b.y[i], 0.0),
-                    hint,
-                    2,
-                    64,
-                ) {
+                let (px, py) = self.pose_of(b.x[i], b.y[i], b.yaw[i]);
+                if let Some(p) = project(self.waypoints, self.cum, Point::new(px, py, 0.0), hint, 2, 64) {
                     cost += c.weight_path_deviation * p.distance * p.distance;
                     hint = p.segment;
                 }
@@ -250,8 +257,9 @@ impl Problem<'_> {
         }
 
         let (tp, th) = self.target;
-        let dx = b.x[n - 1] - tp.x;
-        let dy = b.y[n - 1] - tp.y;
+        let (ex, ey) = self.pose_of(b.x[n - 1], b.y[n - 1], b.yaw[n - 1]);
+        let dx = ex - tp.x;
+        let dy = ey - tp.y;
         let dh = normalize_angle(b.yaw[n - 1] - th);
         cost += c.weight_goal * (dx * dx + dy * dy + 0.5 * dh * dh);
         cost
@@ -352,12 +360,18 @@ impl TebFollower {
     }
 
     pub fn band_poses(&self) -> Vec<Point> {
-        self.band
-            .x
-            .iter()
-            .zip(self.band.y.iter())
-            .map(|(&x, &y)| Point::new(x, y, 0.0))
+        (0..self.band.x.len())
+            .map(|i| {
+                let yaw = self.band.yaw[i];
+                Point::new(self.band.x[i] + self.axle * yaw.cos(), self.band.y[i] + self.axle * yaw.sin(), 0.0)
+            })
             .collect()
+    }
+
+    /// The turning axle of a body whose pose is `p`, heading `yaw`: the point
+    /// the band follows.
+    fn axle_of(&self, p: Point, yaw: f64) -> Point {
+        Point::new(p.x - self.axle * yaw.cos(), p.y - self.axle * yaw.sin(), 0.0)
     }
 
     fn nominal_step(&self, constraints: &RobotConstraints) -> f64 {
@@ -396,12 +410,15 @@ impl TebFollower {
             dt: vec![self.teb_config.dt_nominal; n - 1],
             tail_s: s0,
         };
-        b.x[0] = state.pose.point.x;
-        b.y[0] = state.pose.point.y;
-        b.yaw[0] = state.pose.rotation.to_euler().yaw;
+        let yaw0 = state.pose.rotation.to_euler().yaw;
+        let start = self.axle_of(state.pose.point, yaw0);
+        b.x[0] = start.x;
+        b.y[0] = start.y;
+        b.yaw[0] = yaw0;
         for i in 1..n {
             let s = (s0 + i as f64 * step).min(cusp);
             let (p, h) = self.sample_band_pose(s, i, checker);
+            let p = self.axle_of(p, h);
             b.x[i] = p.x;
             b.y[i] = p.y;
             b.yaw[i] = h;
@@ -424,8 +441,9 @@ impl TebFollower {
     ) {
         let n = self.band.x.len();
         let step = self.nominal_step(constraints);
-        let px = state.pose.point.x;
-        let py = state.pose.point.y;
+        let yaw0 = state.pose.rotation.to_euler().yaw;
+        let start = self.axle_of(state.pose.point, yaw0);
+        let (px, py) = (start.x, start.y);
         for _ in 0..n {
             let dx = self.band.x[1] - px;
             let dy = self.band.y[1] - py;
@@ -441,6 +459,7 @@ impl TebFollower {
             self.band.dt.remove(0);
             self.band.tail_s = (self.band.tail_s + step).min(cusp);
             let (p, h) = self.sample_band_pose(self.band.tail_s, n - 1, checker);
+            let p = self.axle_of(p, h);
             self.band.x.push(p.x);
             self.band.y.push(p.y);
             self.band.yaw.push(h);
@@ -448,7 +467,7 @@ impl TebFollower {
         }
         self.band.x[0] = px;
         self.band.y[0] = py;
-        self.band.yaw[0] = state.pose.rotation.to_euler().yaw;
+        self.band.yaw[0] = yaw0;
         let ds = (self.band.x[1] - px).hypot(self.band.y[1] - py);
         if v_now.abs() > 1e-3 {
             self.band.dt[0] =
@@ -585,6 +604,7 @@ impl Controller for TebFollower {
             }
         };
         let checker = CollisionChecker::new(world, constraints, 0.0).with_spread(1.0);
+        self.axle = axle_offset(constraints);
         let holonomic = is_holonomic(constraints.steering_type);
         let v_now = current_speed(state, self.last_v);
         let vy_now = if holonomic { current_lateral_speed(state, self.last_vy) } else { 0.0 };
@@ -632,6 +652,7 @@ impl Controller for TebFollower {
             ackermann: is_ackermann(constraints.steering_type),
             holonomic,
             start_segment,
+            axle: self.axle,
         };
         self.optimise(&problem);
 
@@ -666,8 +687,13 @@ impl Controller for TebFollower {
         let forward = (dx * yaw0.cos() + dy * yaw0.sin()).signum();
         // Capped to stop by the cusp, braking after the actuation delay.
         let lead = v_now.abs() * actuation_delay(constraints);
-        let stop = (2.0 * a_max * (cusp - prep.proj.arc_length - lead).max(0.0)).sqrt();
-        let v = (forward * length / span).clamp(v_now - a_max * dt, v_now + a_max * dt).clamp(-stop, stop);
+        // The stop holds for the cusp ahead of the pose, the band runs on past it.
+        let stop_at = crate::core::path::cusp_after(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length).unwrap_or(f64::INFINITY);
+        let stop = (2.0 * a_max * (stop_at - prep.proj.arc_length - lead).max(0.0)).sqrt();
+        // Braking to turn round, the ramp runs from the last command, not the
+        // lagging measurement.
+        let base = if forward * v_now < 0.0 { self.last_v } else { v_now };
+        let v = (forward * length / span).clamp(base - a_max * dt, base + a_max * dt).clamp(-stop, stop);
         let share = self.give_way(state, prep.proj.arc_length, constraints, world, (v, w));
         let (v, w) = (v * share, w * share);
 
