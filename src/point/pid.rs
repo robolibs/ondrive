@@ -2,7 +2,7 @@
 //! toward the goal, a heading loop steers onto the bearing. Both loops use
 //! clamped integrals, wrapped derivatives and a `dt` guard.
 
-use crate::controller::{Controller, ControllerBase};
+use crate::controller::{Controller, ControllerBase, pass_through};
 use crate::core::kinematics::{
     can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, is_holonomic,
     reverse_allowed, unreachable_arc_speed_floor, world_to_body,
@@ -216,7 +216,7 @@ impl Controller for PidFollower {
             return finalize(0.0, omega, constraints, &cfg, allow_reverse, "Turning to align");
         }
 
-        let mut v = speed.max(0.0) * heading_speed_scale(bearing_err, constraints);
+        let mut v = speed.max(pass_through(goal)).max(0.0) * heading_speed_scale(bearing_err, constraints);
         if let Some(floor) = unreachable_arc_speed_floor(bearing_err, distance, constraints) {
             v = v.max(floor);
         }

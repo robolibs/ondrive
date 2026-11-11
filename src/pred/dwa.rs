@@ -3,7 +3,7 @@
 //! pairs that cannot stop before an obstacle, and maximises a weighted sum
 //! of heading, clearance, velocity and goal-distance scores.
 
-use crate::controller::{Controller, ControllerBase, effective_tolerances};
+use crate::controller::{Controller, ControllerBase, effective_tolerances, pass_through};
 use crate::core::kinematics::{
     can_turn_in_place, finalize, finalize_holonomic, is_holonomic, max_curvature, reverse_allowed,
     speed_bounds,
@@ -158,7 +158,9 @@ impl Controller for DwaFollower {
         }
 
         let (v_lo, v_hi) = speed_bounds(constraints, allow_reverse);
-        let cruise = crate::pred::mpc::REF_SPEED_HEADROOM * dwa.target_velocity.abs().max(0.1);
+        let passing = pass_through(goal);
+        let preferred = if passing > 0.0 { passing } else { dwa.target_velocity.abs() };
+        let cruise = crate::pred::mpc::REF_SPEED_HEADROOM * preferred.max(0.1);
         let (v_lo, v_hi) = (v_lo.max(-cruise), v_hi.min(cruise));
         let w_lim = constraints.max_angular_velocity.abs();
         let v_now = if state.velocity_valid {
@@ -191,10 +193,9 @@ impl Controller for DwaFollower {
         let y0 = state.pose.point.y;
         let yaw0 = state.pose.rotation.to_euler().yaw;
         let course = normalize_angle(yaw0 + bearing);
-        let free_v = dwa
-            .target_velocity
+        let free_v = preferred
             .min(v_hi)
-            .min((cfg.kp_linear.max(0.1) * dist_to_goal).max(0.15 * v_hi));
+            .min((cfg.kp_linear.max(0.1) * dist_to_goal).max(0.15 * v_hi).max(passing));
         let share = give_way(world, constraints, (x0, y0, course), free_v, v_now.abs());
         let v_min = (v_now - a_lin * dt).max(v_lo);
         let v_max = (v_now + a_lin * dt).min(v_hi).min(cruise * share).max(v_min);

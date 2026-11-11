@@ -8,7 +8,7 @@
 //! resultant still vanishes away from the goal the controller stops and
 //! reports mode `apf_local_minimum`.
 
-use crate::controller::{Controller, ControllerBase};
+use crate::controller::{Controller, ControllerBase, pass_through};
 use crate::core::kinematics::{
     finalize, finalize_holonomic, heading_speed_scale, is_holonomic, reverse_allowed, stop,
     world_to_body,
@@ -75,7 +75,7 @@ impl ApfFollower {
         let gx = goal.target_pose.point.x - x;
         let gy = goal.target_pose.point.y - y;
         let gd = gx.hypot(gy);
-        let (mut fx, mut fy) = if gd > 1.0 {
+        let (mut fx, mut fy) = if gd > 1.0 || (pass_through(goal) > 0.0 && gd > 1e-9) {
             (cfg.k_attract * gx / gd, cfg.k_attract * gy / gd)
         } else {
             (cfg.k_attract * gx, cfg.k_attract * gy)
@@ -186,7 +186,7 @@ impl Controller for ApfFollower {
         if is_holonomic(constraints.steering_type) {
             self.base.status.mode = "apf_holonomic".into();
             let speed =
-                (cfg.kp_linear.max(0.1) * dist).min(constraints.max_linear_velocity) * magnitude.min(1.0);
+                (cfg.kp_linear.max(0.1) * dist).max(pass_through(goal)).min(constraints.max_linear_velocity) * magnitude.min(1.0);
             let (ux, uy) = (fx / magnitude, fy / magnitude);
             let (vx, vy) = world_to_body(speed * ux, speed * uy, yaw);
             let omega = cfg.kp_angular.max(0.1) * normalize_angle(yaw_of(&goal.target_pose) - yaw);
@@ -200,7 +200,7 @@ impl Controller for ApfFollower {
         }
         self.base.status.heading_error = err;
         let v = direction
-            * (cfg.kp_linear.max(0.1) * dist).min(constraints.max_linear_velocity)
+            * (cfg.kp_linear.max(0.1) * dist).max(pass_through(goal)).min(constraints.max_linear_velocity)
             * heading_speed_scale(err, constraints)
             * magnitude.min(1.0);
         let omega = cfg.kp_angular.max(0.1) * err;

@@ -1,7 +1,13 @@
 use crate::controller::{Controller, check_goal};
-use crate::core::kinematics::{actuation_delay, can_turn_in_place, curvature_to_steering, is_ackermann, is_holonomic, stop, wheelbase};
+use crate::core::kinematics::{
+    actuation_delay, braked_for_bends, can_turn_in_place, curvature_to_steering, is_ackermann, is_holonomic, path_speed, stop,
+    wheelbase,
+};
 use crate::core::obstacles::CollisionChecker;
-use crate::core::path::{PathCursor, cumulative_lengths, cusp_after, end_heading, next_cusp, sample, segment_heading};
+use crate::core::path::{
+    PathCursor, PathProjection, cumulative_lengths, curvature_at_arc_length, curvature_at_projection, cusp_after, end_heading,
+    next_cusp, sample, segment_heading, speed_cap,
+};
 use crate::fuzzy::FlcFollower;
 use crate::path::{
     IlcFollower, KanayamaFollower, LqrFollower, PurePursuitFollower, RegulatedPursuitFollower, SlipAdaptiveFollower,
@@ -15,7 +21,7 @@ use crate::pred::{
     VelocityObstacleFollower,
 };
 use crate::types::{
-    ControllerConfig, ControllerStatus, Goal, OutputUnits, Path, RobotConstraints, RobotState, Trajectory,
+    ControllerConfig, ControllerStatus, Goal, OutputUnits, Path, RobotConstraints, RobotState, Trajectory, Velocity,
     VelocityCommand, WorldConstraints,
 };
 use datapod::{Euler, Point, Pose, Quaternion};
@@ -745,6 +751,7 @@ impl Tracker {
                 return Ok(None);
             }
             let speed_now = if state.velocity_valid { state.velocity.linear } else { self.last_command.map_or(0.0, |c| c.0) };
+            let passing = Some(Velocity { linear: pass_speed(path, cum, &proj, &cfg, &self.constraints, speed_now), angular: 0.0, lateral: 0.0 });
             let target = |segment: usize, s: f64| {
                 let idx = cum.iter().position(|c| *c >= s - 1e-9).unwrap_or(n - 1).max(segment + 1).min(n - 1);
                 let cap = next_cusp(&path.waypoints, segment).unwrap_or(n - 1);
@@ -770,7 +777,7 @@ impl Tracker {
                 let heading = segment_heading(&path.waypoints, idx.min(n.saturating_sub(2)));
                 return Ok(Some(Goal {
                     target_pose: Pose { point, rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, heading)) },
-                    target_velocity: None,
+                    target_velocity: passing,
                     tolerance_position: tol,
                     tolerance_orientation: std::f64::consts::PI,
                 }));
@@ -805,7 +812,7 @@ impl Tracker {
                     point,
                     rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, yaw)),
                 },
-                target_velocity: None,
+                target_velocity: if last || idx == cap { None } else { passing },
                 tolerance_position: tol,
                 tolerance_orientation: if last {
                     cfg.angular_tolerance
@@ -1406,6 +1413,27 @@ const BREAKAWAY_SPEED: f64 = 0.3;
 const RATE_PREVIEW_S: f64 = 2.0;
 /// Share of the top speed the steering-rate cap never goes below.
 const RATE_FLOOR: f64 = 0.2;
+
+/// Speed to pass a carrot on `path` at, for a robot projected at `proj`
+/// and going at `v_now`: the path's speed there, slowed for the bends ahead
+/// and to stop by the next cusp or the end.
+fn pass_speed(
+    path: &Path,
+    cum: &[f64],
+    proj: &PathProjection,
+    cfg: &ControllerConfig,
+    constraints: &RobotConstraints,
+    v_now: f64,
+) -> f64 {
+    let vmax = constraints.max_linear_velocity.abs();
+    let nominal = speed_cap(&path.speeds, proj).map_or(vmax, |v| v.min(vmax));
+    let s = proj.arc_length;
+    let end = cusp_after(&path.speeds, cum, s).unwrap_or_else(|| cum.last().copied().unwrap_or(s));
+    let left = (end - s).max(0.0);
+    let here = curvature_at_projection(&path.waypoints, cum, proj);
+    let v = path_speed(nominal, here, left, cfg.goal_tolerance, cfg.kp_linear, constraints);
+    braked_for_bends(v, v_now, nominal, left, |d| curvature_at_arc_length(&path.waypoints, cum, s + d), constraints)
+}
 
 /// `state` carried forward through the actuation delay on its current arc
 /// (delay compensation), from the measured velocity or else the last

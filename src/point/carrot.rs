@@ -1,7 +1,7 @@
 //! Carrot point-to-point controller: proportional heading control onto the
 //! bearing to the goal with speed scaled by distance and heading error.
 
-use crate::controller::{Controller, ControllerBase, effective_tolerances};
+use crate::controller::{Controller, ControllerBase, effective_tolerances, pass_through};
 use crate::core::kinematics::{
     can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, is_holonomic,
     reverse_allowed, unreachable_arc_speed_floor, world_to_body,
@@ -108,7 +108,7 @@ impl Controller for CarrotFollower {
         let carrot = cfg.lookahead_distance.max(1e-3);
         let speed = cfg.kp_linear * distance.min(carrot) * (distance / carrot).min(1.0).sqrt()
             + cfg.kp_linear * (distance - carrot).max(0.0);
-        let mut v = speed.max(0.0) * heading_speed_scale(bearing_err, constraints);
+        let mut v = speed.max(pass_through(goal)).max(0.0) * heading_speed_scale(bearing_err, constraints);
         if let Some(floor) = unreachable_arc_speed_floor(bearing_err, distance, constraints) {
             v = v.max(floor);
         }

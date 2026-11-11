@@ -146,6 +146,12 @@ pub fn cusp_reach(pos_tol: f64, state: &RobotState, constraints: &RobotConstrain
     (if moving { 0.5 * pos_tol } else { pos_tol }).max(0.1)
 }
 
+/// Speed, m/s, to pass `goal` at: that of its `target_velocity`, or 0 for
+/// a goal to stop at.
+pub fn pass_through(goal: &Goal) -> f64 {
+    goal.target_velocity.map_or(0.0, |v| v.linear.abs())
+}
+
 /// Goal tolerances override config tolerances when set (> 0). An
 /// orientation tolerance of `PI` or more disables the orientation check.
 pub fn effective_tolerances(goal: &Goal, cfg: &ControllerConfig) -> (f64, f64) {
@@ -272,7 +278,7 @@ impl ControllerBase {
         self.status.heading_error = check.yaw_error;
 
         let position_ok = (check.position_ok && position_allowed) || extra_position_ok;
-        if !position_ok {
+        if !position_ok || pass_through(goal) > 0.0 {
             self.status.goal_reached = false;
             return None;
         }
