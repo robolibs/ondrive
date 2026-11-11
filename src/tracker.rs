@@ -613,7 +613,7 @@ impl Tracker {
             return;
         }
         let k = crate::core::kinematics::max_curvature(&self.constraints);
-        let radius = if k.is_finite() && k > 0.0 { 1.0 / k } else { PLANNED_TURN_RADIUS };
+        let radius = if k.is_finite() && k > 0.0 { PLANNED_RADIUS_MARGIN / k } else { PLANNED_TURN_RADIUS };
         let start = (state.pose.point.x, state.pose.point.y, state.pose.rotation.to_euler().yaw);
         let waypoints = crate::core::dubins::dubins_path(start, key, radius, PLANNED_STEP)
             .into_iter()
@@ -1405,6 +1405,9 @@ const MOVING_SPEED: f64 = 0.1;
 /// Turning radius, metres, of a path planned to a goal for a platform that
 /// turns in place.
 const PLANNED_TURN_RADIUS: f64 = 0.5;
+/// Times its tightest radius a platform that cannot turn in place is
+/// planned to a goal at, to keep steering in hand on the arcs.
+const PLANNED_RADIUS_MARGIN: f64 = 1.25;
 /// Metres between the poses of a path planned to a goal.
 const PLANNED_STEP: f64 = 0.1;
 /// Share of the top speed below which a point controller's detour does not
