@@ -10,7 +10,7 @@
 //! one that meets the obstacles latest is taken.
 
 use crate::controller::{Controller, ControllerBase};
-use crate::core::kinematics::{finalize, is_ackermann, max_curvature, path_speed};
+use crate::core::kinematics::{actuation_delay, finalize, is_ackermann, max_curvature, path_speed};
 use crate::core::math::normalize_angle;
 use crate::core::obstacles::{CollisionChecker, footprint_extent, robot_radius};
 use crate::core::path::{
@@ -55,6 +55,8 @@ const SATURATED: f64 = 0.98;
 /// Distance, metres, the chosen candidate's curvature is read ahead at
 /// the least when reversing.
 const MIN_PREVIEW: f64 = 0.2;
+/// Points within braking distance the chosen shift's bends are read at.
+const BRAKING_SAMPLES: usize = 10;
 /// Step, seconds, the detour round what blocks the path is laid out at, the
 /// share of top speed it is laid out for, and the steps it runs past the
 /// horizon.
@@ -417,7 +419,20 @@ impl Controller for FrenetFollower {
         }
         .clamp(-k_lim, k_lim);
         let curvature = (curvature + self.bias).clamp(-k_lim, k_lim);
-        let speed = chosen.speed.min(path_speed(nominal, curvature, left0, prep.pos_tol, cfg.kp_linear, constraints));
+        // No faster than braking at `accel`, after the actuation delay, slows
+        // the robot to each bend of the chosen shift within reach.
+        let delay = actuation_delay(constraints);
+        let ahead = (v_now * v_now / (2.0 * accel) + v_now * delay).min((end - s0).max(0.0));
+        let speed = (1..=BRAKING_SAMPLES).fold(
+            chosen.speed.min(path_speed(nominal, curvature, left0, prep.pos_tol, cfg.kp_linear, constraints)),
+            |speed, i| {
+                let sigma = ahead * i as f64 / BRAKING_SAMPLES as f64;
+                let (d, d1, d2) = chosen.shift.at(sigma);
+                let bend = offset_curvature(bend_at(s0 + sigma), d, d1, d2);
+                let at_bend = path_speed(nominal, bend, f64::INFINITY, prep.pos_tol, cfg.kp_linear, constraints);
+                speed.min((at_bend * at_bend + 2.0 * accel * (sigma - v_now * delay).max(0.0)).sqrt())
+            },
+        );
         self.last_speed = speed;
         self.last_command = Some((back, curvature));
         self.base.status.mode = mode.into();
