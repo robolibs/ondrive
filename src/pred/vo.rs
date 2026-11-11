@@ -11,7 +11,7 @@ use crate::core::kinematics::{
 };
 use crate::core::math::normalize_angle;
 use crate::core::obstacles::{CollisionChecker, arc_course, robot_radius};
-use crate::core::path::{PathCursor, curvature_at_arc_length, cusp_after, direction_at, sample, sharpest_ahead, speed_cap};
+use crate::core::path::{PathCursor, curvature_at_arc_length, cusp_after, direction_at, sample_past, sharpest_ahead, speed_cap};
 use crate::pred::mppi::{Swerve, build_reference, pick_detour, prepare};
 use crate::types::{DebugFrame, DebugLevel, Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
@@ -129,7 +129,9 @@ impl Controller for VelocityObstacleFollower {
         let base_lookahead = cfg.lookahead_distance.max(0.5);
         let bend = sharpest_ahead(waypoints, cum, s, base_lookahead, max_curvature(constraints));
         let lookahead = (base_lookahead / (1.0 + LOOKAHEAD_BEND_GAIN * bend * base_lookahead)).clamp(0.5 * base_lookahead, base_lookahead);
-        let (mut target, mut target_heading) = sample(waypoints, cum, (s + lookahead).min(cap));
+        let open_end = cap >= length && !self.base.path.is_closed;
+        let s_target = if open_end { s + lookahead } else { (s + lookahead).min(cap) };
+        let (mut target, mut target_heading) = sample_past(waypoints, cum, s_target, cap);
         let obstacles = world.map_or(&[][..], |w| &w.obstacles[..]);
         if obstacles.is_empty() {
             self.side = 0.0;
@@ -146,7 +148,7 @@ impl Controller for VelocityObstacleFollower {
         }
         // The rear axle aims where it stands when the pose is at the target,
         // facing along the way there.
-        let bend = curvature_at_arc_length(waypoints, cum, (s + lookahead).min(cap));
+        let bend = if s_target > cap { 0.0 } else { curvature_at_arc_length(waypoints, cum, s_target) };
         let body = body_heading_on_path(target_heading, followable(bend, constraints), axle, back);
         let (dx, dy) = (target.x - axle * body.cos() - rx, target.y - axle * body.sin() - ry);
         let reach = dx.hypot(dy).max(1e-6);
