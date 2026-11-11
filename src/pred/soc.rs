@@ -193,7 +193,7 @@ fn cost_gradient(
     model: &Model,
     reference: &Track,
     w: &CostWeights,
-    extra: &dyn Fn(usize, f64, f64, f64) -> f64,
+    extra: &(dyn Fn(usize, f64, f64, f64) -> f64 + Sync),
     steer: &mut [f64],
     accel: &mut [f64],
     accel_lat: &mut [f64],
@@ -224,6 +224,36 @@ fn cost_gradient(
         }
     }
     grad
+}
+
+/// Most threads the guides' gradients are shared among.
+const MAX_GRADIENT_THREADS: usize = 8;
+
+/// `cost_gradient` of every guide, the guides shared among the cores.
+fn guide_gradients(
+    model: &Model,
+    reference: &Track,
+    w: &CostWeights,
+    extra: &(dyn Fn(usize, f64, f64, f64) -> f64 + Sync),
+    guides_s: &mut [Vec<f64>],
+    guides_a: &mut [Vec<f64>],
+    guides_al: &mut [Vec<f64>],
+) -> Vec<Vec<f64>> {
+    let k = guides_s.len();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, MAX_GRADIENT_THREADS).min(k.max(1));
+    let chunk = k.div_ceil(threads).max(1);
+    let mut grads = vec![Vec::new(); k];
+    std::thread::scope(|scope| {
+        let parts = guides_s.chunks_mut(chunk).zip(guides_a.chunks_mut(chunk)).zip(guides_al.chunks_mut(chunk));
+        for (((s, a), al), out) in parts.zip(grads.chunks_mut(chunk)) {
+            scope.spawn(move || {
+                for (((s, a), al), g) in s.iter_mut().zip(a.iter_mut()).zip(al.iter_mut()).zip(out.iter_mut()) {
+                    *g = cost_gradient(model, reference, w, extra, s, a, al);
+                }
+            });
+        }
+    });
+    grads
 }
 
 impl SocFollower {
@@ -281,7 +311,7 @@ impl SocFollower {
         model: &Model,
         reference: &Track,
         w: &CostWeights,
-        extra: &dyn Fn(usize, f64, f64, f64) -> f64,
+        extra: &(dyn Fn(usize, f64, f64, f64) -> f64 + Sync),
         guides_s: &mut [Vec<f64>],
         guides_a: &mut [Vec<f64>],
         guides_al: &mut [Vec<f64>],
@@ -295,18 +325,10 @@ impl SocFollower {
         for _ in 0..self.soc_config.svgd_iterations {
             let mut grad_log_p = vec![vec![0.0; dims]; k];
             let mut flat = vec![vec![0.0; dims]; k];
+            let grads = guide_gradients(model, reference, w, extra, guides_s, guides_a, guides_al);
             for i in 0..k {
-                let g = cost_gradient(
-                    model,
-                    reference,
-                    w,
-                    extra,
-                    &mut guides_s[i],
-                    &mut guides_a[i],
-                    &mut guides_al[i],
-                );
                 for d in 0..dims {
-                    grad_log_p[i][d] = -g[d] / temperature;
+                    grad_log_p[i][d] = -grads[i][d] / temperature;
                 }
                 for t in 0..n {
                     flat[i][3 * t] = guides_s[i][t];
@@ -371,7 +393,7 @@ impl SocFollower {
 fn obstacle_penalty<'a>(
     checker: &'a CollisionChecker<'a>,
     weight: f64,
-) -> impl Fn(usize, f64, f64, f64) -> f64 + 'a {
+) -> impl Fn(usize, f64, f64, f64) -> f64 + Sync + 'a {
     move |step: usize, x: f64, y: f64, yaw: f64| -> f64 {
         if !checker.has_obstacles() {
             return 0.0;
