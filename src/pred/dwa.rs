@@ -5,7 +5,7 @@
 
 use crate::controller::{Controller, ControllerBase, effective_tolerances, pass_through};
 use crate::core::kinematics::{
-    actuation_delay, can_turn_in_place, finalize, finalize_holonomic, is_holonomic, max_curvature, reverse_allowed,
+    actuation_delay, axle_offset, can_turn_in_place, finalize, finalize_holonomic, is_holonomic, max_curvature, reverse_allowed,
     speed_bounds,
 };
 use crate::core::math::{heading_error, normalize_angle, yaw_of};
@@ -221,6 +221,8 @@ impl Controller for DwaFollower {
         let goal_p = Point::new(goal.target_pose.point.x + run_on * gc, goal.target_pose.point.y + run_on * gs, 0.0);
         let reach_goal = dist_to_goal + run_on;
         let margin = dwa.obstacle_margin + LAG_MARGIN_GAIN * v_now.abs() * actuation_delay(constraints);
+        // Driving ahead, the pose rides ahead of the axle the body turns about.
+        let axle = axle_offset(constraints);
         let target_v = free_v * share;
 
         // Against obstacles standing or crossing the course to the goal, while
@@ -266,8 +268,9 @@ impl Controller for DwaFollower {
                             x += (v * c - vy * s) * sim_dt;
                             y += (v * s + vy * c) * sim_dt;
                         } else {
-                            x += v * yaw.cos() * sim_dt;
-                            y += v * yaw.sin() * sim_dt;
+                            let ((s, c), side) = (yaw.sin_cos(), if v > 0.0 { axle * w } else { 0.0 });
+                            x += (v * c - side * s) * sim_dt;
+                            y += (v * s + side * c) * sim_dt;
                         }
                         yaw = normalize_angle(yaw + w * sim_dt);
                         let c = checker.clearance(step, x, y, yaw);
