@@ -123,6 +123,11 @@ pub struct Tracker {
     aiming_at_end: bool,
     /// The goal point last handed to the controller.
     aim: Option<Point>,
+    /// Metres left to the end of the path on its last leg, when that end is
+    /// where the robot stops.
+    end_left: Option<f64>,
+    /// Segment the robot was last projected on for `end_left`.
+    end_segment: usize,
     trajectory: Option<Trajectory>,
     clock: f64,
     clock_origin: Option<f64>,
@@ -163,6 +168,8 @@ impl Tracker {
             path_completed: false,
             aiming_at_end: true,
             aim: None,
+            end_left: None,
+            end_segment: 0,
             trajectory: None,
             clock: 0.0,
             clock_origin: None,
@@ -238,6 +245,7 @@ impl Tracker {
         self.path = Some(path.clone());
         self.waypoint_index = 0;
         self.projection_segment = 0;
+        self.end_segment = 0;
         self.path_completed = false;
         self.aim = None;
         self.controller.set_path(path);
@@ -427,15 +435,61 @@ impl Tracker {
         let ahead = (!self.kind.models_actuation())
             .then(|| predicted_through_actuation(state, &self.constraints, self.last_command))
             .flatten();
-        let cmd = self
+        self.end_left = self.left_on_last_leg(ahead.as_ref().unwrap_or(state));
+        let previous = self.controller.get_status().distance_to_goal;
+        let mut cmd = self
             .controller
             .compute_control(ahead.as_ref().unwrap_or(state), &goal, &self.constraints, dt, world);
+        // Arrival is judged on the pose the robot is at, not the one it is
+        // carried to through the actuation delay.
+        let carried = ahead.as_ref().is_some_and(|a| a.pose.point.distance_to_2d(state.pose.point) > 1e-3);
+        if carried && self.controller.get_status().goal_reached {
+            self.controller.base_mut().status.distance_to_goal = previous;
+            cmd = self.controller.compute_control(state, &goal, &self.constraints, dt, world);
+        }
         let cmd = self.give_way(cmd, state, world);
+        let cmd = self.ease_to_end(cmd);
 
         if self.goal.is_none() && self.path.is_some() && self.aiming_at_end && self.controller.get_status().goal_reached {
             self.path_completed = true;
         }
         self.limit(cmd, state, dt, world)
+    }
+
+    /// Metres left to the end of the path for the robot at `state`, on the
+    /// path's last leg when the robot stops at that end.
+    fn left_on_last_leg(&mut self, state: &RobotState) -> Option<f64> {
+        if self.lap.is_some() || self.trajectory.is_some() || (self.goal.is_some() && self.planned_for.is_none()) {
+            return None;
+        }
+        let path = self.path.as_ref().filter(|p| !p.is_closed && p.waypoints.len() >= 2)?;
+        let proj = self.cursor.project(&path.waypoints, state.pose.point, self.end_segment)?;
+        self.end_segment = proj.segment;
+        let cum = &self.cursor.cum;
+        if cusp_after(&path.speeds, cum, proj.arc_length).is_some() {
+            return None;
+        }
+        Some((cum[cum.len() - 1] - proj.arc_length).max(0.0))
+    }
+
+    /// `cmd` slowed, at the curvature it turns at, to stop at the end of the
+    /// path's last leg.
+    fn ease_to_end(&self, mut cmd: VelocityCommand) -> VelocityCommand {
+        let Some(left) = self.end_left else {
+            return cmd;
+        };
+        let v = cmd.linear_velocity.abs();
+        if !cmd.valid || v < 1e-9 {
+            return cmd;
+        }
+        let cfg = self.controller.get_config();
+        let tol = self.goal.as_ref().map_or(cfg.goal_tolerance, |g| crate::controller::effective_tolerances(g, &cfg).0);
+        let cap = path_speed(v, 0.0, left, tol, cfg.kp_linear, &self.constraints);
+        if cap < v {
+            cmd.linear_velocity *= cap / v;
+            cmd.angular_velocity *= cap / v;
+        }
+        cmd
     }
 
     /// The command held to what the platform can do: `max_linear_acceleration`
@@ -608,6 +662,8 @@ impl Tracker {
     /// the shortest Dubins path from `state` to the goal, turning no
     /// tighter than the platform can (`PLANNED_TURN_RADIUS` for one that
     /// turns in place), and drive it; planned again when the goal moves.
+    /// One that cannot turn in place comes at the goal along a straight of
+    /// a lookahead and the position tolerance, when that adds no loop.
     fn plan_to_goal(&mut self, state: &RobotState) {
         let Some(goal) = &self.goal else {
             return;
@@ -633,7 +689,25 @@ impl Tracker {
         let k = crate::core::kinematics::max_curvature(&self.constraints);
         let radius = if k.is_finite() && k > 0.0 { PLANNED_RADIUS_MARGIN / k } else { PLANNED_TURN_RADIUS };
         let start = (state.pose.point.x, state.pose.point.y, state.pose.rotation.to_euler().yaw);
-        let waypoints = crate::core::dubins::dubins_path(start, key, radius, PLANNED_STEP)
+        let direct = crate::core::dubins::dubins_path(start, key, radius, PLANNED_STEP);
+        let run_in = if can_turn_in_place(self.constraints.steering_type) {
+            0.0
+        } else {
+            let cfg = self.controller.get_config();
+            cfg.lookahead_distance.max(0.0) + crate::controller::effective_tolerances(goal, &cfg).0
+        };
+        let (c, s) = (key.2.cos(), key.2.sin());
+        let pre = (key.0 - run_in * c, key.1 - run_in * s, key.2);
+        let mut led = crate::core::dubins::dubins_path(start, pre, radius, PLANNED_STEP);
+        let steps = (run_in / PLANNED_STEP).ceil() as usize;
+        led.extend((1..=steps).map(|i| {
+            let u = run_in * i as f64 / steps as f64;
+            (pre.0 + u * c, pre.1 + u * s, key.2)
+        }));
+        let length = |p: &[(f64, f64, f64)]| p.windows(2).map(|w| (w[1].0 - w[0].0).hypot(w[1].1 - w[0].1)).sum::<f64>();
+        // The goal is come at along a straight run-in unless that costs a loop.
+        let planned = if run_in > 0.0 && length(&led) <= length(&direct) + run_in { led } else { direct };
+        let waypoints = planned
             .into_iter()
             .map(|(x, y, yaw)| Pose { point: Point::new(x, y, target.point.z), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, yaw)) })
             .collect();
