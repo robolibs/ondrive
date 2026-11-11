@@ -791,13 +791,17 @@ impl Tracker {
             let last = idx + 1 >= n;
             self.aiming_at_end = last;
             let wp = path.waypoints[idx];
-            let yaw = if last {
+            let travel = if last {
                 end_heading(&path.waypoints)
             } else if idx == cap {
                 segment_heading(&path.waypoints, idx - 1)
             } else {
                 segment_heading(&path.waypoints, idx)
             };
+            // A goal to stop at faces the way the body does there, backwards
+            // at the end of a reversing leg.
+            let reversing = path.speeds.get(idx).is_some_and(|v| *v < 0.0);
+            let yaw = if (last || idx == cap) && reversing { travel + std::f64::consts::PI } else { travel };
             self.waypoint_index = idx;
             // An Ackermann robot is aimed one lookahead past the path's end
             // along its last segment, driving through the end, not round it.
@@ -823,10 +827,12 @@ impl Tracker {
         }
 
         let last = *path.waypoints.last().unwrap();
+        let backwards = path.speeds.last().is_some_and(|v| *v < 0.0);
+        let yaw = end_heading(&path.waypoints) + if backwards { std::f64::consts::PI } else { 0.0 };
         Ok(Some(Goal {
             target_pose: Pose {
                 point: last.point,
-                rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, end_heading(&path.waypoints))),
+                rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, yaw)),
             },
             target_velocity: None,
             tolerance_position: cfg.goal_tolerance,
