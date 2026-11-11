@@ -8,9 +8,13 @@
 //! trajectory has ended short of its final pose a pose regulator finishes.
 
 use crate::controller::{Controller, ControllerBase};
-use crate::core::kinematics::{actuation_delay, finalize, finalize_holonomic, is_holonomic, path_speed};
+use crate::core::kinematics::{
+    actuation_delay, axle_offset, bend_heading, braked_for_bends, finalize, finalize_holonomic, is_holonomic, path_speed,
+};
 use crate::core::math::{normalize_angle, yaw_of};
-use crate::core::path::{PathCursor, curvature_at_projection, cusp_after, direction_at, sample, speed_cap};
+use crate::core::path::{
+    PathCursor, curvature_at_arc_length, curvature_at_projection, cusp_after, direction_at, sample, speed_cap,
+};
 use std::f64::consts::PI;
 use crate::point::PoseRegulatorFollower;
 use crate::pred::mppi::prepare;
@@ -28,6 +32,7 @@ pub struct KanayamaFollower {
     trajectory: Option<Trajectory>,
     clock: f64,
     settle: PoseRegulatorFollower,
+    last_speed: f64,
 }
 
 impl KanayamaFollower {
@@ -100,14 +105,21 @@ impl Controller for KanayamaFollower {
                     .map_or(constraints.max_linear_velocity, |s| s.min(constraints.max_linear_velocity));
                 let stop = self.base.distance_left(&prep.proj, self.cursor.total_length()).min(cusp - s);
                 let v_r = path_speed(nominal, kappa, stop, prep.pos_tol, cfg.kp_linear, constraints);
+                let v_now = if state.velocity_valid { state.velocity.linear } else { self.last_speed };
+                let (waypoints, cum) = (&self.base.path.waypoints, &self.cursor.cum);
+                let v_r = braked_for_bends(v_r, v_now, nominal, stop, |d| curvature_at_arc_length(waypoints, cum, s + d), constraints);
+                self.last_speed = v_r;
                 let v_cap = path_speed(constraints.max_linear_velocity, 0.0, stop, prep.pos_tol, cfg.kp_linear, constraints);
                 let back = prep.allow_reverse && direction_at(&self.base.path.speeds, &prep.proj).is_some_and(|d| d < 0);
                 // A reversing leg is tracked by the body facing against its
-                // direction of travel, at negative speed.
+                // direction of travel, at negative speed; the body trails the
+                // bend by its pose's lead on the rear axle either way.
+                let trail = bend_heading(kappa, if back { -1.0 } else { 1.0 } * axle_offset(constraints));
+                let omega_r = v_r * kappa / trail.cos();
                 if back {
-                    (p.x, p.y, normalize_angle(h + PI), -v_r, v_r * kappa, v_cap)
+                    (p.x, p.y, normalize_angle(h + PI - trail), -v_r, omega_r, v_cap)
                 } else {
-                    (p.x, p.y, h, v_r, v_r * kappa, v_cap)
+                    (p.x, p.y, normalize_angle(h - trail), v_r, omega_r, v_cap)
                 }
             }
         };

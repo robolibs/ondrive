@@ -6,12 +6,13 @@ use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
     path_to_body,
     can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, holonomic_point_command,
-    is_ackermann, is_holonomic, path_speed, reverse_allowed, steering_limit, steering_to_curvature,
+    axle_point_offset, braked_for_bends, is_ackermann, is_holonomic, path_speed, reverse_allowed, steering_limit,
+    steering_to_curvature,
     wheelbase,
 };
 use crate::core::math::{heading_error, normalize_angle};
 use crate::core::path::{
-    PathCursor, PathProjection, curvature_at_projection, project, speed_cap,
+    PathCursor, PathProjection, curvature_at_arc_length, curvature_at_projection, project, speed_cap,
 };
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
@@ -38,6 +39,7 @@ pub struct StanleyFollower {
     pub base: ControllerBase,
     pub stanley_config: StanleyConfig,
     cursor: PathCursor,
+    last_speed: f64,
 }
 
 impl StanleyFollower {
@@ -209,20 +211,22 @@ impl Controller for StanleyFollower {
             .map_or(constraints.max_linear_velocity, |v| {
                 v.min(constraints.max_linear_velocity)
             });
-        let v = direction
-            * path_speed(
-                nominal,
-                kappa_path,
-                self.base.distance_left(&at_robot, length).min(stop_distance),
-                pos_tol,
-                cfg.kp_linear,
-                constraints,
-            )
+        let left = self.base.distance_left(&at_robot, length).min(stop_distance);
+        let v = path_speed(nominal, kappa_path, left, pos_tol, cfg.kp_linear, constraints)
             * heading_speed_scale(theta_e, constraints);
+        let v_now = if state.velocity_valid { state.velocity.linear } else { self.last_speed };
+        let (waypoints, cum, s) = (&self.base.path.waypoints, &self.cursor.cum, at_robot.arc_length);
+        let v = braked_for_bends(v, v_now, nominal, left, |d| curvature_at_arc_length(waypoints, cum, s + d), constraints);
+        self.last_speed = v;
+        let v = direction * v;
 
+        // The steered axle runs its own bend, off the one the pose follows.
+        let lead = if reverse || !ackermann { 0.0 } else { wheelbase(constraints) };
+        let body_bend = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &at_robot);
+        let e_lat = proj.lateral_error - axle_point_offset(body_bend, rear_offset, lead);
         let sc = &self.stanley_config;
         let speed = if state.velocity_valid { state.velocity.linear.abs() } else { v.abs() };
-        let cross_term = (-cfg.k_cross_track * proj.lateral_error).atan2(sc.k_soft.max(1e-3) + speed);
+        let cross_term = (-cfg.k_cross_track * e_lat).atan2(sc.k_soft.max(1e-3) + speed);
         let mut raw = cfg.k_heading * theta_e + cross_term;
         if state.velocity_valid && sc.k_yaw_rate != 0.0 {
             raw += sc.k_yaw_rate * (v * kappa_path - state.velocity.angular);

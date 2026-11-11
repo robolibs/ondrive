@@ -5,11 +5,12 @@
 use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
     can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, holonomic_point_command,
-    is_ackermann, is_holonomic, max_curvature, path_speed, reverse_allowed, world_to_body,
+    body_heading_on_path, braked_for_bends, is_ackermann, is_holonomic, max_curvature, path_speed, reverse_allowed,
+    world_to_body,
 };
 use crate::core::math::{heading_error, normalize_angle};
 use crate::core::path::{
-    PathCursor, cusp_after, direction_at, sample, sharpest_ahead, speed_cap,
+    PathCursor, curvature_at_arc_length, cusp_after, direction_at, sample, sharpest_ahead, speed_cap,
 };
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
@@ -24,6 +25,7 @@ pub struct PurePursuitFollower {
     pub base: ControllerBase,
     cursor: PathCursor,
     lookahead_point: Option<Point>,
+    last_speed: f64,
 }
 
 impl PurePursuitFollower {
@@ -158,7 +160,8 @@ impl Controller for PurePursuitFollower {
         let back = direction_at(&self.base.path.speeds, &at_robot) == Some(-1);
         let s_target = (at_robot.arc_length + lookahead).min(cap);
         let (on_path, heading) = sample(&self.base.path.waypoints, &self.cursor.cum, s_target);
-        let body = if back { heading + PI } else { heading };
+        let bend = curvature_at_arc_length(&self.base.path.waypoints, &self.cursor.cum, s_target);
+        let body = body_heading_on_path(heading, bend, axle_offset, back);
         let target = Point::new(on_path.x - axle_offset * body.cos(), on_path.y - axle_offset * body.sin(), on_path.z);
         self.lookahead_point = Some(target);
 
@@ -215,9 +218,12 @@ impl Controller for PurePursuitFollower {
                 s.min(constraints.max_linear_velocity)
             });
         let scale = heading_speed_scale(alpha_eff, constraints);
-        let v = direction
-            * path_speed(nominal, kappa, stop_distance, pos_tol, cfg.kp_linear, constraints)
-            * scale;
+        let v = path_speed(nominal, kappa, stop_distance, pos_tol, cfg.kp_linear, constraints) * scale;
+        let v_now = if state.velocity_valid { state.velocity.linear } else { self.last_speed };
+        let (waypoints, cum, s) = (&self.base.path.waypoints, &self.cursor.cum, at_robot.arc_length);
+        let v = braked_for_bends(v, v_now, nominal, stop_distance, |d| curvature_at_arc_length(waypoints, cum, s + d), constraints);
+        self.last_speed = v;
+        let v = direction * v;
 
         let mut omega = v * kappa;
         if can_turn_in_place(constraints.steering_type) {

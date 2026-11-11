@@ -12,12 +12,12 @@
 
 use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
-    path_to_body,
+    path_to_body, axle_offset, bend_heading, braked_for_bends,
     actuation_delay, can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, is_holonomic,
     path_speed, reverse_allowed,
 };
 use crate::core::math::normalize_angle;
-use crate::core::path::{PathCursor, curvature_at_projection, cusp_after, speed_cap};
+use crate::core::path::{PathCursor, curvature_at_arc_length, curvature_at_projection, cusp_after, speed_cap};
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use nalgebra::{Matrix2, Matrix3, SMatrix, SVector, Vector2, Vector3};
 
@@ -61,6 +61,7 @@ pub struct LqrFollower {
     last_p: Option<Matrix2<f64>>,
     last_p_lagged: Option<Matrix3<f64>>,
     last_omega: f64,
+    last_speed: f64,
 }
 
 impl LqrFollower {
@@ -156,15 +157,17 @@ impl Controller for LqrFollower {
             .map_or(constraints.max_linear_velocity, |v| {
                 v.min(constraints.max_linear_velocity)
             });
-        let v = path_speed(
-            nominal,
-            kappa_path,
-            self.base.distance_left(&proj, length).min(stop_distance),
-            pos_tol,
-            cfg.kp_linear,
-            constraints,
-        ) * heading_speed_scale(theta_e, constraints);
+        let trail = bend_heading(kappa_path, sign * axle_offset(constraints));
+        let theta_e = normalize_angle(theta_e - trail);
+        let left = self.base.distance_left(&proj, length).min(stop_distance);
+        let v = path_speed(nominal, kappa_path, left, pos_tol, cfg.kp_linear, constraints)
+            * heading_speed_scale(theta_e, constraints);
+        let v_now = if state.velocity_valid { state.velocity.linear } else { self.last_speed };
+        let (waypoints, cum, s) = (&self.base.path.waypoints, &self.cursor.cum, proj.arc_length);
+        let v = braked_for_bends(v, v_now, nominal, left, |d| curvature_at_arc_length(waypoints, cum, s + d), constraints);
+        self.last_speed = v;
         let v_lin = v.abs().max(MIN_LINEARISATION_SPEED);
+        let kappa_path = kappa_path / trail.cos();
 
         let (q_lat, q_head) = (cfg.k_cross_track.max(1e-6), cfg.k_heading.max(1e-6));
         let tau = 0.5 * actuation_delay(constraints);
@@ -200,6 +203,7 @@ impl Controller for LqrFollower {
         self.last_p = None;
         self.last_p_lagged = None;
         self.last_omega = 0.0;
+        self.last_speed = 0.0;
     }
 
     fn reset(&mut self) {

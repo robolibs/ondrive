@@ -15,11 +15,15 @@
 //! turned round, where the steered axle trails and the steering flips sign.
 
 use crate::controller::{Controller, ControllerBase};
-use crate::core::kinematics::{actuation_delay, finalize, finalize_holonomic, is_ackermann, is_holonomic, max_curvature, path_speed, wheelbase};
+use crate::core::kinematics::{
+    actuation_delay, axle_point_offset, braked_for_bends, finalize, finalize_holonomic, is_ackermann, is_holonomic,
+    max_curvature, path_speed, wheelbase,
+};
 use crate::core::math::{normalize_angle, yaw_of};
-use crate::core::path::{PathCursor, curvature_at_arc_length, curvature_at_projection, sample, speed_cap};
+use crate::core::path::{PathCursor, curvature_at_arc_length, curvature_at_projection, cusp_after, sample, speed_cap};
 use crate::pred::mppi::{prepare, signed_speed_at};
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
+use datapod::Point;
 use std::f64::consts::PI;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -53,6 +57,7 @@ pub struct SlipAdaptiveFollower {
     /// Steering angle the actuator is taken to hold, following the commands
     /// at the steering rate.
     steering: f64,
+    last_speed: f64,
 }
 
 impl SlipAdaptiveFollower {
@@ -101,8 +106,6 @@ const CHAINED_BLEND: f64 = 0.4;
 /// `TIGHT_BLEND` more.
 const TIGHT_LIMIT: f64 = 0.8;
 const TIGHT_BLEND: f64 = 0.4;
-/// Metres between the path curvatures read ahead for the speed.
-const CURVATURE_SCAN: f64 = 0.5;
 
 /// Curvature of the motion that brings lateral error `y` and heading error
 /// `theta2` (both measured against the slid direction of travel) onto a
@@ -146,18 +149,15 @@ impl Controller for SlipAdaptiveFollower {
         let here = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &prep.proj);
         let nominal = speed_cap(&self.base.path.speeds, &prep.proj)
             .map_or(constraints.max_linear_velocity, |s| s.abs().min(constraints.max_linear_velocity));
-        let a_max = constraints.max_linear_acceleration.abs().max(0.1);
-        let braking = nominal * nominal / (2.0 * a_max) + nominal * actuation_delay(constraints);
-        let sharpest = (0..=(braking / CURVATURE_SCAN).ceil() as usize)
-            .map(|i| curvature_at_arc_length(&self.base.path.waypoints, &self.cursor.cum, prep.proj.arc_length + i as f64 * CURVATURE_SCAN))
-            .fold(here, |a, k| if k.abs() > a.abs() { k } else { a });
-        let speed = path_speed(nominal, sharpest, self.base.distance_left(&prep.proj, self.cursor.total_length()), prep.pos_tol, cfg.kp_linear, constraints);
+        let s0 = prep.proj.arc_length;
+        let cusp = cusp_after(&self.base.path.speeds, &self.cursor.cum, s0).map_or(f64::INFINITY, |c| c - s0);
+        let left = self.base.distance_left(&prep.proj, self.cursor.total_length()).min(cusp);
+        let speed = path_speed(nominal, here, left, prep.pos_tol, cfg.kp_linear, constraints);
+        let v_now = if state.velocity_valid { state.velocity.linear } else { self.last_speed };
+        let (waypoints, cum) = (&self.base.path.waypoints, &self.cursor.cum);
+        let speed = braked_for_bends(speed, v_now, nominal, left, |d| curvature_at_arc_length(waypoints, cum, s0 + d), constraints);
+        self.last_speed = speed;
         let preview = speed * actuation_delay(constraints);
-        let kappa = if preview > 1e-3 {
-            curvature_at_arc_length(&self.base.path.waypoints, &self.cursor.cum, prep.proj.arc_length + preview)
-        } else {
-            here
-        };
 
         if is_holonomic(constraints.steering_type) {
             let yaw = yaw_of(&state.pose);
@@ -173,8 +173,19 @@ impl Controller for SlipAdaptiveFollower {
         let (beta_r, beta_f) = self.sideslip;
         let yaw = yaw_of(&state.pose) + if reverse { PI } else { 0.0 };
         let rear = if ackermann { constraints.rear_wheelbase.max(0.0) } else { 0.0 };
-        let theta = normalize_angle(yaw - prep.proj.heading);
-        let y = prep.proj.lateral_error - direction * rear * theta.sin();
+        // The law steers the rear axle along the bend inside the pose's path.
+        let (rx, ry) = (state.pose.point.x - direction * rear * yaw.cos(), state.pose.point.y - direction * rear * yaw.sin());
+        let at_rear = if rear > 0.0 {
+            let (waypoints, speeds) = (&self.base.path.waypoints, &self.base.path.speeds);
+            self.cursor
+                .project_on_leg(waypoints, speeds, Point::new(rx, ry, 0.0), prep.proj.segment, prep.proj.arc_length)
+                .unwrap_or(prep.proj)
+        } else {
+            prep.proj
+        };
+        let theta = normalize_angle(yaw - at_rear.heading);
+        let bend = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &at_rear);
+        let y = at_rear.lateral_error - axle_point_offset(bend, rear, 0.0);
         let theta2 = normalize_angle(theta + beta_r);
 
         let steer_time = if ackermann && constraints.max_steering_rate > 0.0 {
@@ -189,10 +200,14 @@ impl Controller for SlipAdaptiveFollower {
         };
         let omega_n = 2.0 / settle;
         let gains = (omega_n * omega_n, 2.0 * omega_n);
+        let kappa = if preview > 1e-3 {
+            curvature_at_arc_length(&self.base.path.waypoints, &self.cursor.cum, (at_rear.arc_length + preview).min(s0 + cusp))
+        } else {
+            bend
+        };
         let chained = chained_curvature(y, theta2, kappa, gains);
-        let (target, _) = sample(&self.base.path.waypoints, &self.cursor.cum, prep.proj.arc_length + settle);
+        let (target, _) = sample(&self.base.path.waypoints, &self.cursor.cum, (s0 + settle).min(s0 + cusp));
         let (s, c) = (yaw + beta_r).sin_cos();
-        let (rx, ry) = (state.pose.point.x - direction * rear * yaw.cos(), state.pose.point.y - direction * rear * yaw.sin());
         let (dx, dy) = (target.x - rx, target.y - ry);
         let along = c * dx + s * dy;
         let across = -s * dx + c * dy;

@@ -6,10 +6,12 @@
 //! time is taken; when none does, the one that meets them latest.
 
 use crate::controller::{Controller, ControllerBase};
-use crate::core::kinematics::{finalize, is_ackermann, max_curvature, path_speed, wheelbase};
+use crate::core::kinematics::{
+    body_heading_on_path, braked_for_bends, finalize, is_ackermann, max_curvature, path_speed, wheelbase,
+};
 use crate::core::math::normalize_angle;
 use crate::core::obstacles::{CollisionChecker, arc_course, robot_radius};
-use crate::core::path::{PathCursor, cusp_after, direction_at, sample, sharpest_ahead, speed_cap};
+use crate::core::path::{PathCursor, curvature_at_arc_length, cusp_after, direction_at, sample, sharpest_ahead, speed_cap};
 use crate::pred::mppi::{Swerve, build_reference, pick_detour, prepare};
 use crate::types::{DebugFrame, DebugLevel, Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
@@ -144,7 +146,8 @@ impl Controller for VelocityObstacleFollower {
         }
         // The rear axle aims where it stands when the pose is at the target,
         // facing along the way there.
-        let body = target_heading + body_turn;
+        let bend = curvature_at_arc_length(waypoints, cum, (s + lookahead).min(cap));
+        let body = body_heading_on_path(target_heading, bend, axle, back);
         let (dx, dy) = (target.x - axle * body.cos() - rx, target.y - axle * body.sin() - ry);
         let reach = dx.hypot(dy).max(1e-6);
         let alpha = normalize_angle(dy.atan2(dx) - travel);
@@ -157,6 +160,8 @@ impl Controller for VelocityObstacleFollower {
         let nominal = speed_cap(speeds, &prep.proj).map_or(constraints.max_linear_velocity, |c| c.min(constraints.max_linear_velocity));
         let left = self.base.distance_left(&prep.proj, length).min(cap - s);
         let v_pref = path_speed(nominal, k_pref, left, prep.pos_tol, cfg.kp_linear, constraints);
+        let v_measured = if state.velocity_valid { state.velocity.linear } else { v_pref };
+        let v_pref = braked_for_bends(v_pref, v_measured, nominal, left, |d| curvature_at_arc_length(waypoints, cum, s + d), constraints);
 
         // Commands reachable within the window.
         let v_max = constraints.max_linear_velocity.abs();
