@@ -5,7 +5,7 @@
 //! switching runs at the cusps. Replans when the robot drifts off the
 //! curve or the goal changes.
 
-use crate::controller::{Controller, ControllerBase, check_goal};
+use crate::controller::{Controller, ControllerBase, check_goal, pass_through};
 use crate::core::curves::{CurvePath, dubins_all, reeds_shepp_all};
 use crate::core::obstacles::CollisionChecker;
 use crate::core::kinematics::{
@@ -18,7 +18,7 @@ use crate::types::{
     ControllerConfig, ControllerStatus, Goal, OutputUnits, Path, RobotConstraints, RobotState,
     VelocityCommand, WorldConstraints,
 };
-use datapod::{Point, Pose};
+use datapod::{Euler, Point, Pose, Quaternion};
 use std::f64::consts::PI;
 
 /// Shortest time between two replans while tracking the same goal.
@@ -164,6 +164,12 @@ impl PoseReachFollower {
         self.refinements
     }
 
+    /// Lookahead of the inner Pure Pursuit: the configured one, no shorter
+    /// than the controller config's.
+    fn lookahead(&self) -> f64 {
+        self.pose_config.lookahead.max(self.base.config.lookahead_distance)
+    }
+
     fn radius(&self, constraints: &RobotConstraints) -> f64 {
         if self.pose_config.turning_radius > 0.0 {
             return self.pose_config.turning_radius;
@@ -209,7 +215,7 @@ impl PoseReachFollower {
             let gyaw = yaw_of(&goal.target_pose);
             let dir = run.direction as f64;
             let v = constraints.max_linear_velocity.abs().max(0.1);
-            let n_ext = (self.pose_config.lookahead / spacing).ceil().max(1.0) as usize;
+            let n_ext = (self.lookahead() / spacing).ceil().max(1.0) as usize;
             for i in 1..=n_ext {
                 let s = dir * i as f64 * spacing;
                 path.waypoints.push(Pose {
@@ -226,7 +232,7 @@ impl PoseReachFollower {
         }
         let mut cfg = self.base.config.clone();
         cfg.output_units = OutputUnits::Physical;
-        cfg.lookahead_distance = self.pose_config.lookahead;
+        cfg.lookahead_distance = self.lookahead();
         cfg.allow_reverse = run.direction < 0;
         self.follower.set_config(cfg);
         self.follower.set_path(path);
@@ -272,6 +278,48 @@ impl PoseReachFollower {
         true
     }
 
+    /// Pursuit of a goal to pass at speed: along the line through it on its
+    /// heading, run on past it, with no curve round to that heading.
+    fn pass(
+        &mut self,
+        state: &RobotState,
+        goal: &Goal,
+        constraints: &RobotConstraints,
+        dt: f64,
+        world: Option<&WorldConstraints>,
+        reverse: bool,
+    ) -> VelocityCommand {
+        let heading = yaw_of(&goal.target_pose);
+        let back = reverse && normalize_angle(heading - yaw_of(&state.pose)).abs() > PI / 2.0;
+        let key = (goal.target_pose.point.x, goal.target_pose.point.y, heading, reverse);
+        if self.planned_for != Some(key) {
+            let direction: i8 = if back { -1 } else { 1 };
+            let v = constraints.max_linear_velocity.abs().max(0.1);
+            let accel = constraints.max_linear_acceleration.abs().max(0.1);
+            let on = self.lookahead().max(1.0) + v * v / (2.0 * accel);
+            let (s, c) = heading.sin_cos();
+            let p = goal.target_pose.point;
+            let body = Quaternion::from_euler(Euler::new(0.0, 0.0, if back { heading + PI } else { heading }));
+            let mut path = Path::default();
+            for point in [state.pose.point, p, Point::new(p.x + on * c, p.y + on * s, p.z)] {
+                path.waypoints.push(Pose { point, rotation: body });
+                path.speeds.push(v * direction as f64);
+            }
+            self.runs = vec![Run { path: path.clone(), direction }];
+            self.run_index = 0;
+            let mut cfg = self.base.config.clone();
+            cfg.output_units = OutputUnits::Physical;
+            cfg.lookahead_distance = self.lookahead();
+            cfg.allow_reverse = back;
+            self.follower.set_config(cfg);
+            self.follower.set_path(path);
+            self.planned_for = Some(key);
+        }
+        self.base.status.goal_reached = false;
+        self.base.status.mode = "pose_reach/pass".into();
+        self.follower.compute_control(state, goal, constraints, dt, world)
+    }
+
     /// The goal handed to the follower: the current run's end, or the real
     /// goal on the last run.
     fn run_goal(&self, goal: &Goal) -> Goal {
@@ -315,7 +363,7 @@ impl Controller for PoseReachFollower {
         let check = check_goal(&state.pose, goal, &self.base.config);
         self.base.status.distance_to_goal = check.distance;
         self.base.status.heading_error = check.yaw_error;
-        if check.reached {
+        if check.reached && pass_through(goal) == 0.0 {
             self.base.status.goal_reached = true;
             self.base.status.mode = "stopped".into();
             return stop("Goal reached");
@@ -338,6 +386,9 @@ impl Controller for PoseReachFollower {
             );
         }
         let reverse = reverse_allowed(&self.base.config, state);
+        if pass_through(goal) > 0.0 {
+            return self.pass(state, goal, constraints, dt, world, reverse);
+        }
         let key = (
             goal.target_pose.point.x,
             goal.target_pose.point.y,
@@ -413,7 +464,7 @@ impl Controller for PoseReachFollower {
             return cmd;
         }
         let mut omega = cmd.angular_velocity;
-        let approach = self.pose_config.lookahead;
+        let approach = self.lookahead();
         if last && check.distance < approach {
             let blend = 1.0 - check.distance / approach;
             omega += blend * self.pose_config.k_final_heading * check.yaw_error;
