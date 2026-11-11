@@ -102,7 +102,6 @@ impl TrackerKind {
                 | TrackerKind::SlipAdaptive
                 | TrackerKind::Frenet
                 | TrackerKind::VelocityObstacle
-                | TrackerKind::Teb
         )
     }
 }

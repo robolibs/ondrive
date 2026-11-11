@@ -14,13 +14,12 @@
 
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::{
-    actuation_delay, axle_offset, body_heading_on_path, finalize, finalize_holonomic, is_ackermann, is_holonomic,
-    max_curvature, speed_bounds, wheelbase,
+    actuation_delay, finalize, finalize_holonomic, is_ackermann, is_holonomic, max_curvature, speed_bounds, wheelbase,
     world_to_body,
 };
 use crate::core::math::{normalize_angle, yaw_of};
 use crate::core::obstacles::{CollisionChecker, robot_radius};
-use crate::core::path::{PathCursor, cumulative_lengths, curvature_at_arc_length, project, sample};
+use crate::core::path::{PathCursor, cumulative_lengths, project, sample};
 use crate::pred::mppi::{Swerve, build_reference, current_lateral_speed, current_speed, give_way_share, pick_detour, prepare, signed_speed_at};
 use crate::types::{Goal, Obstacle, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::{Euler, Point, Pose, Quaternion};
@@ -83,9 +82,6 @@ fn default_turn_filter() -> f64 {
 /// Share of the distance covered during the steering delay added to the
 /// obstacle margin.
 const LAG_MARGIN_GAIN: f64 = 0.25;
-/// Gap, m/s, between the measured speed and the last command within which
-/// the next command ramps from the command.
-const HELD_SPEED_SLACK: f64 = 0.3;
 
 #[derive(Clone, Debug, Default)]
 pub struct TebFollower {
@@ -100,10 +96,6 @@ pub struct TebFollower {
     /// Side the band last went round obstacles on: +1 left, −1 right, 0 none.
     side: f64,
     auto_path_goal: Option<(f64, f64, f64)>,
-    /// Distance, metres, the pose rides ahead of the axle the body turns about.
-    axle: f64,
-    /// Tightest curvature the platform turns at, the sharpest bend it follows.
-    k_max: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -134,8 +126,6 @@ struct Problem<'a> {
     steer_per_wheelbase: f64,
     ackermann: bool,
     holonomic: bool,
-    /// Distance, metres, the pose rides ahead of the axle the body turns about.
-    axle: f64,
     /// Path segment the robot projects onto, where projections start.
     start_segment: usize,
 }
@@ -221,8 +211,7 @@ impl Problem<'_> {
             // A holonomic platform can translate off its heading axis, so
             // the common-arc residual below does not apply to it.
             if !self.holonomic {
-                let (rdx, rdy) = (dx - self.axle * (c1 - c0), dy - self.axle * (s1 - s0));
-                let kin = (c0 + c1) * rdy - (s0 + s1) * rdx;
+                let kin = (c0 + c1) * dy - (s0 + s1) * dx;
                 cost += c.weight_kinematic * kin * kin;
             }
 
@@ -387,8 +376,7 @@ impl TebFollower {
     fn path_pose(&self, s: f64) -> (Point, f64) {
         let (p, h) = sample(&self.base.path.waypoints, &self.cursor.cum, s);
         let reverse = signed_speed_at(&self.base.path.speeds, &self.cursor.cum, s).is_some_and(|v| v < 0.0);
-        let bend = curvature_at_arc_length(&self.base.path.waypoints, &self.cursor.cum, s);
-        (p, body_heading_on_path(h, bend.clamp(-self.k_max, self.k_max), self.axle, reverse))
+        (p, if reverse { normalize_angle(h + std::f64::consts::PI) } else { h })
     }
 
     fn initialise_band(
@@ -597,8 +585,6 @@ impl Controller for TebFollower {
             }
         };
         let checker = CollisionChecker::new(world, constraints, 0.0).with_spread(1.0);
-        self.axle = axle_offset(constraints);
-        self.k_max = max_curvature(constraints);
         let holonomic = is_holonomic(constraints.steering_type);
         let v_now = current_speed(state, self.last_v);
         let vy_now = if holonomic { current_lateral_speed(state, self.last_vy) } else { 0.0 };
@@ -646,7 +632,6 @@ impl Controller for TebFollower {
             ackermann: is_ackermann(constraints.steering_type),
             holonomic,
             start_segment,
-            axle: self.axle,
         };
         self.optimise(&problem);
 
@@ -679,10 +664,10 @@ impl Controller for TebFollower {
         }
 
         let forward = (dx * yaw0.cos() + dy * yaw0.sin()).signum();
-        let stop = (2.0 * a_max * (cusp - prep.proj.arc_length).max(0.0)).sqrt();
-        // Ramped from the speed last held, then capped to stop by the cusp.
-        let base = crate::pred::mppi::held_speed(v_now, self.last_v, HELD_SPEED_SLACK);
-        let v = (forward * length / span).clamp(base - a_max * dt, base + a_max * dt).clamp(-stop, stop);
+        // Capped to stop by the cusp, braking after the actuation delay.
+        let lead = v_now.abs() * actuation_delay(constraints);
+        let stop = (2.0 * a_max * (cusp - prep.proj.arc_length - lead).max(0.0)).sqrt();
+        let v = (forward * length / span).clamp(v_now - a_max * dt, v_now + a_max * dt).clamp(-stop, stop);
         let share = self.give_way(state, prep.proj.arc_length, constraints, world, (v, w));
         let (v, w) = (v * share, w * share);
 
