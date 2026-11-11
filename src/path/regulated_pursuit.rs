@@ -76,7 +76,7 @@ const DETOUR_DT: f64 = 0.2;
 const DETOUR_SPEED_SHARE: f64 = 0.8;
 /// Room, metres, the detour keeps beyond the robot's radius on top of the
 /// shared detour margin.
-const DETOUR_ROOM: f64 = 0.2;
+const DETOUR_ROOM: f64 = 0.4;
 /// Shares of the regulated speed tried, fastest first, until the arc is clear.
 const YIELD_SHARES: [f64; 4] = [1.0, 0.75, 0.5, 0.25];
 /// Seconds at least that the yield check watches the arc for traffic.
