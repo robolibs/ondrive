@@ -235,8 +235,7 @@ impl Controller for StanleyFollower {
 
         let omega = if ackermann {
             let dmax = steering_limit(constraints);
-            // Reversing, the axle tracked is not the steered one, so the
-            // bend's own steering is fed forward.
+            // Reversing, the bend's own steering is fed forward.
             let bend_steer = if reverse { curvature_to_steering(followable(kappa_path, constraints), constraints) } else { 0.0 };
             let delta = (direction * (raw + bend_steer)).clamp(-dmax, dmax);
             v * steering_to_curvature(delta, constraints)

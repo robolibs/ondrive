@@ -186,8 +186,8 @@ impl Controller for FlcFollower {
         let mut epsi = prep.epsi;
         let trail = bend_heading(followable(kappa_path, constraints), sign * axle_offset(constraints));
         let mut heading_trail = trail;
-        // Reversing, the pose trails the axle the body turns about, so the
-        // errors are read at that leading axle, which runs inside the bend.
+        // Reversing, the errors are read at the leading axle the body turns
+        // about, which runs inside the bend.
         let axle = axle_offset(constraints);
         if reverse && axle > 0.0 {
             let yaw = state.pose.rotation.to_euler().yaw;
