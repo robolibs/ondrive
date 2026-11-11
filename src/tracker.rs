@@ -1424,13 +1424,15 @@ fn predicted_through_actuation(
     } else {
         last.map_or((0.0, 0.0), |(v, w, _)| (v, w))
     };
+    let lateral = crate::core::kinematics::axle_offset(constraints) * w;
     let steps = 10;
     let h = delay / steps as f64;
     let mut yaw = crate::core::math::yaw_of(&state.pose);
     let (mut x, mut y) = (state.pose.point.x, state.pose.point.y);
     for _ in 0..steps {
-        x += v * (yaw + 0.5 * w * h).cos() * h;
-        y += v * (yaw + 0.5 * w * h).sin() * h;
+        let mid = yaw + 0.5 * w * h;
+        x += (v * mid.cos() - lateral * mid.sin()) * h;
+        y += (v * mid.sin() + lateral * mid.cos()) * h;
         yaw += w * h;
     }
     let mut ahead = state.clone();

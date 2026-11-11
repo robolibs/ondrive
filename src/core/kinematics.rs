@@ -35,6 +35,38 @@ pub fn wheelbase(constraints: &RobotConstraints) -> f64 {
     }
 }
 
+/// Distance, metres, the pose sits ahead of the axle the platform turns
+/// about: the rear axle of an Ackermann platform, none for others.
+pub fn axle_offset(constraints: &RobotConstraints) -> f64 {
+    if is_ackermann(constraints.steering_type) { constraints.rear_wheelbase.max(0.0) } else { 0.0 }
+}
+
+/// Angle, radians, by which the heading of a pose `ahead` metres in front
+/// of its turning axle trails the path in a bend of curvature `kappa` that
+/// the pose follows; the yaw rate there is `v * kappa / cos(angle)`.
+pub fn bend_heading(kappa: f64, ahead: f64) -> f64 {
+    (ahead * kappa).clamp(-0.95, 0.95).asin()
+}
+
+/// Heading of a body whose pose, `ahead` metres in front of its turning
+/// axle, follows a path of travel `heading` and curvature `kappa`, driving
+/// backwards when `back`.
+pub fn body_heading_on_path(heading: f64, kappa: f64, ahead: f64, back: bool) -> f64 {
+    if back {
+        normalize_angle(heading + std::f64::consts::PI - bend_heading(kappa, -ahead))
+    } else {
+        normalize_angle(heading - bend_heading(kappa, ahead))
+    }
+}
+
+/// Signed offset, metres (positive = left), from a bend of curvature
+/// `kappa` that the pose follows to the bend traced by a point `lead`
+/// metres ahead of the turning axle, for a pose `ahead` metres ahead of it.
+pub fn axle_point_offset(kappa: f64, ahead: f64, lead: f64) -> f64 {
+    let spread = lead * lead - ahead * ahead;
+    -spread * kappa / ((1.0 + spread * kappa * kappa).max(0.0).sqrt() + 1.0)
+}
+
 /// Seconds a command takes to act: the time a rate-limited Ackermann
 /// steering needs to swing half way to lock, at most 1.5 s; 0 for other
 /// platforms.
@@ -138,6 +170,32 @@ pub fn path_speed(
     let braking = if accel > 0.0 { (2.0 * accel * left).sqrt() } else { f64::INFINITY };
     let taper = (kp_linear.max(0.1) * left).min(braking).max(0.15 * constraints.max_linear_velocity.max(0.0));
     (nominal * curvature_scale.max(0.25)).min(taper).max(0.0)
+}
+
+/// Points within braking reach `braked_for_bends` reads the bends at.
+const BRAKING_SAMPLES: usize = 10;
+
+/// `speed`, capped so that braking at `max_linear_acceleration`, once the
+/// actuation delay has passed, slows the robot from `v_now` to the
+/// `path_speed` of `nominal` at the curvature `bend(sigma)` at each distance
+/// `sigma` on within its braking distance, and no further than `reach`.
+pub fn braked_for_bends(
+    speed: f64,
+    v_now: f64,
+    nominal: f64,
+    reach: f64,
+    bend: impl Fn(f64) -> f64,
+    constraints: &RobotConstraints,
+) -> f64 {
+    let accel = constraints.max_linear_acceleration.abs().max(0.1);
+    let v_now = v_now.abs();
+    let delay = actuation_delay(constraints);
+    let ahead = (v_now * v_now / (2.0 * accel) + v_now * delay).min(reach.max(0.0));
+    (1..=BRAKING_SAMPLES).fold(speed, |speed, i| {
+        let sigma = ahead * i as f64 / BRAKING_SAMPLES as f64;
+        let at_bend = path_speed(nominal, bend(sigma), f64::INFINITY, 0.0, 1.0, constraints);
+        speed.min((at_bend * at_bend + 2.0 * accel * (sigma - v_now * delay).max(0.0)).sqrt())
+    })
 }
 
 /// `(v, omega)` of a differential or skid-steer platform, scaled together
