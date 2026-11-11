@@ -9,7 +9,7 @@
 
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::{
-    actuation_delay, axle_offset, bend_heading, braked_for_bends, finalize, finalize_holonomic, followable, is_holonomic,
+    actuation_delay, axle_offset, bend_heading, braked_for_bends, can_turn_in_place, finalize, finalize_holonomic, followable, is_holonomic,
     path_speed,
 };
 use crate::core::math::{normalize_angle, yaw_of};
@@ -84,7 +84,7 @@ impl Controller for KanayamaFollower {
         let (x_r, y_r, yaw_r, v_r, omega_r, v_cap) = match &self.trajectory {
             Some(traj) => {
                 let s = traj.sample(self.clock);
-                if s.finished && !is_holonomic(constraints.steering_type) {
+                if s.finished && !is_holonomic(constraints.steering_type) && can_turn_in_place(constraints.steering_type) {
                     self.settle.set_config(cfg.clone());
                     let end = Goal { target_pose: s.pose, ..goal.clone() };
                     let cmd = self.settle.compute_control(state, &end, constraints, dt, None);

@@ -3,15 +3,17 @@
 //! beta)` and the law `v = k_rho rho`, `omega = k_alpha alpha + k_beta beta`
 //! converges to position and orientation simultaneously for
 //! `k_rho > 0`, `k_beta < 0`, `k_alpha > k_rho`. Goals behind the robot are
-//! approached in reverse when allowed.
+//! approached in reverse when allowed. A platform that cannot turn in
+//! place is brought to the pose along planned curves (`PoseReachFollower`).
 
-use crate::controller::{Controller, ControllerBase, check_goal};
+use crate::controller::{Controller, ControllerBase, check_goal, pass_through};
 use crate::core::kinematics::{
     can_turn_in_place, finalize, finalize_holonomic, is_holonomic, reverse_allowed, stop,
     world_to_body,
 };
 use crate::core::math::{normalize_angle, yaw_of};
-use crate::types::{Goal, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
+use crate::point::PoseReachFollower;
+use crate::types::{ControllerConfig, Goal, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use std::f64::consts::PI;
 
 #[derive(Clone, Debug, Default)]
@@ -19,6 +21,8 @@ pub struct PoseRegulatorFollower {
     pub base: ControllerBase,
     /// Driving direction chosen for the goal it belongs to.
     direction: Option<((f64, f64, f64), f64)>,
+    /// Curve planner and tracker for a platform that cannot turn in place.
+    curves: PoseReachFollower,
 }
 
 impl PoseRegulatorFollower {
@@ -44,7 +48,7 @@ impl Controller for PoseRegulatorFollower {
         goal: &Goal,
         constraints: &RobotConstraints,
         dt: f64,
-        _world: Option<&WorldConstraints>,
+        world: Option<&WorldConstraints>,
     ) -> VelocityCommand {
         if !(dt.is_finite() && dt > 0.0) {
             return VelocityCommand::invalid("dt must be positive and finite");
@@ -55,7 +59,7 @@ impl Controller for PoseRegulatorFollower {
         self.base.status.distance_to_goal = check.distance;
         self.base.status.heading_error = check.yaw_error;
         self.base.status.cross_track_error = 0.0;
-        if check.reached {
+        if check.reached && pass_through(goal) == 0.0 {
             self.base.status.goal_reached = true;
             self.base.status.mode = "stopped".into();
             return stop("Goal reached");
@@ -76,8 +80,12 @@ impl Controller for PoseRegulatorFollower {
             return finalize_holonomic(vx, vy, omega, constraints, &cfg, "Regulating to pose");
         }
         if !can_turn_in_place(constraints.steering_type) {
-            self.base.status.mode = "unsupported".into();
-            return VelocityCommand::invalid("pose regulator needs a platform that can turn in place");
+            let cmd = self.curves.compute_control(state, goal, constraints, dt, world);
+            let inner = self.curves.get_status();
+            self.base.status.goal_reached = inner.goal_reached;
+            self.base.status.cross_track_error = inner.cross_track_error;
+            self.base.status.mode = format!("pose_regulator/{}", inner.mode);
+            return cmd;
         }
 
         let (k_rho, k_alpha, k_beta) = self.gains();
@@ -115,6 +123,17 @@ impl Controller for PoseRegulatorFollower {
         let omega = (k_alpha * alpha + k_beta * beta) * scale;
         self.base.status.mode = if direction > 0.0 { "regulating".into() } else { "regulating_reverse".into() };
         finalize(v, omega, constraints, &cfg, allow_reverse, "Regulating to pose")
+    }
+
+    fn set_config(&mut self, config: ControllerConfig) {
+        self.curves.set_config(config.clone());
+        self.base.config = config;
+    }
+
+    fn reset(&mut self) {
+        self.curves.reset();
+        self.direction = None;
+        self.base.status = Default::default();
     }
 
     fn get_type(&self) -> &'static str {
