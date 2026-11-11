@@ -108,7 +108,7 @@ impl Default for FrenetConfig {
             weight_offset: 1.0,
             weight_turn: 1.0,
             weight_speed: 12.0,
-            weight_clearance: 4.0,
+            weight_clearance: 8.0,
             weight_switch: 0.5,
             preview_s: 0.1,
         }
