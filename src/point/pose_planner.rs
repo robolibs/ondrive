@@ -248,14 +248,27 @@ impl PoseReachFollower {
     ) -> bool {
         let radius = self.radius(constraints);
         let spacing = self.pose_config.sample_spacing.max(0.02);
-        let candidates = if reverse {
-            reeds_shepp_all(&state.pose, &goal.target_pose, radius, spacing)
-        } else {
-            dubins_all(&state.pose, &goal.target_pose, radius, spacing)
-        };
-        let mut candidates = candidates;
+        let curves = |to: &Pose| if reverse { reeds_shepp_all(&state.pose, to, radius, spacing) } else { dubins_all(&state.pose, to, radius, spacing) };
         let cost = |c: &CurvePath| plan_cost(c, &self.pose_config);
+        let mut candidates = curves(&goal.target_pose);
         candidates.sort_by(|a, b| cost(a).total_cmp(&cost(b)));
+        // A platform that cannot turn in place comes at the goal along a
+        // straight run-in, forward or reversing, unless that costs a loop.
+        if !can_turn_in_place(constraints.steering_type) {
+            let run_in = self.lookahead() + crate::controller::effective_tolerances(goal, &self.base.config).0;
+            let mut led: Vec<CurvePath> = [1i8, -1]
+                .into_iter()
+                .filter(|d| *d > 0 || reverse)
+                .flat_map(|d| with_run_in(&goal.target_pose, run_in, d, spacing, &curves))
+                .collect();
+            led.sort_by(|a, b| cost(a).total_cmp(&cost(b)));
+            let direct = candidates.first().map_or(f64::INFINITY, |c| cost(c));
+            let straight_in = candidates.first().is_some_and(|c| ends_straight(c, &goal.target_pose, run_in));
+            if !straight_in && led.first().is_some_and(|c| cost(c) <= direct + run_in) {
+                led.extend(candidates);
+                candidates = led;
+            }
+        }
         let checker = CollisionChecker::new(world, constraints, 0.0);
         let curve = if checker.has_obstacles() {
             candidates.into_iter().find(|c| {
@@ -521,6 +534,49 @@ impl Controller for PoseReachFollower {
     fn base_mut(&mut self) -> &mut ControllerBase {
         &mut self.base
     }
+}
+
+/// Heading, radians, within which a curve's last stretch counts as straight
+/// on the goal's heading.
+const STRAIGHT_IN: f64 = 0.02;
+
+/// Whether `curve` comes at `goal` along a straight on the goal's heading of
+/// at least `run_in` metres, or is that straight all along.
+fn ends_straight(curve: &CurvePath, goal: &Pose, run_in: f64) -> bool {
+    let heading = yaw_of(goal);
+    let mut covered = 0.0;
+    for w in curve.poses.windows(2).rev() {
+        if normalize_angle(yaw_of(&w[0]) - heading).abs() > STRAIGHT_IN {
+            return false;
+        }
+        covered += w[0].point.distance_to_2d(w[1].point);
+        if covered >= run_in {
+            return true;
+        }
+    }
+    true
+}
+
+/// Each of the `curves` to the pose `run_in` metres short of `goal` along its
+/// heading, driven in `direction` (+1 forward, −1 reversing), carried on
+/// straight to `goal`.
+fn with_run_in(goal: &Pose, run_in: f64, direction: i8, spacing: f64, curves: &dyn Fn(&Pose) -> Vec<CurvePath>) -> Vec<CurvePath> {
+    let (s, c) = yaw_of(goal).sin_cos();
+    let d = direction as f64;
+    let pre = Pose { point: Point::new(goal.point.x - d * run_in * c, goal.point.y - d * run_in * s, goal.point.z), rotation: goal.rotation };
+    let steps = (run_in / spacing).ceil().max(1.0) as usize;
+    curves(&pre)
+        .into_iter()
+        .map(|mut curve| {
+            for k in 1..=steps {
+                let u = d * run_in * k as f64 / steps as f64;
+                curve.poses.push(Pose { point: Point::new(pre.point.x + u * c, pre.point.y + u * s, goal.point.z), rotation: goal.rotation });
+                curve.directions.push(direction);
+            }
+            curve.length += run_in;
+            curve
+        })
+        .collect()
 }
 
 /// Planning cost of a curve: its length, reverse driving weighted by

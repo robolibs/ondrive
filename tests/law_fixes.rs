@@ -215,7 +215,7 @@ fn pose_reach_starts_each_goal_with_a_fresh_refinement_budget() {
         ..Default::default()
     };
     let a = Goal {
-        tolerance_orientation: 0.005,
+        tolerance_orientation: 1e-6,
         ..goal(3.0, 0.0)
     };
     for _ in 0..2000 {
