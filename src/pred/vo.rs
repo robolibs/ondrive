@@ -7,7 +7,7 @@
 
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::{
-    body_heading_on_path, braked_for_bends, finalize, is_ackermann, max_curvature, path_speed, wheelbase,
+    body_heading_on_path, braked_for_bends, finalize, followable, is_ackermann, max_curvature, path_speed, wheelbase,
 };
 use crate::core::math::normalize_angle;
 use crate::core::obstacles::{CollisionChecker, arc_course, robot_radius};
@@ -147,7 +147,7 @@ impl Controller for VelocityObstacleFollower {
         // The rear axle aims where it stands when the pose is at the target,
         // facing along the way there.
         let bend = curvature_at_arc_length(waypoints, cum, (s + lookahead).min(cap));
-        let body = body_heading_on_path(target_heading, bend, axle, back);
+        let body = body_heading_on_path(target_heading, followable(bend, constraints), axle, back);
         let (dx, dy) = (target.x - axle * body.cos() - rx, target.y - axle * body.sin() - ry);
         let reach = dx.hypot(dy).max(1e-6);
         let alpha = normalize_angle(dy.atan2(dx) - travel);

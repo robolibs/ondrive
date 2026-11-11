@@ -48,6 +48,13 @@ pub fn bend_heading(kappa: f64, ahead: f64) -> f64 {
     (ahead * kappa).clamp(-0.95, 0.95).asin()
 }
 
+/// `kappa` no sharper than the platform's tightest turn: the bend it drives
+/// round a corner it cannot follow.
+pub fn followable(kappa: f64, constraints: &RobotConstraints) -> f64 {
+    let k = max_curvature(constraints);
+    if k.is_finite() { kappa.clamp(-k, k) } else { kappa }
+}
+
 /// Heading of a body whose pose, `ahead` metres in front of its turning
 /// axle, follows a path of travel `heading` and curvature `kappa`, driving
 /// backwards when `back`.

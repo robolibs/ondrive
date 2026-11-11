@@ -6,7 +6,8 @@ use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
     path_to_body,
     can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, holonomic_point_command,
-    axle_point_offset, braked_for_bends, is_ackermann, is_holonomic, path_speed, reverse_allowed, steering_limit,
+    axle_point_offset, braked_for_bends, followable, is_ackermann, is_holonomic, path_speed, reverse_allowed,
+    steering_limit,
     steering_to_curvature,
     wheelbase,
 };
@@ -223,7 +224,7 @@ impl Controller for StanleyFollower {
         // The steered axle runs its own bend, off the one the pose follows.
         let lead = if reverse || !ackermann { 0.0 } else { wheelbase(constraints) };
         let body_bend = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &at_robot);
-        let e_lat = proj.lateral_error - axle_point_offset(body_bend, rear_offset, lead);
+        let e_lat = proj.lateral_error - axle_point_offset(followable(body_bend, constraints), rear_offset, lead);
         let sc = &self.stanley_config;
         let speed = if state.velocity_valid { state.velocity.linear.abs() } else { v.abs() };
         let cross_term = (-cfg.k_cross_track * e_lat).atan2(sc.k_soft.max(1e-3) + speed);

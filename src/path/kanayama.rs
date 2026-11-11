@@ -9,7 +9,8 @@
 
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::{
-    actuation_delay, axle_offset, bend_heading, braked_for_bends, finalize, finalize_holonomic, is_holonomic, path_speed,
+    actuation_delay, axle_offset, bend_heading, braked_for_bends, finalize, finalize_holonomic, followable, is_holonomic,
+    path_speed,
 };
 use crate::core::math::{normalize_angle, yaw_of};
 use crate::core::path::{
@@ -114,7 +115,7 @@ impl Controller for KanayamaFollower {
                 // A reversing leg is tracked by the body facing against its
                 // direction of travel, at negative speed; the body trails the
                 // bend by its pose's lead on the rear axle either way.
-                let trail = bend_heading(kappa, if back { -1.0 } else { 1.0 } * axle_offset(constraints));
+                let trail = bend_heading(followable(kappa, constraints), if back { -1.0 } else { 1.0 } * axle_offset(constraints));
                 let omega_r = v_r * kappa / trail.cos();
                 if back {
                     (p.x, p.y, normalize_angle(h + PI - trail), -v_r, omega_r, v_cap)

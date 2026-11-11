@@ -5,7 +5,8 @@
 use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
     can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, holonomic_point_command,
-    body_heading_on_path, braked_for_bends, is_ackermann, is_holonomic, max_curvature, path_speed, reverse_allowed,
+    body_heading_on_path, braked_for_bends, followable, is_ackermann, is_holonomic, max_curvature, path_speed,
+    reverse_allowed,
     world_to_body,
 };
 use crate::core::math::{heading_error, normalize_angle};
@@ -161,7 +162,7 @@ impl Controller for PurePursuitFollower {
         let s_target = (at_robot.arc_length + lookahead).min(cap);
         let (on_path, heading) = sample(&self.base.path.waypoints, &self.cursor.cum, s_target);
         let bend = curvature_at_arc_length(&self.base.path.waypoints, &self.cursor.cum, s_target);
-        let body = body_heading_on_path(heading, bend, axle_offset, back);
+        let body = body_heading_on_path(heading, followable(bend, constraints), axle_offset, back);
         let target = Point::new(on_path.x - axle_offset * body.cos(), on_path.y - axle_offset * body.sin(), on_path.z);
         self.lookahead_point = Some(target);
 

@@ -6,7 +6,7 @@
 
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::{
-    path_to_body, axle_offset, bend_heading, braked_for_bends,
+    path_to_body, axle_offset, bend_heading, braked_for_bends, followable,
     can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, is_ackermann,
     is_holonomic, path_speed, steering_to_curvature,
 };
@@ -183,7 +183,7 @@ impl Controller for FlcFollower {
         };
         let sign = if reverse { -1.0 } else { 1.0 };
         let facing = if reverse { normalize_angle(prep.epsi - std::f64::consts::PI) } else { prep.epsi };
-        let trail = bend_heading(kappa_path, sign * axle_offset(constraints));
+        let trail = bend_heading(followable(kappa_path, constraints), sign * axle_offset(constraints));
         let theta_e = normalize_angle(facing - trail);
 
         if state.turn_first && can_turn_in_place(constraints.steering_type) && theta_e.abs() > prep.ang_tol

@@ -7,7 +7,8 @@
 use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
     can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, holonomic_point_command,
-    axle_point_offset, braked_for_bends, is_ackermann, is_holonomic, max_curvature, path_speed, reverse_allowed,
+    axle_point_offset, braked_for_bends, followable, is_ackermann, is_holonomic, max_curvature, path_speed,
+    reverse_allowed,
     world_to_body,
 };
 use crate::core::math::{heading_error, normalize_angle};
@@ -158,7 +159,7 @@ impl Controller for VectorPursuitFollower {
         let (on_path, target_heading) = sample_past(&self.base.path.waypoints, &self.cursor.cum, s_target, cap);
         // The rear axle runs inside the bend its pose follows.
         let bend = curvature_at_arc_length(&self.base.path.waypoints, &self.cursor.cum, s_target.min(cap));
-        let inward = axle_point_offset(bend, axle_offset, 0.0);
+        let inward = axle_point_offset(followable(bend, constraints), axle_offset, 0.0);
         let target = Point::new(
             on_path.x - inward * target_heading.sin(),
             on_path.y + inward * target_heading.cos(),

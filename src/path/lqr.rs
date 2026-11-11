@@ -12,7 +12,7 @@
 
 use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
-    path_to_body, axle_offset, bend_heading, braked_for_bends,
+    path_to_body, axle_offset, bend_heading, braked_for_bends, followable,
     actuation_delay, can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, is_holonomic,
     path_speed, reverse_allowed,
 };
@@ -157,7 +157,7 @@ impl Controller for LqrFollower {
             .map_or(constraints.max_linear_velocity, |v| {
                 v.min(constraints.max_linear_velocity)
             });
-        let trail = bend_heading(kappa_path, sign * axle_offset(constraints));
+        let trail = bend_heading(followable(kappa_path, constraints), sign * axle_offset(constraints));
         let theta_e = normalize_angle(theta_e - trail);
         let left = self.base.distance_left(&proj, length).min(stop_distance);
         let v = path_speed(nominal, kappa_path, left, pos_tol, cfg.kp_linear, constraints)

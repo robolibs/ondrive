@@ -8,7 +8,8 @@
 use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
     can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, holonomic_point_command,
-    axle_point_offset, braked_for_bends, is_ackermann, is_holonomic, max_curvature, path_speed, reverse_allowed,
+    axle_point_offset, braked_for_bends, followable, is_ackermann, is_holonomic, max_curvature, path_speed,
+    reverse_allowed,
     wheelbase, world_to_body,
 };
 use crate::core::math::{heading_error, normalize_angle};
@@ -313,7 +314,7 @@ impl Controller for RegulatedPursuitFollower {
         let (on_path, target_heading) = sample_past(&self.base.path.waypoints, &self.cursor.cum, s_target, stop_at);
         // The rear axle runs inside the bend its pose follows.
         let bend = curvature_at_arc_length(&self.base.path.waypoints, &self.cursor.cum, s_target.min(stop_at));
-        let inward = axle_point_offset(bend, axle_offset, 0.0);
+        let inward = axle_point_offset(followable(bend, constraints), axle_offset, 0.0);
         let mut target =
             Point::new(on_path.x - inward * target_heading.sin(), on_path.y + inward * target_heading.cos(), on_path.z);
         let obstacles = world.map_or(&[][..], |w| &w.obstacles[..]);
@@ -413,7 +414,7 @@ impl Controller for RegulatedPursuitFollower {
         v = proximity(v).min(v);
         v = v.max(rpp.min_speed.min(nominal));
         let (waypoints, cum, s) = (&self.base.path.waypoints, &self.cursor.cum, at_robot.arc_length);
-        v = braked_for_bends(v, measured, nominal, remaining, |d| curvature_at_arc_length(waypoints, cum, s + d), constraints);
+        v = braked_for_bends(v, measured, nominal, remaining, |d| followable(curvature_at_arc_length(waypoints, cum, s + d), constraints), constraints);
         let mut v = direction * approach(v);
         if rpp.use_collision_check {
             // The fastest share of the speed whose arc, over the check time

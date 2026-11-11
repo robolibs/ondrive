@@ -16,7 +16,8 @@
 
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::{
-    actuation_delay, axle_point_offset, braked_for_bends, finalize, finalize_holonomic, is_ackermann, is_holonomic,
+    actuation_delay, axle_point_offset, braked_for_bends, finalize, finalize_holonomic, followable, is_ackermann,
+    is_holonomic,
     max_curvature, path_speed, wheelbase,
 };
 use crate::core::math::{normalize_angle, yaw_of};
@@ -185,7 +186,7 @@ impl Controller for SlipAdaptiveFollower {
         };
         let theta = normalize_angle(yaw - at_rear.heading);
         let bend = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &at_rear);
-        let y = at_rear.lateral_error - axle_point_offset(bend, rear, 0.0);
+        let y = at_rear.lateral_error - axle_point_offset(followable(bend, constraints), rear, 0.0);
         let theta2 = normalize_angle(theta + beta_r);
 
         let steer_time = if ackermann && constraints.max_steering_rate > 0.0 {
