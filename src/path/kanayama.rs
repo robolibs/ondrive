@@ -14,7 +14,7 @@ use crate::core::kinematics::{
 };
 use crate::core::math::{normalize_angle, yaw_of};
 use crate::core::path::{
-    PathCursor, curvature_at_arc_length, curvature_at_projection, cusp_after, direction_at, sample, speed_cap,
+    PathCursor, curvature_at_arc_length, curvature_at_projection, cusp_after, direction_at, sample_past, speed_cap,
 };
 use std::f64::consts::PI;
 use crate::point::PoseRegulatorFollower;
@@ -100,7 +100,7 @@ impl Controller for KanayamaFollower {
             None => {
                 let s = prep.proj.arc_length;
                 let cusp = cusp_after(&self.base.path.speeds, &self.cursor.cum, s).unwrap_or(f64::INFINITY);
-                let (p, h) = sample(&self.base.path.waypoints, &self.cursor.cum, (s + PREVIEW).min(cusp));
+                let (p, h) = sample_past(&self.base.path.waypoints, &self.cursor.cum, (s + PREVIEW).min(cusp), cusp);
                 let kappa = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &prep.proj);
                 let nominal = speed_cap(&self.base.path.speeds, &prep.proj)
                     .map_or(constraints.max_linear_velocity, |s| s.min(constraints.max_linear_velocity));

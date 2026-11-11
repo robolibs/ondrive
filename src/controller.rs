@@ -142,16 +142,15 @@ const ARRIVED_SHARE: f64 = 0.25;
 const CLOSING_STEP: f64 = 1e-3;
 const CLOSING_SPEED: f64 = 0.02;
 
-/// Share of top speed under which a robot counts as stopped at a cusp.
-const STOPPED_AT_CUSP: f64 = 0.1;
+/// Speed, m/s, under which a robot counts as stopped at a cusp.
+const STOPPED_AT_CUSP: f64 = 0.05;
 
-/// Distance from a cusp within which the robot counts as there: half the
-/// position tolerance while it moves, all of it once stopped or when its
-/// speed is not reported.
-pub fn cusp_reach(pos_tol: f64, state: &RobotState, constraints: &RobotConstraints) -> f64 {
-    let stopped = STOPPED_AT_CUSP * constraints.max_linear_velocity.abs();
-    let moving = state.velocity_valid && state.velocity.linear.abs() >= stopped.max(0.05);
-    (if moving { 0.5 * pos_tol } else { pos_tol }).max(0.1)
+/// Distance from a cusp within which the robot counts as there:
+/// `ARRIVED_SHARE` of the position tolerance while it moves, all of it once
+/// stopped or when its speed is not reported.
+pub fn cusp_reach(pos_tol: f64, state: &RobotState, _constraints: &RobotConstraints) -> f64 {
+    let moving = state.velocity_valid && state.velocity.linear.abs() >= STOPPED_AT_CUSP;
+    (if moving { ARRIVED_SHARE * pos_tol } else { pos_tol }).max(0.1)
 }
 
 /// Speed, m/s, to pass `goal` at: that of its `target_velocity`, or 0 for

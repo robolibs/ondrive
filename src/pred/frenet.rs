@@ -463,7 +463,6 @@ impl Controller for FrenetFollower {
 
     fn set_path(&mut self, path: Path) {
         self.cursor.set_path(&path.waypoints);
-        self.cursor.hold_cusps = true;
         self.base.path = path;
         self.base.path_index = 0;
         self.base.status = Default::default();

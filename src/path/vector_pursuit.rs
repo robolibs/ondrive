@@ -13,7 +13,7 @@ use crate::core::kinematics::{
 };
 use crate::core::math::{heading_error, normalize_angle};
 use crate::core::path::{
-    PathCursor, curvature_at_arc_length, cusp_after, direction_at, sample_past, sharpest_ahead, speed_cap,
+    PathCursor, curvature_at_arc_length, curvature_toward, cusp_after, direction_at, sample_past, sharpest_ahead, speed_cap,
 };
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
@@ -158,7 +158,7 @@ impl Controller for VectorPursuitFollower {
         let s_target = (proj.arc_length + lookahead).min(cap + trail);
         let (on_path, target_heading) = sample_past(&self.base.path.waypoints, &self.cursor.cum, s_target, cap);
         // The rear axle runs inside the bend its pose follows.
-        let bend = curvature_at_arc_length(&self.base.path.waypoints, &self.cursor.cum, s_target.min(cap));
+        let bend = curvature_toward(&self.base.path.waypoints, &self.cursor.cum, s_target, cap);
         let inward = axle_point_offset(followable(bend, constraints), axle_offset, 0.0);
         let target = Point::new(
             on_path.x - inward * target_heading.sin(),

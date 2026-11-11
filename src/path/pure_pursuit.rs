@@ -11,7 +11,7 @@ use crate::core::kinematics::{
 };
 use crate::core::math::{heading_error, normalize_angle};
 use crate::core::path::{
-    PathCursor, curvature_at_arc_length, cusp_after, direction_at, sample_past, sharpest_ahead, speed_cap,
+    PathCursor, curvature_at_arc_length, curvature_toward, cusp_after, direction_at, sample_past, sharpest_ahead, speed_cap,
 };
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
@@ -163,7 +163,7 @@ impl Controller for PurePursuitFollower {
         let open_end = cap >= length && !self.base.path.is_closed;
         let s_target = if open_end { at_robot.arc_length + lookahead } else { (at_robot.arc_length + lookahead).min(cap) };
         let (on_path, heading) = sample_past(&self.base.path.waypoints, &self.cursor.cum, s_target, cap);
-        let bend = if s_target > cap { 0.0 } else { curvature_at_arc_length(&self.base.path.waypoints, &self.cursor.cum, s_target) };
+        let bend = curvature_toward(&self.base.path.waypoints, &self.cursor.cum, s_target, cap);
         let body = body_heading_on_path(heading, followable(bend, constraints), axle_offset, back);
         let target = Point::new(on_path.x - axle_offset * body.cos(), on_path.y - axle_offset * body.sin(), on_path.z);
         self.lookahead_point = Some(target);

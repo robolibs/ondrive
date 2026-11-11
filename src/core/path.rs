@@ -225,11 +225,11 @@ pub fn sample(waypoints: &[Pose], cum: &[f64], s: f64) -> (Point, f64) {
     )
 }
 
-/// `sample` at `s`, carried straight on past `cap` along the heading the
+/// `sample` at `s`, carried straight on from `cap` along the heading the
 /// path arrives there with: a point a leading axle aims at for the pose
 /// behind it to reach `cap`.
 pub fn sample_past(waypoints: &[Pose], cum: &[f64], s: f64, cap: f64) -> (Point, f64) {
-    if s <= cap {
+    if s < cap {
         return sample(waypoints, cum, s);
     }
     let (p, _) = sample(waypoints, cum, cap);
@@ -267,6 +267,15 @@ pub fn curvature_at_projection(waypoints: &[Pose], cum: &[f64], proj: &PathProje
     let k0 = curvature_at(waypoints, cum, proj.segment);
     let k1 = curvature_at(waypoints, cum, proj.segment + 1);
     k0 + (k1 - k0) * proj.t
+}
+
+/// Curvature at `s` on the way to `cap`, as `sample_past` runs: that the
+/// path arrives at `cap` with once there, and none on the straight past it.
+pub fn curvature_toward(waypoints: &[Pose], cum: &[f64], s: f64, cap: f64) -> f64 {
+    if s > cap {
+        return 0.0;
+    }
+    curvature_at_arc_length(waypoints, cum, s.min(cap - 1e-6).max(0.0))
 }
 
 /// Curvature at arc length `s` (clamped to the path), interpolated as
@@ -346,9 +355,6 @@ pub struct PathCursor {
     /// First segment projections may land on: progress committed past a
     /// cusp does not slide back over it.
     pub floor: usize,
-    /// Whether a projection that jumped onto the leg after a cusp not yet
-    /// reached is taken back onto the leg before it.
-    pub hold_cusps: bool,
 }
 
 const CURSOR_WINDOW: usize = 64;
@@ -387,13 +393,13 @@ impl PathCursor {
         Some(proj)
     }
 
-    /// `proj` of `p`, carried onto the leg leaving the next cusp once `p`
-    /// comes within `reach` of it, straight or along the path, with
-    /// progress committed past the cusp.
+    /// `proj` of `p`, held on the leg before the next cusp until `p` comes
+    /// within `reach` of it, straight or along the path, then carried onto
+    /// the leg leaving it with progress committed past the cusp.
     pub fn past_cusp(&mut self, waypoints: &[Pose], speeds: &[f64], p: Point, proj: PathProjection, reach: f64) -> PathProjection {
         let committed = self.cum.get(self.floor).copied().unwrap_or(0.0);
         let proj = match self.cusp_ahead(speeds, committed) {
-            Some(k) if self.hold_cusps && proj.arc_length > self.cum[k] + 1e-9 => {
+            Some(k) if proj.arc_length > self.cum[k] + 1e-9 => {
                 let start = self.floor.min(k.saturating_sub(1));
                 project(waypoints, &self.cum, p, start, 0, (k - start).max(1)).unwrap_or(proj)
             }
@@ -466,7 +472,6 @@ mod tests {
         }
         let mut cursor = PathCursor::default();
         cursor.set_path(&waypoints);
-        cursor.hold_cusps = true;
         let p = Point::new(8.8, 0.1, 0.0);
         let raw = cursor.project(&waypoints, p, 18).expect("a projection");
         let held = cursor.past_cusp(&waypoints, &speeds, p, raw, 0.3);

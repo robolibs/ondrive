@@ -15,7 +15,7 @@ use crate::core::kinematics::{
 use crate::core::math::{heading_error, normalize_angle};
 use crate::core::obstacles::{CollisionChecker, robot_radius};
 use crate::pred::mppi::{Swerve, build_reference, pick_detour};
-use crate::core::path::{PathCursor, curvature_at_arc_length, cusp_after, direction_at, sample_past, speed_cap};
+use crate::core::path::{PathCursor, curvature_at_arc_length, curvature_toward, cusp_after, direction_at, sample_past, speed_cap};
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
 use std::f64::consts::PI;
@@ -313,7 +313,7 @@ impl Controller for RegulatedPursuitFollower {
         let s_target = (proj.arc_length + lookahead).min(stop_at + trail);
         let (on_path, target_heading) = sample_past(&self.base.path.waypoints, &self.cursor.cum, s_target, stop_at);
         // The rear axle runs inside the bend its pose follows.
-        let bend = curvature_at_arc_length(&self.base.path.waypoints, &self.cursor.cum, s_target.min(stop_at));
+        let bend = curvature_toward(&self.base.path.waypoints, &self.cursor.cum, s_target, stop_at);
         let inward = axle_point_offset(followable(bend, constraints), axle_offset, 0.0);
         let mut target =
             Point::new(on_path.x - inward * target_heading.sin(), on_path.y + inward * target_heading.cos(), on_path.z);
