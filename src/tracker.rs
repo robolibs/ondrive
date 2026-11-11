@@ -340,7 +340,15 @@ impl Tracker {
     }
 
     pub fn get_status(&self) -> ControllerStatus {
-        self.controller.get_status()
+        let mut status = self.controller.get_status();
+        status.goal_reached |= self.led_to_goal();
+        status
+    }
+
+    /// Whether a point controller led along a plan to the goal has come to
+    /// its end.
+    fn led_to_goal(&self) -> bool {
+        self.kind.is_point_controller() && self.goal.is_some() && self.planned_for.is_some() && self.path_completed
     }
 
     pub fn controller(&self) -> &dyn Controller {
@@ -595,7 +603,8 @@ impl Tracker {
         }
     }
 
-    /// For a path-following kind given a goal and no path of its own, plan
+    /// For a kind that follows paths, or a point controller that cannot turn
+    /// in place, given a goal and no path of its own, plan
     /// the shortest Dubins path from `state` to the goal, turning no
     /// tighter than the platform can (`PLANNED_TURN_RADIUS` for one that
     /// turns in place), and drive it; planned again when the goal moves.
@@ -603,7 +612,17 @@ impl Tracker {
         let Some(goal) = &self.goal else {
             return;
         };
-        if self.kind.is_point_controller() || self.trajectory.is_some() || (self.path.is_some() && self.planned_for.is_none()) {
+        // A point controller on a platform that cannot turn in place is
+        // driven along the plan too when the goal's heading counts: aimed
+        // straight at the goal it would arrive facing the wrong way.
+        let heading_counts = crate::controller::effective_tolerances(goal, &self.controller.get_config()).1 < std::f64::consts::PI;
+        let aims_itself = matches!(self.kind, TrackerKind::PoseReach | TrackerKind::PoseRegulator)
+            || can_turn_in_place(self.constraints.steering_type)
+            || !heading_counts;
+        if (self.kind.is_point_controller() && aims_itself)
+            || self.trajectory.is_some()
+            || (self.path.is_some() && self.planned_for.is_none())
+        {
             return;
         }
         let target = &goal.target_pose;
@@ -725,7 +744,10 @@ impl Tracker {
         state: &RobotState,
         world: Option<&WorldConstraints>,
     ) -> Result<Option<Goal>, &'static str> {
-        if let Some(g) = &self.goal {
+        // A point controller given a planned way to the goal is led along it.
+        if let Some(g) = &self.goal
+            && !(self.kind.is_point_controller() && self.planned_for.is_some())
+        {
             return Ok(Some(g.clone()));
         }
         let Some(path) = self.path.as_ref() else {
@@ -854,7 +876,7 @@ impl Tracker {
     /// True if the last tick put the controller in the goal-reached state,
     /// or a path driven without an explicit goal has been completed.
     pub fn is_goal_reached(&self) -> bool {
-        self.controller.get_status().goal_reached || (self.goal.is_none() && self.path_completed)
+        self.controller.get_status().goal_reached || (self.goal.is_none() && self.path_completed) || self.led_to_goal()
     }
 
     /// True once a path driven without an explicit goal has been consumed.
