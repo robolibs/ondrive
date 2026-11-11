@@ -17,7 +17,7 @@ use crate::core::path::{
     PathCursor, curvature_at_arc_length, curvature_at_projection, cusp_after, direction_at, sample_past, sharpest_ahead,
     speed_cap,
 };
-use crate::pred::mppi::{Swerve, prepare};
+use crate::pred::mppi::{Swerve, build_reference, pick_detour, prepare};
 use crate::types::{DebugFrame, DebugLevel, Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
 use std::f64::consts::PI;
@@ -55,6 +55,15 @@ const SATURATED: f64 = 0.98;
 /// Distance, metres, the chosen candidate's curvature is read ahead at
 /// the least when reversing.
 const MIN_PREVIEW: f64 = 0.2;
+/// Step, seconds, the detour round what blocks the path is laid out at, the
+/// share of top speed it is laid out for, and the steps it runs past the
+/// horizon.
+const DETOUR_DT: f64 = 0.2;
+const DETOUR_SPEED_SHARE: f64 = 0.8;
+const DETOUR_TAIL: usize = 6;
+/// Share of the furthest offset a candidate may lie across the path from
+/// the detour's side.
+const SIDE_SLACK: f64 = 0.1;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FrenetConfig {
@@ -113,6 +122,7 @@ pub struct FrenetFollower {
     cursor: PathCursor,
     plan: Vec<Point>,
     offset: f64,
+    side: f64,
     last_speed: f64,
     sideslip: f64,
     /// Whether the leg reverses and the curvature of travel commanded last
@@ -270,6 +280,22 @@ impl Controller for FrenetFollower {
             (0..n_off).map(|i| -reach + 2.0 * reach * i as f64 / (n_off - 1) as f64).collect()
         };
         offsets.extend([d0.clamp(-reach, reach), self.offset.clamp(-reach, reach)]);
+        // While what blocks the path ahead calls for a detour, the side it
+        // takes, kept from tick to tick, is the only one tried.
+        let obstacles = world.map_or(&[][..], |w| &w.obstacles[..]);
+        if obstacles.is_empty() {
+            self.side = 0.0;
+        } else {
+            let speed = (DETOUR_SPEED_SHARE * v_max).max(0.1);
+            let steps = (nominal * fc.horizon_s / (speed * DETOUR_DT)).ceil() as usize + DETOUR_TAIL;
+            let reference = build_reference(&self.base.path, cum, prep.proj.arc_length, steps, DETOUR_DT, speed, 0.0);
+            let room = robot_radius(constraints) + margin;
+            pick_detour(&reference, obstacles, room, DETOUR_DT, &mut self.side, Swerve::of(constraints, speed));
+        }
+        if self.side != 0.0 {
+            let side = self.side;
+            offsets.retain(|o| o * side >= -SIDE_SLACK * reach);
+        }
         let n_speed = fc.speed_samples.max(1);
         let targets: Vec<f64> = (0..=n_speed).map(|i| nominal * i as f64 / n_speed as f64).collect();
         let swerve = Swerve::of(constraints, v_now.max(0.3 * nominal));
@@ -428,6 +454,7 @@ impl Controller for FrenetFollower {
         self.base.status = Default::default();
         self.plan.clear();
         self.offset = 0.0;
+        self.side = 0.0;
         self.last_speed = 0.0;
         self.sideslip = 0.0;
         self.last_command = None;
