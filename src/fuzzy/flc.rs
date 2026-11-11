@@ -6,7 +6,7 @@
 
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::{
-    path_to_body, axle_offset, bend_heading, braked_for_bends, followable,
+    path_to_body, axle_offset, axle_point_offset, bend_heading, braked_for_bends, followable,
     can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, is_ackermann,
     is_holonomic, path_speed, steering_to_curvature,
 };
@@ -14,6 +14,7 @@ use crate::core::math::normalize_angle;
 use crate::core::path::{PathCursor, curvature_at_arc_length, curvature_at_projection, cusp_after, direction_at, speed_cap};
 use crate::pred::mppi::prepare;
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
+use datapod::Point;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Term {
@@ -173,8 +174,8 @@ impl Controller for FlcFollower {
         };
         let cfg = self.base.config.clone();
         let flc = self.flc_config.clone();
-        let e_lat = prep.proj.lateral_error;
-        let kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &prep.proj);
+        let mut e_lat = prep.proj.lateral_error;
+        let mut kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &prep.proj);
         // A reversing leg is driven as a vehicle facing the other way,
         // forward; the body trails the bend by its pose's lead either way.
         let reverse = match direction_at(&self.base.path.speeds, &prep.proj) {
@@ -182,9 +183,24 @@ impl Controller for FlcFollower {
             None => prep.allow_reverse && prep.epsi.abs() > std::f64::consts::FRAC_PI_2,
         };
         let sign = if reverse { -1.0 } else { 1.0 };
-        let facing = if reverse { normalize_angle(prep.epsi - std::f64::consts::PI) } else { prep.epsi };
+        let mut epsi = prep.epsi;
         let trail = bend_heading(followable(kappa_path, constraints), sign * axle_offset(constraints));
-        let theta_e = normalize_angle(facing - trail);
+        let mut heading_trail = trail;
+        // Reversing, the pose trails the axle the body turns about, so the
+        // errors are read at that leading axle, which runs inside the bend.
+        let axle = axle_offset(constraints);
+        if reverse && axle > 0.0 {
+            let yaw = state.pose.rotation.to_euler().yaw;
+            let rear = Point::new(state.pose.point.x - axle * yaw.cos(), state.pose.point.y - axle * yaw.sin(), 0.0);
+            if let Some(at_rear) = self.cursor.project_on_leg(&self.base.path.waypoints, &self.base.path.speeds, rear, prep.proj.segment, prep.proj.arc_length) {
+                kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &at_rear);
+                e_lat = at_rear.lateral_error - axle_point_offset(followable(kappa_path, constraints), axle, 0.0);
+                epsi = normalize_angle(at_rear.heading - yaw);
+                heading_trail = 0.0;
+            }
+        }
+        let facing = if reverse { normalize_angle(epsi - std::f64::consts::PI) } else { epsi };
+        let theta_e = normalize_angle(facing - heading_trail);
 
         if state.turn_first && can_turn_in_place(constraints.steering_type) && theta_e.abs() > prep.ang_tol
         {
