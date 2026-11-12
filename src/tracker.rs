@@ -123,11 +123,14 @@ pub struct Tracker {
     aiming_at_end: bool,
     /// The goal point last handed to the controller.
     aim: Option<Point>,
-    /// Metres left to the end of the path on its last leg, when that end is
-    /// where the robot stops.
-    end_left: Option<f64>,
-    /// Segment the robot was last projected on for `end_left`.
-    end_segment: usize,
+    /// Metres left to where the robot next stops on its path: the next cusp,
+    /// or the end when that is where it stops.
+    stop_left: Option<f64>,
+    /// Progress along the path for `stop_left`, held at each cusp until the
+    /// robot reaches it.
+    stop_cursor: PathCursor,
+    /// Segment the robot was last projected on for `stop_left`.
+    stop_segment: usize,
     trajectory: Option<Trajectory>,
     clock: f64,
     clock_origin: Option<f64>,
@@ -168,8 +171,9 @@ impl Tracker {
             path_completed: false,
             aiming_at_end: true,
             aim: None,
-            end_left: None,
-            end_segment: 0,
+            stop_left: None,
+            stop_cursor: PathCursor::default(),
+            stop_segment: 0,
             trajectory: None,
             clock: 0.0,
             clock_origin: None,
@@ -242,10 +246,11 @@ impl Tracker {
             path
         };
         self.cursor.set_path(&path.waypoints);
+        self.stop_cursor.set_path(&path.waypoints);
         self.path = Some(path.clone());
         self.waypoint_index = 0;
         self.projection_segment = 0;
-        self.end_segment = 0;
+        self.stop_segment = 0;
         self.path_completed = false;
         self.aim = None;
         self.controller.set_path(path);
@@ -435,7 +440,7 @@ impl Tracker {
         let ahead = (!self.kind.models_actuation())
             .then(|| predicted_through_actuation(state, &self.constraints, self.last_command))
             .flatten();
-        self.end_left = self.left_on_last_leg(ahead.as_ref().unwrap_or(state));
+        self.stop_left = self.left_to_stop(ahead.as_ref().unwrap_or(state));
         let previous = self.controller.get_status().distance_to_goal;
         let mut cmd = self
             .controller
@@ -448,7 +453,7 @@ impl Tracker {
             cmd = self.controller.compute_control(state, &goal, &self.constraints, dt, world);
         }
         let cmd = self.give_way(cmd, state, world);
-        let cmd = self.ease_to_end(cmd);
+        let cmd = self.ease_to_stop(cmd);
 
         if self.goal.is_none() && self.path.is_some() && self.aiming_at_end && self.controller.get_status().goal_reached {
             self.path_completed = true;
@@ -456,26 +461,33 @@ impl Tracker {
         self.limit(cmd, state, dt, world)
     }
 
-    /// Metres left to the end of the path for the robot at `state`, on the
-    /// path's last leg when the robot stops at that end.
-    fn left_on_last_leg(&mut self, state: &RobotState) -> Option<f64> {
+    /// Position tolerance, metres, of the goal the robot stops at.
+    fn stop_tolerance(&self) -> f64 {
+        let cfg = self.controller.get_config();
+        self.goal.as_ref().map_or(cfg.goal_tolerance, |g| crate::controller::effective_tolerances(g, &cfg).0)
+    }
+
+    /// Metres left for the robot at `state` to where it next stops on its
+    /// path: the next cusp, or the end when it stops there; carried past a
+    /// cusp once the robot comes within `cusp_reach` of it.
+    fn left_to_stop(&mut self, state: &RobotState) -> Option<f64> {
         if self.lap.is_some() || self.trajectory.is_some() || (self.goal.is_some() && self.planned_for.is_none()) {
             return None;
         }
+        let reach = crate::controller::cusp_reach(self.stop_tolerance(), state, &self.constraints);
         let path = self.path.as_ref().filter(|p| !p.is_closed && p.waypoints.len() >= 2)?;
-        let proj = self.cursor.project(&path.waypoints, state.pose.point, self.end_segment)?;
-        self.end_segment = proj.segment;
-        let cum = &self.cursor.cum;
-        if cusp_after(&path.speeds, cum, proj.arc_length).is_some() {
-            return None;
-        }
-        Some((cum[cum.len() - 1] - proj.arc_length).max(0.0))
+        let proj = self.stop_cursor.project(&path.waypoints, state.pose.point, self.stop_segment)?;
+        let proj = self.stop_cursor.past_cusp(&path.waypoints, &path.speeds, state.pose.point, proj, reach);
+        self.stop_segment = proj.segment;
+        let cum = &self.stop_cursor.cum;
+        let stop = cusp_after(&path.speeds, cum, proj.arc_length).unwrap_or(cum[cum.len() - 1]);
+        Some((stop - proj.arc_length).max(0.0))
     }
 
-    /// `cmd` slowed, at the curvature it turns at, to stop at the end of the
-    /// path's last leg.
-    fn ease_to_end(&self, mut cmd: VelocityCommand) -> VelocityCommand {
-        let Some(left) = self.end_left else {
+    /// `cmd` slowed, at the curvature it turns at, to stop where the robot
+    /// next stops on its path.
+    fn ease_to_stop(&self, mut cmd: VelocityCommand) -> VelocityCommand {
+        let Some(left) = self.stop_left else {
             return cmd;
         };
         let v = cmd.linear_velocity.abs();
@@ -483,8 +495,7 @@ impl Tracker {
             return cmd;
         }
         let cfg = self.controller.get_config();
-        let tol = self.goal.as_ref().map_or(cfg.goal_tolerance, |g| crate::controller::effective_tolerances(g, &cfg).0);
-        let cap = path_speed(v, 0.0, left, tol, cfg.kp_linear, &self.constraints);
+        let cap = path_speed(v, 0.0, left, self.stop_tolerance(), cfg.kp_linear, &self.constraints);
         if cap < v {
             cmd.linear_velocity *= cap / v;
             cmd.angular_velocity *= cap / v;
