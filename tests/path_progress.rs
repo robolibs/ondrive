@@ -144,7 +144,7 @@ fn point_controllers_drive_to_the_cusp_before_turning_back() {
         t.tick(&state, 0.05, None);
         let target = t.current_target().unwrap();
         assert!(
-            (target.x - 5.0).abs() < 1e-9,
+            target.x > 4.5 && target.x <= 5.0 + 1e-9 && target.y.abs() < 1e-9,
             "{kind:?}: first target {target:?}"
         );
 

@@ -872,11 +872,15 @@ impl Tracker {
             };
             // The robot drives to a cusp, then on along the leg that leaves it.
             let mut segment = proj.segment;
-            let (mut idx, mut cap) = target(segment, proj.arc_length + ahead);
+            // The carrot is `CARROT_SHARE` of a lookahead on from the pose the
+            // controller is handed, carried through the actuation delay.
+            let lead = if self.kind.models_actuation() { 0.0 } else { speed_now.abs() * actuation_delay(&self.constraints) };
+            let carrot = (CARROT_SHARE * cfg.lookahead_distance).max(tol);
+            let (mut idx, mut cap) = target(segment, proj.arc_length + carrot + lead);
             if cap < n - 1 && idx == cap && path.waypoints[cap].point.distance_to_2d(state.pose.point) < tol {
                 segment = cap;
                 self.cursor.floor = self.cursor.floor.max(cap);
-                (idx, cap) = target(segment, cum[segment] + ahead);
+                (idx, cap) = target(segment, cum[segment] + carrot + lead);
             }
             self.projection_segment = segment;
             let round_crossing = can_turn_in_place(self.constraints.steering_type) && self.kind != TrackerKind::Apf;
@@ -1518,6 +1522,8 @@ const PLANNED_TURN_RADIUS: f64 = 0.5;
 const PLANNED_RADIUS_MARGIN: f64 = 1.25;
 /// Metres between the poses of a path planned to a goal.
 const PLANNED_STEP: f64 = 0.1;
+/// Share of the lookahead a point controller's carrot sits ahead of it.
+const CARROT_SHARE: f64 = 0.5;
 /// Share of the top speed below which a point controller's detour does not
 /// take the robot's speed to fall.
 const DETOUR_SPEED_FLOOR: f64 = 0.3;
