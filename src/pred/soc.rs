@@ -126,7 +126,7 @@ impl Default for SocConfig {
             initial_steer_variance: 0.25,
             min_steer_variance: 1e-4,
             max_steer_variance: 1.0,
-            weight_cte: 50.0,
+            weight_cte: 100.0,
             weight_epsi: 100.0,
             weight_vel: 100.0,
             weight_steering: 10.0,
