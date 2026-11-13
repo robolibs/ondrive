@@ -3,7 +3,8 @@
 //! pose to the goal pose with the platform's turning radius, splits it into
 //! same-direction runs and tracks one run at a time with Pure Pursuit,
 //! switching runs at the cusps. Replans when the robot drifts off the
-//! curve or the goal changes.
+//! curve or the goal changes. Handed a path, it follows the path with Pure
+//! Pursuit to the goals the path holds.
 
 use crate::controller::{Controller, ControllerBase, check_goal, pass_through, settled};
 use crate::core::curves::{CurvePath, dubins_all, reeds_shepp_all};
@@ -13,6 +14,7 @@ use crate::core::kinematics::{
     max_curvature, path_speed, reverse_allowed, stop,
 };
 use crate::core::math::{normalize_angle, yaw_of};
+use crate::core::path::end_heading;
 use crate::path::PurePursuitFollower;
 use crate::types::{
     ControllerConfig, ControllerStatus, Goal, OutputUnits, Path, RobotConstraints, RobotState,
@@ -85,6 +87,10 @@ pub struct PoseReachFollower {
     pub base: ControllerBase,
     pub pose_config: PoseReachConfig,
     follower: PurePursuitFollower,
+    /// Follower of the path handed in, for goals on it.
+    along: PurePursuitFollower,
+    /// Whether `along` still has to be given the path.
+    along_stale: bool,
     runs: Vec<Run>,
     run_index: usize,
     goal_index: usize,
@@ -291,6 +297,29 @@ impl PoseReachFollower {
         true
     }
 
+    /// Pursuit along the path handed in, to `goal` at its end.
+    fn follow_along(
+        &mut self,
+        state: &RobotState,
+        goal: &Goal,
+        constraints: &RobotConstraints,
+        dt: f64,
+        world: Option<&WorldConstraints>,
+    ) -> VelocityCommand {
+        if self.along_stale || self.along.base.path.waypoints.len() != self.base.path.waypoints.len() {
+            let mut cfg = self.base.config.clone();
+            cfg.output_units = OutputUnits::Physical;
+            self.along.set_config(cfg);
+            self.along.set_path(self.base.path.clone());
+            self.along_stale = false;
+        }
+        self.planned_for = None;
+        self.base.status.mode = "pose_reach/along".into();
+        let cmd = self.along.compute_control(state, goal, constraints, dt, world);
+        self.base.status.goal_reached = self.along.get_status().goal_reached;
+        cmd
+    }
+
     /// Pursuit of a goal to pass at speed: along the line through it on its
     /// heading, run on past it, with no curve round to that heading.
     fn pass(
@@ -400,6 +429,9 @@ impl Controller for PoseReachFollower {
             );
         }
         let reverse = reverse_allowed(&self.base.config, state);
+        if let Some(along) = along_goal(&self.base.path, goal, self.base.config.angular_tolerance) {
+            return self.follow_along(state, &along, constraints, dt, world);
+        }
         if pass_through(goal) > 0.0 {
             return self.pass(state, goal, constraints, dt, world, reverse);
         }
@@ -494,7 +526,9 @@ impl Controller for PoseReachFollower {
         finalize(v, omega, constraints, &self.base.config, reverse, &cmd.status_message)
     }
 
-    fn set_path(&mut self, _path: Path) {
+    fn set_path(&mut self, path: Path) {
+        self.base.path = path;
+        self.along_stale = true;
         self.planned_for = None;
         self.refined_for = None;
         self.runs.clear();
@@ -505,6 +539,8 @@ impl Controller for PoseReachFollower {
     fn reset(&mut self) {
         self.base.status = ControllerStatus::default();
         self.follower.reset();
+        self.along.reset();
+        self.along_stale = true;
         self.runs.clear();
         self.run_index = 0;
         self.planned_for = None;
@@ -516,6 +552,7 @@ impl Controller for PoseReachFollower {
 
     fn set_config(&mut self, config: ControllerConfig) {
         self.base.config = config;
+        self.along_stale = true;
         self.planned_for = None;
     }
 
@@ -534,6 +571,54 @@ impl Controller for PoseReachFollower {
     fn base_mut(&mut self) -> &mut ControllerBase {
         &mut self.base
     }
+}
+
+/// Distance, metres, within which a goal counts as a point of the path.
+const ON_PATH: f64 = 1e-3;
+
+/// Whether `p` lies within `tol` of the polyline of `path`.
+fn on_path(path: &Path, p: Point, tol: f64) -> bool {
+    path.waypoints.windows(2).any(|w| {
+        let (a, b) = (w[0].point, w[1].point);
+        let (dx, dy) = (b.x - a.x, b.y - a.y);
+        let len2 = dx * dx + dy * dy;
+        let t = if len2 > 1e-12 { (((p.x - a.x) * dx + (p.y - a.y) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+        (a.x + t * dx - p.x).hypot(a.y + t * dy - p.y) < tol
+    })
+}
+
+/// The end of `path` the follower along it drives to for `goal`, when `goal`
+/// is a point of the path: on it with any heading, or at or straight on past
+/// its open end facing the way the path ends.
+fn along_goal(path: &Path, goal: &Goal, angular_tolerance: f64) -> Option<Goal> {
+    let n = path.waypoints.len();
+    if n < 2 {
+        return None;
+    }
+    let p = goal.target_pose.point;
+    let end = path.waypoints[n - 1].point;
+    let heading = end_heading(&path.waypoints);
+    let backwards = path.speeds.last().is_some_and(|v| *v < 0.0);
+    let facing = heading + if backwards { PI } else { 0.0 };
+    let free = pass_through(goal) > 0.0 || goal.tolerance_orientation >= PI - 1e-9;
+    let tolerance_orientation = if free && on_path(path, p, ON_PATH) {
+        angular_tolerance
+    } else {
+        let (c, s) = (heading.cos(), heading.sin());
+        let (dx, dy) = (p.x - end.x, p.y - end.y);
+        let turned = normalize_angle(yaw_of(&goal.target_pose) - facing).abs();
+        let past_end = !path.is_closed && dx * c + dy * s > -ON_PATH && (dy * c - dx * s).abs() < ON_PATH;
+        if !past_end || turned > goal.tolerance_orientation.max(STRAIGHT_IN) {
+            return None;
+        }
+        goal.tolerance_orientation
+    };
+    Some(Goal {
+        target_pose: Pose { point: end, rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, facing)) },
+        target_velocity: None,
+        tolerance_position: goal.tolerance_position,
+        tolerance_orientation,
+    })
 }
 
 /// Heading, radians, within which a curve's last stretch counts as straight
@@ -600,4 +685,59 @@ fn plan_cost(c: &CurvePath, cfg: &PoseReachConfig) -> f64 {
         run += step;
     }
     cost + cfg.cusp_penalty.max(0.0) * cusps
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn straight(backwards: bool) -> Path {
+        let yaw = if backwards { PI } else { 0.0 };
+        Path {
+            waypoints: (0..=10)
+                .map(|i| Pose { point: Point::new(i as f64, 0.0, 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, yaw)) })
+                .collect(),
+            speeds: vec![if backwards { -1.0 } else { 1.0 }; 11],
+            is_closed: false,
+        }
+    }
+
+    fn goal(x: f64, y: f64, yaw: f64, heading_tolerance: f64) -> Goal {
+        Goal {
+            target_pose: Pose { point: Point::new(x, y, 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, yaw)) },
+            target_velocity: None,
+            tolerance_position: 0.25,
+            tolerance_orientation: heading_tolerance,
+        }
+    }
+
+    #[test]
+    fn a_point_of_the_path_is_driven_to_along_it() {
+        let g = along_goal(&straight(false), &goal(4.0, 0.0, 0.0, PI), 0.3).expect("on the path");
+        assert!((g.target_pose.point.x - 10.0).abs() < 1e-9);
+        assert!((g.tolerance_orientation - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_detour_off_the_path_is_planned() {
+        assert!(along_goal(&straight(false), &goal(4.0, 0.5, 0.0, PI), 0.3).is_none());
+    }
+
+    #[test]
+    fn an_aim_past_the_end_is_moved_onto_it() {
+        let g = along_goal(&straight(false), &goal(12.0, 0.0, 0.0, 0.25), PI).expect("past the end");
+        assert!((g.target_pose.point.x - 10.0).abs() < 1e-9);
+        assert!((g.tolerance_orientation - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_end_facing_another_way_is_planned() {
+        assert!(along_goal(&straight(false), &goal(10.0, 0.0, PI / 2.0, 0.25), PI).is_none());
+    }
+
+    #[test]
+    fn a_reversing_end_faces_back_along_the_path() {
+        let g = along_goal(&straight(true), &goal(12.0, 0.0, PI, 0.25), PI).expect("reversing end");
+        assert!(normalize_angle(yaw_of(&g.target_pose) - PI).abs() < 1e-9);
+    }
 }
