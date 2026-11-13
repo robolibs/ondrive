@@ -13,7 +13,7 @@ use crate::core::kinematics::{
 };
 use crate::core::math::{normalize_angle, yaw_of};
 use crate::point::PoseReachFollower;
-use crate::types::{ControllerConfig, Goal, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
+use crate::types::{ControllerConfig, Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use std::f64::consts::PI;
 
 #[derive(Clone, Debug, Default)]
@@ -129,6 +129,13 @@ impl Controller for PoseRegulatorFollower {
     fn set_config(&mut self, config: ControllerConfig) {
         self.curves.set_config(config.clone());
         self.base.config = config;
+    }
+
+    fn set_path(&mut self, path: Path) {
+        self.curves.set_path(path.clone());
+        self.base.path = path;
+        self.base.path_index = 0;
+        self.base.status = Default::default();
     }
 
     fn reset(&mut self) {
