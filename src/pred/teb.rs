@@ -63,7 +63,7 @@ impl Default for TebConfig {
             weight_velocity_limit: 50.0,
             weight_angular_limit: 50.0,
             weight_acceleration_limit: 10.0,
-            weight_path_deviation: 1.0,
+            weight_path_deviation: 3.0,
             weight_obstacle: 100.0,
             weight_kinematic: 50.0,
             weight_goal: 5.0,
