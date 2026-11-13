@@ -1,7 +1,8 @@
 //! Artificial potential field (Khatib 1986) as a fallback / recovery
 //! behaviour: an attractive force toward the goal and repulsive forces from
-//! obstacles within `influence`, each at the nearest of its predicted
-//! positions over the next 1.5 s, the robot steering along the resultant.
+//! obstacles within `influence` of the footprint, each at the nearest of its
+//! predicted positions over the next 1.5 s, the robot steering along the
+//! resultant.
 //! Each repulsion carries a circulating part along the obstacle (Singh,
 //! Stephanou & Wen 1996), turning the way that heads for the goal, so an
 //! obstacle straight ahead is gone round rather than stopped at. Where the
@@ -94,7 +95,7 @@ impl ApfFollower {
         };
         let checker = CollisionChecker::new(world, constraints, 0.0);
         if let Some(w) = world {
-            let r = checker.radius();
+            let h = 0.05;
             for obs in &w.obstacles {
                 let mut nearest: Vec<Option<crate::core::obstacles::ModeAt>> = Vec::new();
                 for t in PREVIEW_S {
@@ -108,20 +109,22 @@ impl ApfFollower {
                         }
                     }
                 }
+                // Each repels by the footprint's clearance, pushing the way
+                // that clearance grows.
                 for m in nearest.into_iter().flatten() {
-                    let (ox, oy, orad, weight) = (m.x, m.y, m.radius, m.weight);
-                    let dx = x - ox;
-                    let dy = y - oy;
-                    let dist = dx.hypot(dy);
-                    let d = (dist - orad - r).max(1e-3);
-                    if d < cfg.influence && dist > 1e-9 {
-                        let mag = cfg.k_repulse * weight * (1.0 / d - 1.0 / cfg.influence) / (d * d);
-                        repel(&mut fx, &mut fy, mag, dx / dist, dy / dist);
+                    let gap = |px: f64, py: f64| checker.body_distance(m.x, m.y, px, py, yaw) - m.radius;
+                    let d = gap(x, y).max(1e-3);
+                    if d < cfg.influence {
+                        let (nx, ny) = (gap(x + h, y) - gap(x - h, y), gap(x, y + h) - gap(x, y - h));
+                        let n = nx.hypot(ny);
+                        if n > 1e-9 {
+                            let mag = cfg.k_repulse * m.weight * (1.0 / d - 1.0 / cfg.influence) / (d * d);
+                            repel(&mut fx, &mut fy, mag, nx / n, ny / n);
+                        }
                     }
                 }
             }
             if w.grid.is_some() {
-                let h = 0.05;
                 let c0 = checker.clearance(0, x, y, yaw);
                 if c0 < cfg.influence {
                     let cx = (checker.clearance(0, x + h, y, yaw) - checker.clearance(0, x - h, y, yaw)) / (2.0 * h);

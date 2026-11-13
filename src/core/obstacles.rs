@@ -178,19 +178,10 @@ impl<'a> CollisionChecker<'a> {
             return f64::INFINITY;
         };
         let mut best = f64::INFINITY;
-        if !world.obstacles.is_empty() {
-            let (s, c) = yaw.sin_cos();
-            for obs in &world.obstacles {
-                for m in modes_at(obs, t, self.step) {
-                    let grow = m.radius + self.spread * m.std_x.max(m.std_y);
-                    let (dx, dy) = (m.x - x, m.y - y);
-                    let d = if self.polygon.is_empty() {
-                        dx.hypot(dy) - self.disc_radius
-                    } else {
-                        polygon_distance(&self.polygon, c * dx + s * dy, -s * dx + c * dy)
-                    };
-                    best = best.min(d - grow);
-                }
+        for obs in &world.obstacles {
+            for m in modes_at(obs, t, self.step) {
+                let grow = m.radius + self.spread * m.std_x.max(m.std_y);
+                best = best.min(self.body_distance(m.x, m.y, x, y, yaw) - grow);
             }
         }
         if let Some(grid) = &world.grid {
@@ -207,6 +198,17 @@ impl<'a> CollisionChecker<'a> {
             }
         }
         best - self.margin
+    }
+
+    /// Distance from the footprint at `(x, y, yaw)` to the point `(px, py)`,
+    /// negative inside it.
+    pub fn body_distance(&self, px: f64, py: f64, x: f64, y: f64, yaw: f64) -> f64 {
+        let (dx, dy) = (px - x, py - y);
+        if self.polygon.is_empty() {
+            return dx.hypot(dy) - self.disc_radius;
+        }
+        let (s, c) = yaw.sin_cos();
+        polygon_distance(&self.polygon, c * dx + s * dy, -s * dx + c * dy)
     }
 
     /// Clearance of the footprint at `(x, y, yaw)` against the occupancy grid
