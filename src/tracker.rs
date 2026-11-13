@@ -535,7 +535,8 @@ impl Tracker {
     /// The command held to what the platform can do: `max_linear_acceleration`
     /// and `max_angular_acceleration` around the last command, keeping the
     /// commanded curvature where the window allows (dynamic-window pure
-    /// pursuit); then the speed limit of the zones the robot is in; then the
+    /// pursuit); for a point controller, the speed its steering keeps up with
+    /// the path at; then the speed limit of the zones the robot is in; then the
     /// Ackermann steering angle to `max_steering_rate`, held while standing.
     /// A full stop passes unchanged.
     fn limit(
@@ -548,7 +549,7 @@ impl Tracker {
         if !cmd.valid {
             return cmd;
         }
-        let rate_cap = if self.kind.models_actuation() { None } else { self.steering_rate_speed(state) };
+        let rate_cap = if self.kind.is_point_controller() { self.steering_rate_speed(state) } else { None };
         let c = &self.constraints;
         let (linear_unit, angular_unit) = match self.controller.get_config().output_units {
             OutputUnits::Physical => (1.0, 1.0),
@@ -2063,5 +2064,33 @@ mod tests {
         ease_back(&mut carried, &c, Point::new(0.0, 0.0, 0.0), 0.0, Point::new(0.0, 1.0, 0.0), 0.0, 1.0);
         let back = ease_back(&mut carried, &c, Point::new(1.0, 0.0, 0.0), 0.0, Point::new(1.0, 0.0, 0.0), 0.5, 1.0);
         assert!(back.y.abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_path_follower_is_not_held_to_the_bend_its_path_starts_with() {
+        let mut t = Tracker::new(TrackerKind::PurePursuit);
+        let mut c = car();
+        c.max_steering_rate = 0.4;
+        t.init(c);
+        let (run_in, radius) = (3.0, 1.5);
+        let mut waypoints: Vec<Pose> = (0..30).map(|i| flat(0.1 * i as f64, 0.0)).collect();
+        waypoints.extend((0..=24).map(|i| {
+            let a = i as f64 * std::f64::consts::FRAC_PI_2 / 24.0;
+            Pose { point: Point::new(run_in + radius * a.sin(), radius * (1.0 - a.cos()), 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, a)) }
+        }));
+        let up = Quaternion::from_euler(Euler::new(0.0, 0.0, std::f64::consts::FRAC_PI_2));
+        waypoints.extend((1..=300).map(|i| Pose { point: Point::new(run_in + radius, radius + 0.1 * i as f64, 0.0), rotation: up }));
+        t.set_path(Path { waypoints, speeds: Vec::new(), is_closed: false });
+        let at = |x: f64, y: f64, yaw: f64| RobotState {
+            pose: Pose { point: Point::new(x, y, 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, yaw)) },
+            velocity: crate::types::Velocity { linear: 1.5, angular: 0.0, lateral: 0.0 },
+            velocity_valid: true,
+            ..Default::default()
+        };
+        let cruise = VelocityCommand { valid: true, linear_velocity: 1.5, ..Default::default() };
+        t.limit(cruise.clone(), &at(0.0, 0.0, 0.0), 0.05, None);
+        t.last_command = None;
+        let cmd = t.limit(cruise, &at(run_in + radius, radius + 20.0, std::f64::consts::FRAC_PI_2), 0.05, None);
+        assert!(cmd.linear_velocity > 1.45, "held to {:.2} m/s on the straight", cmd.linear_velocity);
     }
 }
