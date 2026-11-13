@@ -80,6 +80,10 @@ pub fn end_heading(waypoints: &[Pose]) -> f64 {
 /// robot catches up over the following calls.
 const MAX_ADVANCE: f64 = 2.0;
 
+/// Metres short of the mirror of a projection that jumped past a cusp that
+/// the search for the leg before it starts from.
+const HOLD_MARGIN: f64 = 1.0;
+
 /// Distances closer than this are a tie.
 const TIE: f64 = 1e-9;
 
@@ -411,7 +415,10 @@ impl PathCursor {
         let committed = self.cum.get(self.floor).copied().unwrap_or(0.0);
         let proj = match self.cusp_ahead(speeds, committed) {
             Some(k) if proj.arc_length > self.cum[k] + 1e-9 => {
-                let start = self.floor.min(k.saturating_sub(1));
+                // Searched back from the cusp as far as the jump went past it.
+                let mirrored = 2.0 * self.cum[k] - proj.arc_length - HOLD_MARGIN;
+                let from = self.cum.partition_point(|c| *c < mirrored).saturating_sub(1);
+                let start = from.max(self.floor).min(k.saturating_sub(1));
                 project(waypoints, &self.cum, p, start, 0, (k - start).max(1)).unwrap_or(proj)
             }
             _ => proj,
@@ -486,7 +493,7 @@ mod tests {
         let p = Point::new(8.8, 0.1, 0.0);
         let raw = cursor.project(&waypoints, p, 18).expect("a projection");
         let held = cursor.past_cusp(&waypoints, &speeds, p, raw, 0.3);
-        assert!(held.arc_length < 10.0, "the pose 1.2 m short of the cusp projects at {:.2}, past it", held.arc_length);
+        assert!((held.arc_length - 8.8).abs() < 0.05, "the pose 1.2 m short of the cusp projects at {:.2}, not 8.8", held.arc_length);
         let near = Point::new(9.9, 0.0, 0.0);
         let raw = cursor.project(&waypoints, near, held.segment).expect("a projection");
         let passed = cursor.past_cusp(&waypoints, &speeds, near, raw, 0.3);
