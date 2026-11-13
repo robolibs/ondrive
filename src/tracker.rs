@@ -118,6 +118,10 @@ pub struct Tracker {
     /// Side a point controller last went round obstacles on: +1 left, −1
     /// right, 0 none.
     detour_side: f64,
+    /// Arc length of the robot, signed lateral offset of the carrot last
+    /// handed to a point controller, metres, and the share of it per metre
+    /// the carrot may come back by, while the carrot is off the path.
+    carried: Option<(f64, f64, f64)>,
     projection_segment: usize,
     path_completed: bool,
     /// Whether the goal last handed to the controller is the path's end.
@@ -170,6 +174,7 @@ impl Tracker {
             cursor: PathCursor::default(),
             waypoint_index: 0,
             detour_side: 0.0,
+            carried: None,
             projection_segment: 0,
             path_completed: false,
             aiming_at_end: true,
@@ -255,6 +260,7 @@ impl Tracker {
         self.waypoint_index = 0;
         self.projection_segment = 0;
         self.stop_segment = 0;
+        self.carried = None;
         self.path_completed = false;
         self.aim = None;
         self.controller.set_path(path);
@@ -914,6 +920,7 @@ impl Tracker {
             if let Some(point) = detour {
                 self.aiming_at_end = false;
                 let heading = segment_heading(&path.waypoints, idx.min(n.saturating_sub(2)));
+                let point = ease_back(&mut self.carried, &self.constraints, path.waypoints[idx].point, heading, point, proj.arc_length, speed_now);
                 return Ok(Some(Goal {
                     target_pose: Pose { point, rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, heading)) },
                     target_velocity: passing,
@@ -944,12 +951,17 @@ impl Tracker {
             self.waypoint_index = idx;
             // An Ackermann robot is aimed one lookahead past the path's end
             // along its last segment, driving through the end, not round it.
-            let point = if last && self.lap.is_none() && n >= 2 && is_ackermann(self.constraints.steering_type) {
+            let mut point = if last && self.lap.is_none() && n >= 2 && is_ackermann(self.constraints.steering_type) {
                 let (s, c) = segment_heading(&path.waypoints, n - 2).sin_cos();
                 Point::new(wp.point.x + c * ahead, wp.point.y + s * ahead, wp.point.z)
             } else {
                 wp.point
             };
+            if last || idx == cap {
+                self.carried = None;
+            } else {
+                point = ease_back(&mut self.carried, &self.constraints, wp.point, travel, point, proj.arc_length, speed_now);
+            }
             return Ok(Some(Goal {
                 target_pose: Pose {
                     point,
@@ -1324,6 +1336,35 @@ fn blocked(waypoints: &[Pose], idx: usize, checker: &CollisionChecker) -> bool {
     let heading = segment_heading(waypoints, idx.min(waypoints.len().saturating_sub(2)));
     checker.collides(0, p.x, p.y, heading)
 }
+
+/// `point`, a point controller's carrot beside `on_path` (the path there,
+/// heading `heading`) with the robot at arc length `s`, kept off the path at
+/// least as far as the carrot `carried` last, less the share of that offset
+/// the machine at `speed` swerves over each metre the robot made since: back
+/// from a detour, the carrot returns no faster than it went out. A carrot
+/// further out, or on the other side, is handed out as it is.
+fn ease_back(carried: &mut Option<(f64, f64, f64)>, constraints: &RobotConstraints, on_path: Point, heading: f64, point: Point, s: f64, speed: f64) -> Point {
+    let (lat, _) = crate::core::path::frame_offsets(on_path, heading, point);
+    let swerve = crate::pred::mppi::Swerve::of(constraints, speed);
+    let rate = |d: f64| {
+        let length = swerve.length(d);
+        if length > 1e-6 { d.abs() / length } else { f64::INFINITY }
+    };
+    let held = carried.filter(|c| lat * c.1 >= 0.0);
+    let (point, lat, rate) = match held {
+        Some((from, off, r)) if off.abs() - r * (s - from).max(0.0) > lat.abs() => {
+            let shift = off.signum() * (off.abs() - r * (s - from).max(0.0));
+            let (sn, cs) = heading.sin_cos();
+            (Point::new(on_path.x - shift * sn, on_path.y + shift * cs, on_path.z), shift, r)
+        }
+        _ => (point, lat, held.map_or(0.0, |c| c.2).max(rate(lat))),
+    };
+    *carried = (lat.abs() > CARRIED_MIN && rate.is_finite()).then_some((s, lat, rate));
+    point
+}
+
+/// Lateral offset, metres, below which a carrot counts as on the path.
+const CARRIED_MIN: f64 = 1e-3;
 
 /// Where a point controller heads while obstacles block the path between
 /// arc lengths `from` (the robot) and `to` (its target): the target moved
@@ -1977,5 +2018,49 @@ mod tests {
             let cmd = t.limit(turn.clone(), &state, 0.05, None);
             assert!(cmd.angular_velocity.abs() <= 1.5 + 1e-9, "w {}", cmd.angular_velocity);
         }
+    }
+
+    fn car() -> RobotConstraints {
+        let mut c = RobotConstraints::default();
+        c.steering_type = crate::types::SteeringType::Ackermann;
+        c.max_linear_velocity = 1.5;
+        c.max_steering_angle = 0.6;
+        c.max_steering_rate = 0.8;
+        c.wheelbase = 1.0;
+        c
+    }
+
+    #[test]
+    fn a_carrot_back_from_a_detour_returns_no_faster_than_it_went_out() {
+        let c = car();
+        let mut carried = None;
+        let out = ease_back(&mut carried, &c, Point::new(0.0, 0.0, 0.0), 0.0, Point::new(0.0, 1.0, 0.0), 0.0, 1.0);
+        assert!((out.y - 1.0).abs() < 1e-9);
+        let rate = carried.expect("held off the path").2;
+        assert!(rate > 0.0 && rate < 1.0, "rate {rate}");
+        let back = ease_back(&mut carried, &c, Point::new(1.0, 0.0, 0.0), 0.0, Point::new(1.0, 0.0, 0.0), 0.5, 1.0);
+        assert!((back.y - (1.0 - 0.5 * rate)).abs() < 1e-9, "carrot at {:.3}", back.y);
+        let home = ease_back(&mut carried, &c, Point::new(9.0, 0.0, 0.0), 0.0, Point::new(9.0, 0.0, 0.0), 0.5 + 1.0 / rate, 1.0);
+        assert!(home.y.abs() < 1e-9 && carried.is_none());
+    }
+
+    #[test]
+    fn a_carrot_further_out_or_across_the_path_goes_as_it_is() {
+        let c = car();
+        let mut carried = Some((0.0, 1.0, 0.1));
+        let out = ease_back(&mut carried, &c, Point::new(1.0, 0.0, 0.0), 0.0, Point::new(1.0, 1.5, 0.0), 0.5, 1.0);
+        assert!((out.y - 1.5).abs() < 1e-9);
+        let across = ease_back(&mut carried, &c, Point::new(2.0, 0.0, 0.0), 0.0, Point::new(2.0, -0.8, 0.0), 1.0, 1.0);
+        assert!((across.y + 0.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_machine_that_turns_in_place_comes_straight_back() {
+        let mut c = car();
+        c.steering_type = crate::types::SteeringType::SkidSteer;
+        let mut carried = None;
+        ease_back(&mut carried, &c, Point::new(0.0, 0.0, 0.0), 0.0, Point::new(0.0, 1.0, 0.0), 0.0, 1.0);
+        let back = ease_back(&mut carried, &c, Point::new(1.0, 0.0, 0.0), 0.0, Point::new(1.0, 0.0, 0.0), 0.5, 1.0);
+        assert!(back.y.abs() < 1e-9);
     }
 }
