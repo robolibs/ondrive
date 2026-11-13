@@ -56,7 +56,7 @@ pub struct FlcConfig {
 impl Default for FlcConfig {
     fn default() -> Self {
         Self {
-            cte_range: 2.0,
+            cte_range: 0.6,
             heading_range: 1.57,
             max_steering: 0.7,
             base_velocity: 0.6,
