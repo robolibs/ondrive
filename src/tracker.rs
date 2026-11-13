@@ -85,25 +85,26 @@ impl TrackerKind {
         )
     }
 
-    /// Whether the controller tracks the path as drawn, by a steering law
-    /// or in the path's own frame, and so is handed it with its corners
-    /// rounded to what the platform can turn; Regulated Pure Pursuit, which
-    /// slows into corners on its own, keeps them sharp.
+    /// Whether the controller tracks the path as drawn, by a steering law,
+    /// in the path's own frame or through carrots on it, and so is handed it
+    /// with its corners rounded to what the platform can turn; Regulated
+    /// Pure Pursuit, which slows into corners on its own, and the
+    /// controllers that plan their own way round a corner keep them sharp.
     pub fn rounds_corners(self) -> bool {
-        matches!(
-            self,
-            TrackerKind::PurePursuit
-                | TrackerKind::Stanley
-                | TrackerKind::Lqr
-                | TrackerKind::Kanayama
-                | TrackerKind::VectorPursuit
-                | TrackerKind::Flc
-                | TrackerKind::Ilc
-                | TrackerKind::SlipAdaptive
-                | TrackerKind::Frenet
-                | TrackerKind::VelocityObstacle
-                | TrackerKind::PoseReach
-        )
+        self.is_point_controller()
+            || matches!(
+                self,
+                TrackerKind::PurePursuit
+                    | TrackerKind::Stanley
+                    | TrackerKind::Lqr
+                    | TrackerKind::Kanayama
+                    | TrackerKind::VectorPursuit
+                    | TrackerKind::Flc
+                    | TrackerKind::Ilc
+                    | TrackerKind::SlipAdaptive
+                    | TrackerKind::Frenet
+                    | TrackerKind::VelocityObstacle
+            )
     }
 }
 
