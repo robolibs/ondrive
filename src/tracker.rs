@@ -131,6 +131,8 @@ pub struct Tracker {
     stop_cursor: PathCursor,
     /// Segment the robot was last projected on for `stop_left`.
     stop_segment: usize,
+    /// Body curvature the leg past the cusp `stop_left` reaches starts on.
+    stop_bend: Option<f64>,
     trajectory: Option<Trajectory>,
     clock: f64,
     clock_origin: Option<f64>,
@@ -174,6 +176,7 @@ impl Tracker {
             stop_left: None,
             stop_cursor: PathCursor::default(),
             stop_segment: 0,
+            stop_bend: None,
             trajectory: None,
             clock: 0.0,
             clock_origin: None,
@@ -480,7 +483,14 @@ impl Tracker {
         let proj = self.stop_cursor.past_cusp(&path.waypoints, &path.speeds, state.pose.point, proj, reach);
         self.stop_segment = proj.segment;
         let cum = &self.stop_cursor.cum;
-        let stop = cusp_after(&path.speeds, cum, proj.arc_length).unwrap_or(cum[cum.len() - 1]);
+        let cusp = cusp_after(&path.speeds, cum, proj.arc_length);
+        // The body curvature the leg past the cusp starts on.
+        self.stop_bend = cusp.map(|c| {
+            let into = c + PRE_STEER_LOOK;
+            let direction = crate::pred::mppi::signed_speed_at(&path.speeds, cum, into).map_or(1.0, f64::signum);
+            direction * crate::core::kinematics::followable(curvature_at_arc_length(&path.waypoints, cum, into), &self.constraints)
+        });
+        let stop = cusp.unwrap_or(cum[cum.len() - 1]);
         Some((stop - proj.arc_length).max(0.0))
     }
 
@@ -499,6 +509,17 @@ impl Tracker {
         if cap < v {
             cmd.linear_velocity *= cap / v;
             cmd.angular_velocity *= cap / v;
+        }
+        // Creeping the last of the way into a cusp, an Ackermann machine
+        // steers for the leg it reverses onto, unless its controller plans
+        // the steering through the cusp itself.
+        if let Some(bend) = self.stop_bend
+            && is_ackermann(self.constraints.steering_type)
+            && !self.kind.models_actuation()
+            && left < self.stop_tolerance()
+        {
+            cmd.angular_velocity = cmd.linear_velocity * bend;
+            cmd.steering_angle = curvature_to_steering(bend, &self.constraints);
         }
         cmd
     }
@@ -1522,6 +1543,8 @@ const PLANNED_TURN_RADIUS: f64 = 0.5;
 const PLANNED_RADIUS_MARGIN: f64 = 1.25;
 /// Metres between the poses of a path planned to a goal.
 const PLANNED_STEP: f64 = 0.1;
+/// Metres into the leg past a cusp its starting curvature is read at.
+const PRE_STEER_LOOK: f64 = 1.0;
 /// Share of the lookahead a point controller's carrot sits ahead of it.
 const CARROT_SHARE: f64 = 0.5;
 /// Share of the top speed below which a point controller's detour does not
