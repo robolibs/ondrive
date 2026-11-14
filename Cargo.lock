@@ -2252,6 +2252,7 @@ dependencies = [
  "pyo3",
  "rand 0.8.6",
  "rand_distr",
+ "rayon",
  "rerun",
  "serde",
  "serde_json",

@@ -10,8 +10,8 @@ use crate::core::kinematics::planning;
 use crate::core::obstacles::{CollisionChecker, footprint_discs, obstacle_barrier};
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
-    CostWeights, Model, Reference, build_reference, build_timed_reference, command_from_controls,
-    current_lateral_speed, current_speed, prepare, rollout, speed_at_arc_length,
+    CostWeights, Model, Reference, Resume, build_reference, build_timed_reference, command_from_controls,
+    current_lateral_speed, current_speed, prepare, rollout, rollout_resumed, speed_at_arc_length,
     update_turn_in_place,
 };
 use crate::types::{
@@ -106,7 +106,7 @@ impl Default for MpcFollower {
     }
 }
 
-type StageExtra<'a> = dyn Fn(usize, f64, f64, f64) -> f64 + 'a;
+type StageExtra<'a> = dyn Fn(usize, f64, f64, f64) -> f64 + Sync + 'a;
 
 /// Steering, acceleration and lateral acceleration over the horizon.
 type Controls = (Vec<f64>, Vec<f64>, Vec<f64>);
@@ -199,6 +199,41 @@ const GIVE_WAY_SHARES: [f64; 3] = [0.6, 0.3, 0.0];
 /// Cost of giving up the whole pace, in the units of the solves' costs.
 const GIVE_WAY_COST: f64 = 60.0;
 
+/// Control channel `k` of `controls`: steering, acceleration, lateral
+/// acceleration.
+fn channel(controls: &mut Controls, k: usize) -> &mut Vec<f64> {
+    match k {
+        0 => &mut controls.0,
+        1 => &mut controls.1,
+        _ => &mut controls.2,
+    }
+}
+
+/// Central difference of `total_cost` in control `i` of channel `k`, rolled
+/// out from where the unchanged controls stood at step `i` (`stood`), the
+/// control put back after.
+#[allow(clippy::too_many_arguments)]
+fn central_difference(
+    model: &Model,
+    reference: &Reference,
+    w: &CostWeights,
+    cfg: &MpcConfig,
+    extra: &StageExtra,
+    stood: &[Resume],
+    controls: &mut Controls,
+    k: usize,
+    i: usize,
+) -> f64 {
+    let o = channel(controls, k)[i];
+    channel(controls, k)[i] = o + FD_EPS;
+    let from = stood.get(i).map(|r| (i, r));
+    let cp = total_cost_from(model, reference, w, cfg, extra, &controls.0, &controls.1, &controls.2, from);
+    channel(controls, k)[i] = o - FD_EPS;
+    let cm = total_cost_from(model, reference, w, cfg, extra, &controls.0, &controls.1, &controls.2, from);
+    channel(controls, k)[i] = o;
+    (cp - cm) / (2.0 * FD_EPS)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn total_cost(
     model: &Model,
@@ -210,7 +245,23 @@ fn total_cost(
     accel: &[f64],
     accel_lat: &[f64],
 ) -> f64 {
-    let (mut c, _) = rollout(model, steer, accel, accel_lat, reference, w, extra, false);
+    total_cost_from(model, reference, w, cfg, extra, steer, accel, accel_lat, None)
+}
+
+/// `total_cost` with its rollout taken up at `from` (see `rollout_resumed`).
+#[allow(clippy::too_many_arguments)]
+fn total_cost_from(
+    model: &Model,
+    reference: &Reference,
+    w: &CostWeights,
+    cfg: &MpcConfig,
+    extra: &StageExtra,
+    steer: &[f64],
+    accel: &[f64],
+    accel_lat: &[f64],
+    from: Option<(usize, &Resume)>,
+) -> f64 {
+    let (mut c, _) = rollout_resumed(model, steer, accel, accel_lat, reference, w, extra, false, from, None);
     for i in 1..steer.len() {
         let ds = steer[i] - steer[i - 1];
         let da = accel[i] - accel[i - 1];
@@ -291,31 +342,25 @@ impl MpcFollower {
         let mut cand_al = accel_lat.to_vec();
 
         for _ in 0..MAX_ITERATIONS {
-            for i in 0..n {
-                let o = steer[i];
-                steer[i] = o + FD_EPS;
-                let cp = total_cost(model, reference, w, cfg, extra, steer, accel, accel_lat);
-                steer[i] = o - FD_EPS;
-                let cm = total_cost(model, reference, w, cfg, extra, steer, accel, accel_lat);
-                steer[i] = o;
-                grad_s[i] = (cp - cm) / (2.0 * FD_EPS);
-
-                let o = accel[i];
-                accel[i] = o + FD_EPS;
-                let cp = total_cost(model, reference, w, cfg, extra, steer, accel, accel_lat);
-                accel[i] = o - FD_EPS;
-                let cm = total_cost(model, reference, w, cfg, extra, steer, accel, accel_lat);
-                accel[i] = o;
-                grad_a[i] = (cp - cm) / (2.0 * FD_EPS);
-
+            // Central differences of every control, shared among the pool's
+            // threads, each on its own copy of the controls.
+            let (now_s, now_a, now_al): (&[f64], &[f64], &[f64]) = (steer, accel, accel_lat);
+            let mut stood = Vec::with_capacity(n);
+            rollout_resumed(model, now_s, now_a, now_al, reference, w, extra, false, None, Some(&mut stood));
+            let grads = crate::core::parallel::map_indexed(n, |i| {
+                let mut at: Controls = (now_s.to_vec(), now_a.to_vec(), now_al.to_vec());
+                let lateral = if bound_al > 1e-6 { central_difference(model, reference, w, cfg, extra, &stood, &mut at, 2, i) } else { 0.0 };
+                (
+                    central_difference(model, reference, w, cfg, extra, &stood, &mut at, 0, i),
+                    central_difference(model, reference, w, cfg, extra, &stood, &mut at, 1, i),
+                    lateral,
+                )
+            });
+            for (i, (gs, ga, gal)) in grads.into_iter().enumerate() {
+                grad_s[i] = gs;
+                grad_a[i] = ga;
                 if bound_al > 1e-6 {
-                    let o = accel_lat[i];
-                    accel_lat[i] = o + FD_EPS;
-                    let cp = total_cost(model, reference, w, cfg, extra, steer, accel, accel_lat);
-                    accel_lat[i] = o - FD_EPS;
-                    let cm = total_cost(model, reference, w, cfg, extra, steer, accel, accel_lat);
-                    accel_lat[i] = o;
-                    grad_al[i] = (cp - cm) / (2.0 * FD_EPS);
+                    grad_al[i] = gal;
                 }
             }
             let g_inf = grad_s

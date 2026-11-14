@@ -4,5 +4,6 @@ pub mod error;
 pub mod kinematics;
 pub mod math;
 pub mod obstacles;
+pub mod parallel;
 pub mod path;
 pub mod safety;

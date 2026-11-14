@@ -199,7 +199,11 @@ fn cost_gradient(
     let eps = 1e-3;
     let mut grad = vec![0.0; 3 * n];
     let channels = if model.holonomic { 3 } else { 2 };
-    for t in 0..n {
+    // A control changed at step t leaves the steps before it as they were,
+    // so each difference is rolled out from where the unchanged one stood.
+    let mut stood = Vec::with_capacity(n);
+    reference.rollout_resumed(model, steer, accel, accel_lat, w, extra, None, Some(&mut stood));
+    for t in 0..n.min(stood.len()) {
         for channel in 0..channels {
             let mut cost_at = |by: f64| {
                 let control = match channel {
@@ -209,7 +213,7 @@ fn cost_gradient(
                 };
                 let o = *control;
                 *control = o + by;
-                let (c, _) = reference.rollout(model, steer, accel, accel_lat, w, extra, false);
+                let c = reference.rollout_resumed(model, steer, accel, accel_lat, w, extra, Some((t, &stood[t])), None);
                 match channel {
                     0 => steer[t] = o,
                     1 => accel[t] = o,
@@ -223,34 +227,21 @@ fn cost_gradient(
     grad
 }
 
-/// Most threads the guides' gradients are shared among.
-const MAX_GRADIENT_THREADS: usize = 8;
-
-/// `cost_gradient` of every guide, the guides shared among the cores.
+/// `cost_gradient` of every guide, the guides shared among the pool's
+/// threads, each on its own copy.
 fn guide_gradients(
     model: &Model,
     reference: &Track,
     w: &CostWeights,
     extra: &(dyn Fn(usize, f64, f64, f64) -> f64 + Sync),
-    guides_s: &mut [Vec<f64>],
-    guides_a: &mut [Vec<f64>],
-    guides_al: &mut [Vec<f64>],
+    guides_s: &[Vec<f64>],
+    guides_a: &[Vec<f64>],
+    guides_al: &[Vec<f64>],
 ) -> Vec<Vec<f64>> {
-    let k = guides_s.len();
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, MAX_GRADIENT_THREADS).min(k.max(1));
-    let chunk = k.div_ceil(threads).max(1);
-    let mut grads = vec![Vec::new(); k];
-    std::thread::scope(|scope| {
-        let parts = guides_s.chunks_mut(chunk).zip(guides_a.chunks_mut(chunk)).zip(guides_al.chunks_mut(chunk));
-        for (((s, a), al), out) in parts.zip(grads.chunks_mut(chunk)) {
-            scope.spawn(move || {
-                for (((s, a), al), g) in s.iter_mut().zip(a.iter_mut()).zip(al.iter_mut()).zip(out.iter_mut()) {
-                    *g = cost_gradient(model, reference, w, extra, s, a, al);
-                }
-            });
-        }
-    });
-    grads
+    crate::core::parallel::map_indexed(guides_s.len(), |i| {
+        let (mut s, mut a, mut al) = (guides_s[i].clone(), guides_a[i].clone(), guides_al[i].clone());
+        cost_gradient(model, reference, w, extra, &mut s, &mut a, &mut al)
+    })
 }
 
 impl SocFollower {
@@ -638,6 +629,8 @@ impl Controller for SocFollower {
         let mut steer = vec![0.0; n];
         let mut accel = vec![0.0; n];
         let mut accel_lat = vec![0.0; n];
+        let mut drawn = vec![(vec![0.0; n], vec![0.0; n], vec![0.0; n]); k];
+        let mut control_costs = vec![0.0; k];
         for j in 0..k {
             let mut control_cost = 0.0;
             if cfg.smooth_sampling {
@@ -659,8 +652,15 @@ impl Controller for SocFollower {
                 noise_al[j][t] = eal;
                 control_cost += CONTROL_PULL * (base_s[t] * es / nominal_s + base_a[t] * ea / nominal_a + base_al[t] * eal / nominal_a);
             }
-            let (c, _) = reference.rollout(&model, &steer, &accel, &accel_lat, &w, &extra, false);
-            costs[j] = c + lambda * control_cost;
+            control_costs[j] = control_cost;
+            drawn[j].0.copy_from_slice(&steer);
+            drawn[j].1.copy_from_slice(&accel);
+            drawn[j].2.copy_from_slice(&accel_lat);
+        }
+        // Rollouts shared among the pool's threads, costs kept in sample order.
+        let rolled = crate::core::parallel::map_indexed(k, |j| reference.rollout(&model, &drawn[j].0, &drawn[j].1, &drawn[j].2, &w, &extra, false).0);
+        for (j, c) in rolled.into_iter().enumerate() {
+            costs[j] = c + lambda * control_costs[j];
         }
         let weights = importance_weights(&costs, lambda);
         let ess = effective_sample_size(&weights);

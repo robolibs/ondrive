@@ -627,12 +627,56 @@ pub(crate) fn rollout(
     extra: &dyn Fn(usize, f64, f64, f64) -> f64,
     collect: bool,
 ) -> (f64, Vec<Point>) {
+    rollout_resumed(model, steer, accel, accel_lat, reference, w, extra, collect, None, None)
+}
+
+/// Where a rollout stood before one of its steps: the state, the steering
+/// reached, its place on a corridor and the cost run up so far.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Resume {
+    x: f64,
+    y: f64,
+    yaw: f64,
+    v: f64,
+    vy: f64,
+    actual: f64,
+    j: usize,
+    gate: usize,
+    cost: f64,
+}
+
+impl Resume {
+    /// Before the first step of a rollout of `model`.
+    fn start(model: &Model) -> Self {
+        let sb = model.steer_bound();
+        Resume { x: model.x0, y: model.y0, yaw: model.yaw0, v: model.v0, vy: model.vy0, actual: model.steer0.clamp(-sb, sb), ..Default::default() }
+    }
+}
+
+/// `rollout`, taken up at step `from.0` where `from.1` left it (from the
+/// start without), pushing onto `record` where it stands before each step.
+/// A rollout taken up where a recorded one stood costs what it would have
+/// from the start.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rollout_resumed(
+    model: &Model,
+    steer: &[f64],
+    accel: &[f64],
+    accel_lat: &[f64],
+    reference: &Reference,
+    w: &CostWeights,
+    extra: &dyn Fn(usize, f64, f64, f64) -> f64,
+    collect: bool,
+    from: Option<(usize, &Resume)>,
+    mut record: Option<&mut Vec<Resume>>,
+) -> (f64, Vec<Point>) {
     let n = steer.len().min(accel.len()).min(accel_lat.len());
     let sb = model.steer_bound();
     let ab = model.accel_bound();
     let lb = model.accel_lat_bound();
-    let (mut x, mut y, mut yaw, mut v, mut vy) = (model.x0, model.y0, model.yaw0, model.v0, model.vy0);
-    let mut actual = model.steer0.clamp(-sb, sb);
+    let (first, at) = from.map_or((0, Resume::start(model)), |(i, r)| (i, *r));
+    let (mut x, mut y, mut yaw, mut v, mut vy) = (at.x, at.y, at.yaw, at.v, at.vy);
+    let mut actual = at.actual;
     let lag = model.steer_rate * model.dt;
     let mut traj = Vec::new();
     if collect {
@@ -640,8 +684,11 @@ pub(crate) fn rollout(
         let (ox, oy) = model.origin(x, y, yaw);
         traj.push(Point::new(ox, oy, 0.0));
     }
-    let mut cost = 0.0;
-    for i in 0..n {
+    let mut cost = at.cost;
+    for i in first..n {
+        if let Some(r) = record.as_deref_mut() {
+            r.push(Resume { x, y, yaw, v, vy, actual, j: 0, gate: 0, cost });
+        }
         let s = steer[i].clamp(-sb, sb);
         let a = accel[i].clamp(-ab, ab);
         let al = accel_lat[i].clamp(-lb, lb);
@@ -1014,7 +1061,7 @@ impl MppiFollower {
         goal: &Goal,
         constraints: &RobotConstraints,
         dt: f64,
-        extra: &dyn Fn(usize, f64, f64, f64) -> f64,
+        extra: &(dyn Fn(usize, f64, f64, f64) -> f64 + Sync),
         relax: &dyn Fn(f64, f64) -> (f64, f64, f64),
         ref_scale: f64,
         message: &str,
@@ -1100,6 +1147,8 @@ impl MppiFollower {
         let mut accel = vec![0.0; n];
         let mut accel_lat = vec![0.0; n];
         let mut kept: Vec<(Vec<Point>, f64)> = Vec::new();
+        let mut drawn = vec![(vec![0.0; n], vec![0.0; n], vec![0.0; n]); k];
+        let mut control_costs = vec![0.0; k];
         for j in 0..k {
             match j {
                 // The previous plan, unperturbed.
@@ -1175,10 +1224,20 @@ impl MppiFollower {
                     + self.mean_acceleration[t] * eps_a[j][t] / (sigma_a * sigma_a)
                     + self.mean_accel_lateral[t] * eps_al[j][t] / (sigma_al * sigma_al);
             }
-            let keep = self.debug_level == DebugLevel::Full && j % ROLLOUT_STRIDE == 0;
-            let (c, traj) = cost_of(&steer, &accel, &accel_lat, keep);
-            costs[j] = c + gamma * control_cost * model.dt;
-            if keep {
+            control_costs[j] = control_cost;
+            drawn[j].0.copy_from_slice(&steer);
+            drawn[j].1.copy_from_slice(&accel);
+            drawn[j].2.copy_from_slice(&accel_lat);
+        }
+        // Rollouts shared among the pool's threads, costs kept in sample order.
+        let full = self.debug_level == DebugLevel::Full;
+        let rolled = crate::core::parallel::map_indexed(k, |j| {
+            let (s, a, al) = &drawn[j];
+            cost_of(s, a, al, full && j % ROLLOUT_STRIDE == 0)
+        });
+        for (j, (c, traj)) in rolled.into_iter().enumerate() {
+            costs[j] = c + gamma * control_costs[j] * model.dt;
+            if full && j % ROLLOUT_STRIDE == 0 {
                 kept.push((traj, costs[j]));
             }
         }
@@ -1312,7 +1371,7 @@ impl Controller for MppiFollower {
         let (collision, repulsion, reach) = (cfg.weight_collision, cfg.weight_repulsion, cfg.repulsion_distance.max(1e-3));
         let checker = CollisionChecker::new(world, constraints, cfg.safety_margin.max(0.0)).with_step(step).with_spread(1.0);
         let critic = |i: usize, x: f64, y: f64, yaw: f64| -> f64 {
-            let d = checker.clearance_at((i + 1) as f64 * step, x, y, yaw);
+            let d = checker.clearance(i + 1, x, y, yaw);
             if d < 0.0 {
                 collision
             } else if d < reach {
@@ -1508,10 +1567,28 @@ pub(crate) fn rollout_corridor(
     extra: &dyn Fn(usize, f64, f64, f64) -> f64,
     collect: bool,
 ) -> (f64, Vec<Point>) {
+    rollout_corridor_resumed(model, steer, accel, accel_lat, corridor, w, extra, collect, None, None)
+}
+
+/// `rollout_corridor`, taken up and recorded as `rollout_resumed` is.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rollout_corridor_resumed(
+    model: &Model,
+    steer: &[f64],
+    accel: &[f64],
+    accel_lat: &[f64],
+    corridor: &Corridor,
+    w: &CostWeights,
+    extra: &dyn Fn(usize, f64, f64, f64) -> f64,
+    collect: bool,
+    from: Option<(usize, &Resume)>,
+    mut record: Option<&mut Vec<Resume>>,
+) -> (f64, Vec<Point>) {
     let n = steer.len().min(accel.len()).min(accel_lat.len());
     let (sb, ab, lb) = (model.steer_bound(), model.accel_bound(), model.accel_lat_bound());
-    let (mut x, mut y, mut yaw, mut v, mut vy) = (model.x0, model.y0, model.yaw0, model.v0, model.vy0);
-    let mut actual = model.steer0.clamp(-sb, sb);
+    let (first, at) = from.map_or((0, Resume::start(model)), |(i, r)| (i, *r));
+    let (mut x, mut y, mut yaw, mut v, mut vy) = (at.x, at.y, at.yaw, at.v, at.vy);
+    let mut actual = at.actual;
     let lag = model.steer_rate * model.dt;
     let mut traj = Vec::new();
     if collect {
@@ -1522,11 +1599,14 @@ pub(crate) fn rollout_corridor(
     let m = corridor.x.len();
     let d2 = |k: usize, px: f64, py: f64| (corridor.x[k] - px).powi(2) + (corridor.y[k] - py).powi(2);
     let reach = (model.v_max.abs().max(model.v_min.abs()) * model.dt / corridor.spacing.max(1e-3)).ceil() as usize * 2 + 3;
-    let mut j = 0usize;
+    let mut j = at.j;
     let release = corridor.release.max(corridor.spacing);
-    let mut gates = corridor.cusps.iter().copied().peekable();
-    let mut cost = 0.0;
-    for i in 0..n {
+    let mut gate = at.gate;
+    let mut cost = at.cost;
+    for i in first..n {
+        if let Some(r) = record.as_deref_mut() {
+            r.push(Resume { x, y, yaw, v, vy, actual, j, gate, cost });
+        }
         let s = steer[i].clamp(-sb, sb);
         let a = accel[i].clamp(-ab, ab);
         let al = accel_lat[i].clamp(-lb, lb);
@@ -1540,14 +1620,14 @@ pub(crate) fn rollout_corridor(
         if m > 0 {
             // Nearest corridor point within one step's reach; ties go to the
             // later point, so a fold at a cusp is followed onto the next leg.
-            while let Some(&g) = gates.peek() {
+            while let Some(&g) = corridor.cusps.get(gate) {
                 if g < j || d2(g, px, py) < release * release {
-                    gates.next();
+                    gate += 1;
                 } else {
                     break;
                 }
             }
-            let limit = gates.peek().copied().unwrap_or(m - 1);
+            let limit = corridor.cusps.get(gate).copied().unwrap_or(m - 1);
             let (mut best, mut best_d) = (j, d2(j, px, py));
             for k in j.saturating_sub(1)..=(j + reach).min(limit) {
                 let d = d2(k, px, py);
@@ -1769,7 +1849,7 @@ fn comes_near(o: &Obstacle, reference: &Reference, step: f64, reach: f64) -> boo
     (0..reference.x.len()).any(|k| {
         modes_at(o, k as f64 * step, step).any(|m| {
             let near = m.radius + CROSSING_REACH.max(reach + DETOUR_MARGIN + 2.0 * m.std_x.max(m.std_y));
-            (0..reference.x.len()).any(|i| (m.x - reference.x[i]).hypot(m.y - reference.y[i]) < near)
+            (0..reference.x.len()).any(|i| (m.x - reference.x[i]).powi(2) + (m.y - reference.y[i]).powi(2) < near * near)
         })
     })
 }
@@ -2157,6 +2237,25 @@ impl Track {
         match self {
             Track::Timed(r) => rollout(model, steer, accel, accel_lat, r, w, extra, collect),
             Track::Path(c) => rollout_corridor(model, steer, accel, accel_lat, c, w, extra, collect),
+        }
+    }
+
+    /// `rollout`, taken up and recorded as `rollout_resumed` is.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn rollout_resumed(
+        &self,
+        model: &Model,
+        steer: &[f64],
+        accel: &[f64],
+        accel_lat: &[f64],
+        w: &CostWeights,
+        extra: &dyn Fn(usize, f64, f64, f64) -> f64,
+        from: Option<(usize, &Resume)>,
+        record: Option<&mut Vec<Resume>>,
+    ) -> f64 {
+        match self {
+            Track::Timed(r) => rollout_resumed(model, steer, accel, accel_lat, r, w, extra, false, from, record).0,
+            Track::Path(c) => rollout_corridor_resumed(model, steer, accel, accel_lat, c, w, extra, false, from, record).0,
         }
     }
 }
