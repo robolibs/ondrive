@@ -87,7 +87,7 @@ pub fn clearance_at(obstacles: &[Obstacle], t: f64, step: f64, x: f64, y: f64, r
 /// negative inside.
 fn polygon_distance(poly: &[(f64, f64)], x: f64, y: f64) -> f64 {
     let n = poly.len();
-    let mut d = f64::INFINITY;
+    let mut d2 = f64::INFINITY;
     let mut inside = false;
     for i in 0..n {
         let (ax, ay) = poly[i];
@@ -95,11 +95,13 @@ fn polygon_distance(poly: &[(f64, f64)], x: f64, y: f64) -> f64 {
         let (ex, ey) = (bx - ax, by - ay);
         let ll = ex * ex + ey * ey;
         let t = if ll > 0.0 { (((x - ax) * ex + (y - ay) * ey) / ll).clamp(0.0, 1.0) } else { 0.0 };
-        d = d.min((ax + t * ex - x).hypot(ay + t * ey - y));
+        let (qx, qy) = (ax + t * ex - x, ay + t * ey - y);
+        d2 = d2.min(qx * qx + qy * qy);
         if (ay > y) != (by > y) && x < ax + (y - ay) * ex / ey {
             inside = !inside;
         }
     }
+    let d = d2.sqrt();
     if inside { -d } else { d }
 }
 
@@ -121,6 +123,16 @@ pub struct CollisionChecker<'a> {
     spread: f64,
     /// Extra clearance treated as contact.
     pub margin: f64,
+    /// Centre and grown radius of every obstacle mode at each controller
+    /// step, filled in as the steps are first asked for.
+    table: Vec<std::sync::OnceLock<Vec<(f64, f64, f64)>>>,
+}
+
+/// Controller steps a checker keeps the obstacles' places for.
+const TABLE_STEPS: usize = 256;
+
+fn fresh_table() -> Vec<std::sync::OnceLock<Vec<(f64, f64, f64)>>> {
+    (0..TABLE_STEPS).map(|_| std::sync::OnceLock::new()).collect()
 }
 
 impl<'a> CollisionChecker<'a> {
@@ -142,7 +154,7 @@ impl<'a> CollisionChecker<'a> {
             }
             _ => (Vec::new(), Vec::new()),
         };
-        Self { world, polygon, samples, disc_radius: robot_radius(constraints), step: 0.1, spread: 0.0, margin: margin.max(0.0) }
+        Self { world, polygon, samples, disc_radius: robot_radius(constraints), step: 0.1, spread: 0.0, margin: margin.max(0.0), table: fresh_table() }
     }
 
     /// Seconds per controller step, so `clearance(step, ..)` can read
@@ -150,6 +162,7 @@ impl<'a> CollisionChecker<'a> {
     pub fn with_step(mut self, seconds: f64) -> Self {
         if seconds > 0.0 {
             self.step = seconds;
+            self.table = fresh_table();
         }
         self
     }
@@ -158,6 +171,7 @@ impl<'a> CollisionChecker<'a> {
     /// spread at the moment checked.
     pub fn with_spread(mut self, k: f64) -> Self {
         self.spread = k.max(0.0);
+        self.table = fresh_table();
         self
     }
 
@@ -166,29 +180,58 @@ impl<'a> CollisionChecker<'a> {
     }
 
     /// Clearance of the footprint at `(x, y, yaw)` at controller step `step`,
-    /// with `margin` already subtracted. Infinite without obstacles.
+    /// with `margin` already subtracted. Infinite without obstacles. Where
+    /// the obstacles are at each step is worked out once per checker.
     pub fn clearance(&self, step: usize, x: f64, y: f64, yaw: f64) -> f64 {
-        self.clearance_at(step as f64 * self.step, x, y, yaw)
+        match self.table.get(step) {
+            Some(cell) => {
+                let modes = cell.get_or_init(|| self.grown_modes(step as f64 * self.step).collect());
+                self.clearance_among(modes.iter().copied(), x, y, yaw)
+            }
+            None => self.clearance_at(step as f64 * self.step, x, y, yaw),
+        }
     }
 
     /// Clearance of the footprint at `(x, y, yaw)` against the obstacles as
     /// predicted `t` seconds from now, with `margin` already subtracted.
     pub fn clearance_at(&self, t: f64, x: f64, y: f64, yaw: f64) -> f64 {
+        self.clearance_among(self.grown_modes(t), x, y, yaw)
+    }
+
+    /// Centre and grown radius of every obstacle mode `t` seconds from now.
+    fn grown_modes(&self, t: f64) -> impl Iterator<Item = (f64, f64, f64)> + '_ {
+        self.world.into_iter().flat_map(|w| w.obstacles.iter()).flat_map(move |obs| {
+            modes_at(obs, t, self.step).map(move |m| (m.x, m.y, m.radius + self.spread * m.std_x.max(m.std_y)))
+        })
+    }
+
+    /// `clearance_at` against the obstacle modes `modes` (centre and grown
+    /// radius) and the occupancy grid.
+    fn clearance_among(&self, modes: impl Iterator<Item = (f64, f64, f64)>, x: f64, y: f64, yaw: f64) -> f64 {
         let Some(world) = self.world else {
             return f64::INFINITY;
         };
         let mut best = f64::INFINITY;
-        for obs in &world.obstacles {
-            for m in modes_at(obs, t, self.step) {
-                let grow = m.radius + self.spread * m.std_x.max(m.std_y);
-                best = best.min(self.body_distance(m.x, m.y, x, y, yaw) - grow);
+        let (s, c) = yaw.sin_cos();
+        for (mx, my, grow) in modes {
+            let (dx, dy) = (mx - x, my - y);
+            let centre = (dx * dx + dy * dy).sqrt();
+            // The footprint lies within the bounding disc, so a mode past it
+            // by more than the nearest so far cannot be nearer.
+            if centre - self.disc_radius - grow >= best {
+                continue;
             }
+            let d = if self.polygon.is_empty() {
+                centre - self.disc_radius
+            } else {
+                polygon_distance(&self.polygon, c * dx + s * dy, -s * dx + c * dy)
+            };
+            best = best.min(d - grow);
         }
         if let Some(grid) = &world.grid {
             if self.samples.is_empty() {
                 best = best.min(grid.distance_to_occupied(x, y) - self.disc_radius);
             } else {
-                let (s, c) = yaw.sin_cos();
                 for (px, py) in &self.samples {
                     best = best.min(grid.distance_to_occupied(x + px * c - py * s, y + px * s + py * c));
                 }
@@ -275,12 +318,12 @@ pub fn obstacle_barrier(
         return b;
     }
     let (s, c) = yaw.sin_cos();
-    for &(off, r) in discs {
-        let (px, py) = (x + off * c, y + off * s);
-        for obs in obstacles {
-            for m in modes_at(obs, t, step) {
+    for obs in obstacles {
+        for m in modes_at(obs, t, step) {
+            for &(off, r) in discs {
+                let (px, py) = (x + off * c, y + off * s);
                 let (dx, dy) = (px - m.x, py - m.y);
-                let dist = dx.hypot(dy).max(1e-6);
+                let dist = (dx * dx + dy * dy).sqrt().max(1e-6);
                 let d = dist - m.radius - r - spread * m.std_x.max(m.std_y);
                 if d > 8.0 * scale {
                     continue;
