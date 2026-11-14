@@ -1371,7 +1371,7 @@ impl Controller for MppiFollower {
         let (collision, repulsion, reach) = (cfg.weight_collision, cfg.weight_repulsion, cfg.repulsion_distance.max(1e-3));
         let checker = CollisionChecker::new(world, constraints, cfg.safety_margin.max(0.0)).with_step(step).with_spread(1.0);
         let critic = |i: usize, x: f64, y: f64, yaw: f64| -> f64 {
-            let d = checker.clearance(i + 1, x, y, yaw);
+            let d = checker.clearance_within(i + 1, x, y, yaw, reach);
             if d < 0.0 {
                 collision
             } else if d < reach {
@@ -1846,9 +1846,16 @@ pub(crate) fn crosses(o: &Obstacle, reference: &Reference, step: f64, reach: f64
 /// within its radius plus `CROSSING_REACH`, or plus the detour room of
 /// `reach`, of any point of `reference`.
 fn comes_near(o: &Obstacle, reference: &Reference, step: f64, reach: f64) -> bool {
+    let (x0, x1) = reference.x.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+    let (y0, y1) = reference.y.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
     (0..reference.x.len()).any(|k| {
         modes_at(o, k as f64 * step, step).any(|m| {
             let near = m.radius + CROSSING_REACH.max(reach + DETOUR_MARGIN + 2.0 * m.std_x.max(m.std_y));
+            // No point of the reference is nearer than its bounding box.
+            let (gx, gy) = ((x0 - m.x).max(m.x - x1).max(0.0), (y0 - m.y).max(m.y - y1).max(0.0));
+            if gx * gx + gy * gy >= near * near {
+                return false;
+            }
             (0..reference.x.len()).any(|i| (m.x - reference.x[i]).powi(2) + (m.y - reference.y[i]).powi(2) < near * near)
         })
     })
@@ -1871,10 +1878,14 @@ fn velocity_on(o: &Obstacle, reference: &Reference, step: f64) -> Option<(f64, f
     if vx.hypot(vy) < CROSSING_MIN_SPEED {
         return None;
     }
-    let k = (0..reference.x.len()).min_by(|a, b| {
-        let d = |i: usize| (reference.x[i] - now.x).hypot(reference.y[i] - now.y);
-        d(*a).total_cmp(&d(*b))
-    })?;
+    let d = |i: usize| (reference.x[i] - now.x).hypot(reference.y[i] - now.y);
+    let d2 = |i: usize| (reference.x[i] - now.x).powi(2) + (reference.y[i] - now.y).powi(2);
+    // The nearest by `hypot` lies among the nearest by squared distance.
+    let lo = (0..reference.x.len()).map(d2).fold(f64::INFINITY, f64::min);
+    let k = (0..reference.x.len())
+        .filter(|&i| d2(i) <= lo * (1.0 + 1e-9))
+        .min_by(|a, b| d(*a).total_cmp(&d(*b)))
+        .or_else(|| (0..reference.x.len()).min_by(|a, b| d(*a).total_cmp(&d(*b))))?;
     let (s, c) = reference.yaw[k].sin_cos();
     Some((vx * -s + vy * c, vx * c + vy * s))
 }
@@ -2025,18 +2036,20 @@ pub(crate) fn plan_avoidance(
     let (back, _, half, keep) = swerve.keep(reach);
     let width = 2.0 * if half > 0.0 { half } else { reach.max(0.1) };
     let start = along.reference(1, step, speed);
-    let ahead: Vec<Obstacle> = obstacles.iter().filter(|o| !left_behind(o, &start, back - keep)).cloned().collect();
+    let ahead: Vec<bool> = obstacles.iter().map(|o| !left_behind(o, &start, back - keep)).collect();
     let mut far = n + (swerve.lookahead() / (speed.abs() * step).max(1e-3)).ceil() as usize;
-    if ahead.iter().any(|o| crosses(o, &along.reference(far, step, speed), step, reach)) {
+    let lookout = along.reference(far, step, speed);
+    if obstacles.iter().zip(&ahead).any(|(o, a)| *a && crosses(o, &lookout, step, reach)) {
         far = far.max((CROSSING_LOOKOUT_S / step.max(1e-3)).ceil() as usize);
     }
     let paces: &[f64] = if along.trajectory.is_some() { &AVOID_PACES[..1] } else { &AVOID_PACES };
     let mut best: Option<(f64, f64, Avoidance)> = None;
     for &pace in paces {
         let reference = along.reference((far as f64 / pace).ceil() as usize, step, speed * pace);
-        let behinds = behind_sides(&ahead, &reference, step, reach);
+        let crossing: Vec<bool> = obstacles.iter().map(|o| crosses(o, &reference, step, reach)).collect();
+        let behinds: Vec<f64> = (0..obstacles.len()).filter(|&k| ahead[k] && crossing[k]).filter_map(|k| behind(&obstacles[k], &reference, step)).collect();
         // Traffic crossing the way is given way to, not gone round.
-        let around: Vec<Obstacle> = obstacles.iter().filter(|o| !crosses(o, &reference, step, reach)).cloned().collect();
+        let around: Vec<Obstacle> = (0..obstacles.len()).filter(|&k| !crossing[k]).map(|k| obstacles[k].clone()).collect();
         let (first, room) = nearest_cluster(&reference, &around, reach + DETOUR_MARGIN, step, swerve, width);
         let mut options: Vec<(f64, f64, Option<Reference>)> = Vec::new();
         let mut met = false;
