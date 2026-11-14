@@ -78,6 +78,23 @@ fn main() {
     if kinds.is_empty() {
         kinds = ["mppi", "mca", "soc", "mpc", "teb", "ilqr"].iter().map(|s| s.to_string()).collect();
     }
+    // `ONDRIVE_CROWD` more walkers, crossing from either side of the path
+    // over `ONDRIVE_CROWD_SPAN` metres of it.
+    let walkers: usize = std::env::var("ONDRIVE_CROWD").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let span: f64 = std::env::var("ONDRIVE_CROWD_SPAN").ok().and_then(|v| v.parse().ok()).unwrap_or(110.0);
+    let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+    let mut draw = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let crowd: Vec<(f64, f64, f64, f64)> = (0..walkers)
+        .map(|_| {
+            let (x, side, speed) = (10.0 + span * draw(), if draw() < 0.5 { -1.0 } else { 1.0 }, 0.4 + 0.8 * draw());
+            (x, side * (4.0 + 20.0 * draw()), 0.3 * (draw() - 0.5), -side * speed)
+        })
+        .collect();
     let mut path = Path::default();
     path.waypoints = (0..=180).map(|i| pose(0.5 * i as f64, 0.0, 0.0)).collect();
     for name in &kinds {
@@ -94,14 +111,13 @@ fn main() {
         let mut times: Vec<f64> = Vec::with_capacity(ticks);
         for k in 0..ticks {
             let now = k as f64 * DT;
-            let world = WorldConstraints {
-                obstacles: vec![
-                    obstacle(0, 24.0, 1.2, 0.0, 0.0, 1.5),
-                    obstacle(1, 45.0, -12.0 + 0.7 * now, 0.0, 0.7, 0.5),
-                    obstacle(2, 90.0 - 0.6 * now, 0.6, -0.6, 0.0, 0.5),
-                ],
-                ..Default::default()
-            };
+            let mut obstacles = vec![
+                obstacle(0, 24.0, 1.2, 0.0, 0.0, 1.5),
+                obstacle(1, 45.0, -12.0 + 0.7 * now, 0.0, 0.7, 0.5),
+                obstacle(2, 90.0 - 0.6 * now, 0.6, -0.6, 0.0, 0.5),
+            ];
+            obstacles.extend(crowd.iter().enumerate().map(|(i, &(x, y, vx, vy))| obstacle(3 + i as u64, x + vx * now, y + vy * now, vx, vy, 0.4)));
+            let world = WorldConstraints { obstacles, ..Default::default() };
             let state = RobotState {
                 pose: pose(x, y, yaw),
                 velocity: Velocity { linear: v, angular: w, lateral: 0.0 },

@@ -438,6 +438,10 @@ impl Tracker {
             self.controller.set_time(self.clock);
         }
 
+        // Only the obstacles the robot could meet within `CULL_LOOKOUT_S`.
+        let culled = world.and_then(|w| reachable(w, state, &self.constraints));
+        let world = culled.as_ref().or(world);
+
         self.next_lap(state);
         self.plan_to_goal(state);
         self.steer_round(state, world, dt);
@@ -1332,6 +1336,36 @@ fn make_controller(kind: TrackerKind) -> Box<dyn Controller> {
 /// Safety margin around obstacles when choosing a waypoint target.
 const WAYPOINT_MARGIN: f64 = 0.3;
 
+/// `world` with only the obstacles the robot at `state` could meet within
+/// `CULL_LOOKOUT_S`: those whose prediction comes within the way the robot
+/// covers at its top speed, its footprint, their radius and twice their
+/// spread, plus `CULL_MARGIN`. `None` when every obstacle is kept.
+fn reachable(world: &WorldConstraints, state: &RobotState, constraints: &RobotConstraints) -> Option<WorldConstraints> {
+    let (x, y) = (state.pose.point.x, state.pose.point.y);
+    let speed = constraints.max_linear_velocity.abs().max(constraints.min_linear_velocity.abs()).max(0.1);
+    let body = crate::core::obstacles::robot_radius(constraints) + CULL_MARGIN;
+    let steps = (CULL_LOOKOUT_S / CULL_STEP).ceil() as usize;
+    let near = |o: &crate::types::Obstacle| {
+        (0..=steps).any(|k| {
+            let t = k as f64 * CULL_STEP;
+            crate::core::obstacles::modes_at(o, t, CULL_STEP).any(|m| {
+                let room = body + m.radius + 2.0 * m.std_x.max(m.std_y) + speed * t;
+                (m.x - x).powi(2) + (m.y - y).powi(2) < room * room
+            })
+        })
+    };
+    let kept: Vec<_> = world.obstacles.iter().filter(|o| near(o)).cloned().collect();
+    (kept.len() < world.obstacles.len()).then(|| WorldConstraints { zones: world.zones.clone(), obstacles: kept, grid: world.grid.clone() })
+}
+
+/// Seconds ahead an obstacle may be met in and still be planned round: the
+/// longest horizon a controller plans over.
+const CULL_LOOKOUT_S: f64 = 12.0;
+/// Seconds between the moments the culling checks.
+const CULL_STEP: f64 = 0.5;
+/// Metres past the footprint and an obstacle's spread kept in.
+const CULL_MARGIN: f64 = 2.0;
+
 /// True when the robot footprint placed at waypoint `idx` collides now.
 fn blocked(waypoints: &[Pose], idx: usize, checker: &CollisionChecker) -> bool {
     let p = waypoints[idx].point;
@@ -2092,5 +2126,27 @@ mod tests {
         t.last_command = None;
         let cmd = t.limit(cruise, &at(run_in + radius, radius + 20.0, std::f64::consts::FRAC_PI_2), 0.05, None);
         assert!(cmd.linear_velocity > 1.45, "held to {:.2} m/s on the straight", cmd.linear_velocity);
+    }
+
+    #[test]
+    fn obstacles_the_robot_cannot_meet_in_time_are_left_out() {
+        let walker = |id: u64, x: f64, vx: f64| {
+            let n = 31;
+            let mode = crate::types::GaussianMode {
+                weight: 1.0,
+                mean_x: (0..n).map(|k| x + vx * 0.2 * k as f64).collect(),
+                mean_y: vec![0.0; n],
+                std_x: vec![0.05; n],
+                std_y: vec![0.05; n],
+            };
+            crate::types::Obstacle { id, radius: 0.4, dt: 0.2, modes: vec![mode] }
+        };
+        let world = WorldConstraints { obstacles: vec![walker(0, 10.0, 0.0), walker(1, 200.0, 0.0), walker(2, 60.0, -4.0)], ..Default::default() };
+        let state = RobotState { pose: flat(0.0, 0.0), ..Default::default() };
+        let kept = reachable(&world, &state, &car()).expect("the far walker is left out");
+        let ids: Vec<u64> = kept.obstacles.iter().map(|o| o.id).collect();
+        assert_eq!(ids, vec![0, 2], "the near walker and the one closing fast are kept");
+        let near = WorldConstraints { obstacles: vec![walker(0, 10.0, 0.0)], ..Default::default() };
+        assert!(reachable(&near, &state, &car()).is_none(), "nothing to leave out");
     }
 }
