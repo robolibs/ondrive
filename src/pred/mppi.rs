@@ -1750,7 +1750,7 @@ pub(crate) const GIVE_WAY_LOOKOUT_S: f64 = 2.0;
 /// Seconds of path at the reference speed the give-way course spans.
 const GIVE_WAY_COURSE_S: f64 = 12.0;
 /// Room, metres, the give-way check keeps beyond the footprint.
-pub(crate) const GIVE_WAY_MARGIN: f64 = 0.1;
+pub(crate) const GIVE_WAY_MARGIN: f64 = 0.7;
 
 /// Whether `o` is about to cross the path: it moves across it (more across
 /// than along, at the point of `reference` nearest it) rather than stands
@@ -1926,7 +1926,8 @@ pub(crate) struct Avoidance {
 /// of its excess over the robot's width per width, `AHEAD_COST` times more
 /// in front of crossing traffic, plus `LATE_COST` per metre the
 /// robot sits off where it starts (`guide_gap`), and a pace `PACE_COST` per
-/// share of the speed given up. `last` (side, pace) is kept unless another
+/// share of the speed given up. Traffic crossing the way is not detoured
+/// round but given way to. `last` (side, pace) is kept unless another
 /// is cheaper by `SIDE_SWITCH_COST`, and updated.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_avoidance(
@@ -1954,7 +1955,9 @@ pub(crate) fn plan_avoidance(
     for &pace in paces {
         let reference = along.reference((far as f64 / pace).ceil() as usize, step, speed * pace);
         let behinds = behind_sides(&ahead, &reference, step, reach);
-        let (first, room) = nearest_cluster(&reference, obstacles, reach + DETOUR_MARGIN, step, swerve, width);
+        // Traffic crossing the way is given way to, not gone round.
+        let around: Vec<Obstacle> = obstacles.iter().filter(|o| !crosses(o, &reference, step, reach)).cloned().collect();
+        let (first, room) = nearest_cluster(&reference, &around, reach + DETOUR_MARGIN, step, swerve, width);
         let mut options: Vec<(f64, f64, Option<Reference>)> = Vec::new();
         let mut met = false;
         for s in [1.0, -1.0] {
