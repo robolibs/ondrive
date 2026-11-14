@@ -286,6 +286,23 @@ impl Reference {
         self.allow.get(i).copied().unwrap_or(0.0)
     }
 
+    /// Index of the first point at which `o`, at that point's time, comes
+    /// within the room `detour` keeps from it, if any.
+    pub fn first_met(&self, o: &Obstacle, reach: f64, dt: f64, swerve: Swerve) -> Option<usize> {
+        let (back, front, half, keep) = swerve.keep(reach);
+        (0..self.x.len()).find(|&i| {
+            let (s, c) = self.yaw[i].sin_cos();
+            modes_at(o, i as f64 * dt, dt).any(|m| {
+                let room = m.radius + half + keep + m.std_x.max(m.std_y);
+                let (dx, dy) = (m.x - self.x[i], m.y - self.y[i]);
+                let along = dx * c + dy * s;
+                let past = along - along.clamp(back, front);
+                let lateral = -dx * s + dy * c;
+                past * past + lateral * lateral < room * room
+            })
+        })
+    }
+
     /// This reference moved sideways round every obstacle mode it meets at
     /// its own time (passes within the mode's radius plus its spread, as the
     /// obstacle critics grow it, plus the room `swerve` keeps for `reach` of
@@ -1937,10 +1954,11 @@ pub(crate) fn plan_avoidance(
     for &pace in paces {
         let reference = along.reference((far as f64 / pace).ceil() as usize, step, speed * pace);
         let behinds = behind_sides(&ahead, &reference, step, reach);
+        let (first, room) = nearest_cluster(&reference, obstacles, reach + DETOUR_MARGIN, step, swerve, width);
         let mut options: Vec<(f64, f64, Option<Reference>)> = Vec::new();
         let mut met = false;
         for s in [1.0, -1.0] {
-            let Some(g) = reference.detour(obstacles, reach + DETOUR_MARGIN, step, s, DETOUR_RAMP, swerve) else {
+            let Some(g) = reference.detour(&first, reach + DETOUR_MARGIN, step, s, DETOUR_RAMP, swerve) else {
                 continue;
             };
             met = true;
@@ -1954,7 +1972,11 @@ pub(crate) fn plan_avoidance(
             if racing {
                 continue;
             }
-            let late = LATE_COST * (guide_gap(&reference, &points, robot) - SWERVE_SLACK).max(0.0);
+            // A detour the robot can still swerve onto before it meets the
+            // obstacles, or is already swerving onto, is not begun too late.
+            let gap = guide_gap(&reference, &points, robot);
+            let onto = s == last.0 || swerve.length(gap) < room;
+            let late = if onto { 0.0 } else { LATE_COST * (gap - SWERVE_SLACK).max(0.0) };
             let wide = widest + (widest - width).max(0.0).powi(2) / width;
             options.push((s, if in_front { AHEAD_COST } else { 1.0 } * wide + late, Some(g)));
         }
@@ -1980,6 +2002,23 @@ pub(crate) fn plan_avoidance(
             Avoidance { pace, reference: along.reference(far, step, speed), guide: None }
         }
     }
+}
+
+/// The obstacles of `obstacles` that `reference` meets first, and metres to
+/// where it meets them: the nearest,
+/// and those it meets before the length `swerve` takes to cross twice the
+/// body's `width` has run out past it. Each farther one is gone round on a
+/// side of its own once it is the nearest.
+fn nearest_cluster(reference: &Reference, obstacles: &[Obstacle], reach: f64, step: f64, swerve: Swerve, width: f64) -> (Vec<Obstacle>, f64) {
+    let met: Vec<(usize, &Obstacle)> = obstacles.iter().filter_map(|o| reference.first_met(o, reach, step, swerve).map(|i| (i, o))).collect();
+    let Some(first) = met.iter().map(|m| m.0).min() else {
+        return (Vec::new(), f64::INFINITY);
+    };
+    let n = reference.x.len();
+    let span: f64 = (1..n).map(|i| (reference.x[i] - reference.x[i - 1]).hypot(reference.y[i] - reference.y[i - 1])).sum();
+    let spacing = span / (n.max(2) - 1) as f64;
+    let gap = if spacing > 1e-6 { (swerve.length(2.0 * width) / spacing).ceil() as usize } else { n };
+    (met.into_iter().filter(|(i, _)| *i <= first + gap).map(|(_, o)| o.clone()).collect(), first as f64 * spacing)
 }
 
 /// Shares of the reference speed an avoidance plan weighs, fastest first.
@@ -2126,6 +2165,34 @@ mod tests {
     use datapod::{Euler, Point, Pose, Quaternion};
 
     #[test]
+    #[test]
+    fn takes_the_next_gate_on_its_own_side() {
+        let waypoints: Vec<Pose> = (0..=80)
+            .map(|i| Pose { point: Point::new(i as f64, 0.0, 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, 0.0)) })
+            .collect();
+        let cum = crate::core::path::cumulative_lengths(&waypoints);
+        let path = Path { waypoints, speeds: Vec::new(), is_closed: false };
+        let mut c = RobotConstraints::default();
+        c.steering_type = SteeringType::Ackermann;
+        c.max_linear_velocity = 1.0;
+        c.max_steering_angle = 0.5;
+        c.max_steering_rate = 0.7;
+        c.wheelbase = 1.5;
+        c.footprint = Footprint::Polygon { points: vec![(1.8, 0.6), (-0.4, 0.6), (-0.4, -0.6), (1.8, -0.6)] };
+        let (steps, dt) = (120, 0.2);
+        let gate = |id: u64, x: f64, y: f64| {
+            let mode = GaussianMode { weight: 1.0, mean_x: vec![x; steps + 1], mean_y: vec![y; steps + 1], std_x: vec![0.05; steps + 1], std_y: vec![0.05; steps + 1] };
+            Obstacle { id, radius: 0.6, modes: vec![mode], dt }
+        };
+        let gates = [gate(0, 12.0, 0.8), gate(1, 32.0, -0.8)];
+        let reach = crate::core::obstacles::robot_radius(&c);
+        let along = Along { path: &path, cum: &cum, trajectory: None, clock: 0.0, from: 19.0 };
+        let mut last = (-1.0, 1.0);
+        let plan = plan_avoidance(&along, &gates, reach, Swerve::of(&c, 1.0), 30, 0.2, 1.0, (19.0, -1.2), &mut last);
+        assert!(plan.guide.is_some(), "no detour round the next gate");
+        assert_eq!(last.0, 1.0, "the gate on the right is passed on the left, not round the far side");
+    }
+
     fn steers_past_traffic_crossing_into_its_way_rather_than_slowing() {
         let waypoints: Vec<Pose> = (0..=40)
             .map(|i| Pose { point: Point::new(i as f64, 0.0, 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, 0.0)) })
