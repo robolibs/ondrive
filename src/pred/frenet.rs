@@ -10,7 +10,9 @@
 //! one that meets the obstacles latest is taken.
 
 use crate::controller::{Controller, ControllerBase};
-use crate::core::kinematics::{actuation_delay, finalize, is_ackermann, max_curvature, path_speed};
+use crate::core::kinematics::{
+    actuation_delay, curvature_to_steering, finalize, is_ackermann, max_curvature, path_speed, steering_to_curvature,
+};
 use crate::core::math::normalize_angle;
 use crate::core::obstacles::{CollisionChecker, footprint_extent, robot_radius};
 use crate::core::path::{
@@ -131,6 +133,9 @@ pub struct FrenetFollower {
     /// tick, and how far the curvature falls short of the commands.
     last_command: Option<(bool, f64)>,
     bias: f64,
+    /// Curvature the steering has reached towards the commands, turning no
+    /// faster than `max_steering_rate`.
+    reached: f64,
     debug_level: DebugLevel,
 }
 
@@ -263,12 +268,25 @@ impl Controller for FrenetFollower {
         // over the leg: what a slope or slip takes off each command.
         match self.last_command {
             Some((was_back, commanded)) if was_back == back => {
-                if state.velocity_valid && v_now > SLIP_SPEED && commanded.abs() < SATURATED * k_lim {
+                // The shortfall against what the steering has reached, which
+                // is taken as measured once the leg is under way.
+                let moving = state.velocity_valid && v_now > SLIP_SPEED;
+                if moving && self.reached.is_nan() {
+                    self.reached = k_now;
+                }
+                // No further from the command than the curvature measured.
+                if moving && (k_now - self.reached) * (commanded - self.reached) > 0.0 {
+                    self.reached = if (k_now - self.reached).abs() < (commanded - self.reached).abs() { k_now } else { commanded };
+                }
+                if moving && !self.reached.is_nan() && commanded.abs() < SATURATED * k_lim {
                     let gain = (dt / BIAS_TIME).min(1.0);
-                    self.bias = (self.bias + gain * (commanded - k_now - self.bias)).clamp(-MAX_BIAS * k_lim, MAX_BIAS * k_lim);
+                    self.bias = (self.bias + gain * (self.reached - k_now - self.bias)).clamp(-MAX_BIAS * k_lim, MAX_BIAS * k_lim);
                 }
             }
-            _ => self.bias = 0.0,
+            _ => {
+                self.bias = 0.0;
+                self.reached = f64::NAN;
+            }
         }
         let d0pp = (squeeze / err.cos().powi(2) * (k_now * squeeze / err.cos() - kappa0)).clamp(-2.0 * k_lim, 2.0 * k_lim);
 
@@ -434,6 +452,15 @@ impl Controller for FrenetFollower {
             },
         );
         self.last_speed = speed;
+        self.reached = if !(is_ackermann(constraints.steering_type) && constraints.max_steering_rate > 0.0) {
+            curvature
+        } else if self.reached.is_nan() {
+            f64::NAN
+        } else {
+            let from = curvature_to_steering(self.reached, constraints);
+            let step = constraints.max_steering_rate * dt;
+            steering_to_curvature(from + (curvature_to_steering(curvature, constraints) - from).clamp(-step, step), constraints)
+        };
         self.last_command = Some((back, curvature));
         self.base.status.mode = mode.into();
         let direction = if back { -1.0 } else { 1.0 };
