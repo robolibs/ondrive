@@ -15,6 +15,7 @@
 //! Without obstacles this is exactly MPPI.
 
 use crate::controller::{Controller, ControllerBase};
+use crate::core::buckets::Buckets;
 use crate::core::obstacles::{CollisionChecker, ModeAt, footprint_discs, modes_at};
 
 use crate::pred::mppi::{MppiConfig, MppiFollower, detour_relax};
@@ -186,6 +187,30 @@ impl McaFollower {
     }
 }
 
+/// The obstacle modes of one step sorted into cells, with the obstacle each
+/// belongs to and the distance from the pose past which none can be hit.
+struct Near {
+    cells: Buckets,
+    owner: Vec<u32>,
+    reach: f64,
+}
+
+impl Near {
+    fn new(obstacles: &[Vec<ModeAt>], discs: &[(f64, f64)]) -> Self {
+        let body = discs.iter().map(|&(dx, r)| dx.abs() + r).fold(0.0_f64, f64::max);
+        let (mut points, mut owner, mut widest) = (Vec::new(), Vec::new(), 0.0_f64);
+        for (k, modes) in obstacles.iter().enumerate() {
+            for m in modes {
+                points.push((m.x, m.y));
+                owner.push(k as u32);
+                widest = widest.max(m.radius + 4.0 * m.std_x.max(m.std_y));
+            }
+        }
+        let reach = body + widest + 1e-6;
+        Self { cells: Buckets::new(&points, (0.5 * reach).max(0.5)), owner, reach }
+    }
+}
+
 /// Probability that a disc of `radius` at `(x, y)` meets an obstacle mode:
 /// the share of `normals`, scaled by the mode's spread, inside the combined
 /// radius.
@@ -269,27 +294,33 @@ impl Controller for McaFollower {
                 _ => false,
             })
             .collect();
+        let near: Vec<Near> = modes.iter().map(|at| Near::new(at, &discs)).collect();
         let probability_of = |i: usize, x: f64, y: f64, yaw: f64, only_moving: bool, footprint: &[(f64, f64)]| -> f64 {
+            let i = i.min(n - 1);
             let (s, c) = yaw.sin_cos();
-            let mut survive = 1.0;
-            for (k, obstacle) in modes[i.min(n - 1)].iter().enumerate() {
-                if only_moving && !moving[k] {
-                    continue;
+            let near = &near[i];
+            near.cells.within_sorted(x, y, near.reach, |j| near.owner[j], |found| {
+                let mut survive = 1.0;
+                for &k in found {
+                    let k = k as usize;
+                    if only_moving && !moving[k] {
+                        continue;
+                    }
+                    let (mut p, mut total) = (0.0, 0.0);
+                    for m in &modes[i][k] {
+                        let hit = footprint
+                            .iter()
+                            .map(|(dx, r)| hit_probability(m, x + c * dx, y + s * dx, *r, normals))
+                            .fold(0.0_f64, f64::max);
+                        p += m.weight * hit;
+                        total += m.weight;
+                    }
+                    if total > 0.0 {
+                        survive *= 1.0 - p / total;
+                    }
                 }
-                let (mut p, mut total) = (0.0, 0.0);
-                for m in obstacle {
-                    let hit = footprint
-                        .iter()
-                        .map(|(dx, r)| hit_probability(m, x + c * dx, y + s * dx, *r, normals))
-                        .fold(0.0_f64, f64::max);
-                    p += m.weight * hit;
-                    total += m.weight;
-                }
-                if total > 0.0 {
-                    survive *= 1.0 - p / total;
-                }
-            }
-            1.0 - survive
+                1.0 - survive
+            })
         };
         let checker = CollisionChecker::new(world, constraints, margin).with_step(step);
         let (soft, hard, threshold) = (cfg.weight_soft_risk, cfg.weight_hard_risk, cfg.risk_threshold);

@@ -1,3 +1,4 @@
+pub mod buckets;
 pub mod curves;
 pub mod dubins;
 pub mod error;

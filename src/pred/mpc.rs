@@ -7,7 +7,7 @@
 
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::planning;
-use crate::core::obstacles::{CollisionChecker, footprint_discs, obstacle_barrier};
+use crate::core::obstacles::{BarrierField, CollisionChecker, footprint_discs};
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
     CostWeights, Model, Reference, Resume, build_reference, build_timed_reference, command_from_controls,
@@ -493,10 +493,10 @@ impl Controller for MpcFollower {
         let kept = crate::pred::mppi::with_body_room(obstacles, constraints);
         let checker = CollisionChecker::new(world, constraints, 0.0);
         let grid = world.is_some_and(|w| w.grid.is_some());
-        let (step_dt, weight, scale) = (cfg.dt, cfg.weight_obstacle, cfg.obstacle_scale);
+        let (weight, scale) = (cfg.weight_obstacle, cfg.obstacle_scale);
+        let field = BarrierField::new(&kept, &discs, cfg.dt, 1.0, weight, scale);
         let barrier = |i: usize, x: f64, y: f64, yaw: f64| -> f64 {
-            let t = (i + 1) as f64 * step_dt;
-            let mut c = obstacle_barrier(&kept, &discs, t, step_dt, 1.0, (x, y, yaw), weight, scale).cost;
+            let mut c = field.at(i + 1, (x, y, yaw)).cost;
             if grid && weight > 0.0 && scale > 0.0 {
                 c += weight * (-checker.grid_clearance(x, y, yaw) / scale).min(30.0).exp();
             }

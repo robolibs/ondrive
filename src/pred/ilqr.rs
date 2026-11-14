@@ -13,7 +13,7 @@
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::{planning, wheelbase};
 use crate::core::math::normalize_angle;
-use crate::core::obstacles::{footprint_discs, obstacle_barrier};
+use crate::core::obstacles::{BarrierField, footprint_discs};
 use crate::core::path::PathCursor;
 use crate::pred::mpc::{SIDE_SWITCH_COST, guided};
 use crate::pred::mppi::{
@@ -126,9 +126,8 @@ struct Problem<'a> {
     model: &'a Model<'a>,
     reference: &'a Reference,
     cfg: &'a IlqrConfig,
-    obstacles: &'a [Obstacle],
-    /// Footprint discs as `(offset ahead of the state point, radius)`.
-    discs: Vec<(f64, f64)>,
+    /// Obstacle barrier for footprint discs offset ahead of the state point.
+    field: &'a BarrierField<'a>,
 }
 
 impl Problem<'_> {
@@ -258,18 +257,8 @@ impl Problem<'_> {
         lxx[(5, 3)] += 2.0 * w_w * d_v * d_s;
         lxx[(5, 5)] += 2.0 * w_w * d_s * d_s;
 
-        if !self.obstacles.is_empty() {
-            let t = (i + 1) as f64 * self.model.dt;
-            let b = obstacle_barrier(
-                self.obstacles,
-                &self.discs,
-                t,
-                self.model.dt,
-                1.0,
-                (x[0], x[1], x[2]),
-                cfg.weight_obstacle,
-                cfg.obstacle_scale,
-            );
+        if !self.field.is_empty() {
+            let b = self.field.at(i + 1, (x[0], x[1], x[2]));
             cost += b.cost;
             for k in 0..3 {
                 lx[k] += b.grad[k];
@@ -533,7 +522,8 @@ impl Controller for IlqrFollower {
         let guides = guided(&mut reference, obstacles, reach, cfg.dt, constraints);
         let kept = crate::pred::mppi::with_body_room(obstacles, constraints);
         let obstacles: &[Obstacle] = &kept;
-        let problem = Problem { model: &model, reference: &reference, cfg: &cfg, obstacles, discs: discs.clone() };
+        let field = BarrierField::new(obstacles, &discs, model.dt, 1.0, cfg.weight_obstacle, cfg.obstacle_scale);
+        let problem = Problem { model: &model, reference: &reference, cfg: &cfg, field: &field };
         let x0 = State::new(model.x0, model.y0, model.yaw0, model.v0, model.vy0, model.steer0.clamp(-model.steer_bound(), model.steer_bound()));
         let warm: Vec<Control> = (0..n).map(|i| Control::new(self.steer[i], self.accel[i], self.accel_lat[i])).collect();
         let mut best: Option<(f64, f64, Vec<Control>, usize)> = None;
@@ -543,7 +533,7 @@ impl Controller for IlqrFollower {
         }
         for guide in &guides {
             let side = &guide.side;
-            let guided = Problem { model: &model, reference: &guide.reference, cfg: &cfg, obstacles, discs: discs.clone() };
+            let guided = Problem { model: &model, reference: &guide.reference, cfg: &cfg, field: &field };
             let (us, _, iterations) = guided.solve(&x0, warm.clone());
             let switch = *side != 0.0 && self.side != 0.0 && *side != self.side;
             let scored = if guide.pace < 1.0 { &guided } else { &problem };
@@ -750,7 +740,7 @@ mod tests {
             lateral: Vec::new(),
             allow: Vec::new(),
         };
-        let problem = Problem { model: &model, reference: &reference, cfg: &cfg, obstacles: &[], discs: Vec::new() };
+        let problem = Problem { model: &model, reference: &reference, cfg: &cfg, field: &BarrierField::new(&[], &[], model.dt, 1.0, 0.0, 1.0) };
         let (us, cost, _) = problem.solve(&x0, vec![Control::zeros(); n]);
         let h = 1e-6;
         let mut worst: f64 = 0.0;
@@ -787,7 +777,7 @@ mod tests {
             lateral: Vec::new(),
             allow: Vec::new(),
         };
-        let problem = Problem { model: &model, reference: &reference, cfg: &cfg, obstacles: &[], discs: Vec::new() };
+        let problem = Problem { model: &model, reference: &reference, cfg: &cfg, field: &BarrierField::new(&[], &[], model.dt, 1.0, 0.0, 1.0) };
         let (us, cost, _) = problem.solve(&x0, vec![Control::zeros(); n]);
         let bound = model.steer_bound();
         assert!(us.iter().any(|u| (u[0].abs() - bound).abs() < 1e-9), "steering never saturated");

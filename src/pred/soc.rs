@@ -386,7 +386,7 @@ fn obstacle_penalty<'a>(
         if !checker.has_obstacles() {
             return 0.0;
         }
-        let clearance = checker.clearance(step + 1, x, y, yaw);
+        let clearance = checker.clearance_within(step + 1, x, y, yaw, OBSTACLE_INFLUENCE);
         if clearance < 0.0 {
             weight * (100.0 + 10.0 * clearance.abs())
         } else if clearance < OBSTACLE_INFLUENCE {

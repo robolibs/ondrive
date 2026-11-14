@@ -158,7 +158,8 @@ impl Problem<'_> {
         if !self.checker.has_obstacles() {
             return 0.0;
         }
-        let (d, margin) = (self.checker.clearance_at(t, x, y, yaw), self.margin());
+        let margin = self.margin();
+        let d = self.checker.clearance_at_within(t, x, y, yaw, margin);
         if d < margin {
             let s = margin - d;
             c.weight_obstacle * s * s

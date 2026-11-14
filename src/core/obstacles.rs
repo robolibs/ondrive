@@ -2,6 +2,7 @@
 //! predicted obstacle is at a given time, and the clearance of the robot
 //! footprint against those obstacles and the occupancy grid.
 
+use crate::core::buckets::Buckets;
 use crate::types::{Obstacle, RobotConstraints, WorldConstraints};
 
 /// Disc radius covering the robot footprint (0.3 m when unset).
@@ -36,7 +37,7 @@ fn series_at(v: &[f64], u: f64) -> f64 {
         0 => 0.0,
         1 => v[0],
         n => {
-            let i = (u.max(0.0).floor() as usize).min(n - 2);
+            let i = (u.max(0.0) as usize).min(n - 2);
             v[i] + (u - i as f64) * (v[i + 1] - v[i])
         }
     }
@@ -125,14 +126,43 @@ pub struct CollisionChecker<'a> {
     pub margin: f64,
     /// Centre and grown radius of every obstacle mode at each controller
     /// step, filled in as the steps are first asked for.
-    table: Vec<std::sync::OnceLock<Vec<(f64, f64, f64)>>>,
+    table: Vec<std::sync::OnceLock<StepModes>>,
+    times: TimeCache,
+}
+
+/// The obstacle modes at one controller step: centre and grown radius,
+/// sorted into cells, and the widest grown radius.
+#[derive(Clone, Debug)]
+struct StepModes {
+    modes: Vec<(f64, f64, f64)>,
+    cells: Buckets,
+    widest: f64,
 }
 
 /// Controller steps a checker keeps the obstacles' places for.
 const TABLE_STEPS: usize = 256;
 
-fn fresh_table() -> Vec<std::sync::OnceLock<Vec<(f64, f64, f64)>>> {
+fn fresh_table() -> Vec<std::sync::OnceLock<StepModes>> {
     (0..TABLE_STEPS).map(|_| std::sync::OnceLock::new()).collect()
+}
+
+/// Slots `clearance_at_within` keeps the obstacle modes of recent times in.
+const TIME_SLOTS: usize = 512;
+
+/// Modes few enough to look at every one rather than through their cells.
+const FEW_MODES: usize = 8;
+
+/// The obstacle modes at times asked for by `clearance_at_within`, each in
+/// a slot picked by its time; a clone starts empty.
+#[derive(Default)]
+struct TimeCache {
+    slots: std::sync::Mutex<Vec<Option<(u64, std::sync::Arc<StepModes>)>>>,
+}
+
+impl Clone for TimeCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
 }
 
 impl<'a> CollisionChecker<'a> {
@@ -154,7 +184,7 @@ impl<'a> CollisionChecker<'a> {
             }
             _ => (Vec::new(), Vec::new()),
         };
-        Self { world, polygon, samples, disc_radius: robot_radius(constraints), step: 0.1, spread: 0.0, margin: margin.max(0.0), table: fresh_table() }
+        Self { world, polygon, samples, disc_radius: robot_radius(constraints), step: 0.1, spread: 0.0, margin: margin.max(0.0), table: fresh_table(), times: TimeCache::default() }
     }
 
     /// Seconds per controller step, so `clearance(step, ..)` can read
@@ -163,6 +193,7 @@ impl<'a> CollisionChecker<'a> {
         if seconds > 0.0 {
             self.step = seconds;
             self.table = fresh_table();
+            self.times = TimeCache::default();
         }
         self
     }
@@ -172,6 +203,7 @@ impl<'a> CollisionChecker<'a> {
     pub fn with_spread(mut self, k: f64) -> Self {
         self.spread = k.max(0.0);
         self.table = fresh_table();
+        self.times = TimeCache::default();
         self
     }
 
@@ -185,10 +217,18 @@ impl<'a> CollisionChecker<'a> {
     pub fn clearance(&self, step: usize, x: f64, y: f64, yaw: f64) -> f64 {
         match self.table.get(step) {
             Some(cell) => {
-                let modes = cell.get_or_init(|| self.grown_modes(step as f64 * self.step).collect());
-                self.clearance_among(modes.iter().copied(), x, y, yaw)
+                let at = cell.get_or_init(|| self.step_modes(step as f64 * self.step));
+                self.clearance_among(at.modes.iter().copied(), x, y, yaw)
             }
             None => self.clearance_at(step as f64 * self.step, x, y, yaw),
+        }
+    }
+
+    /// `clearance` where it is below `cap`, infinite where it is not.
+    pub fn clearance_within(&self, step: usize, x: f64, y: f64, yaw: f64, cap: f64) -> f64 {
+        match self.table.get(step) {
+            Some(cell) => self.capped(cell.get_or_init(|| self.step_modes(step as f64 * self.step)), x, y, yaw, cap),
+            None => self.clearance_at_within(step as f64 * self.step, x, y, yaw, cap),
         }
     }
 
@@ -196,6 +236,45 @@ impl<'a> CollisionChecker<'a> {
     /// predicted `t` seconds from now, with `margin` already subtracted.
     pub fn clearance_at(&self, t: f64, x: f64, y: f64, yaw: f64) -> f64 {
         self.clearance_among(self.grown_modes(t), x, y, yaw)
+    }
+
+    /// `clearance_at` where it is below `cap`, infinite where it is not.
+    /// The obstacle modes at the last `TIME_SLOTS` or so times asked for are
+    /// kept.
+    pub fn clearance_at_within(&self, t: f64, x: f64, y: f64, yaw: f64, cap: f64) -> f64 {
+        let slot = (t.to_bits().wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 55) as usize % TIME_SLOTS;
+        let kept = self.times.slots.lock().ok().and_then(|s| s.get(slot).and_then(|k| k.clone()).filter(|k| k.0 == t.to_bits()));
+        let at = match kept {
+            Some((_, at)) => at,
+            None => {
+                let at = std::sync::Arc::new(self.step_modes(t));
+                if let Ok(mut slots) = self.times.slots.lock() {
+                    slots.resize(TIME_SLOTS, None);
+                    slots[slot] = Some((t.to_bits(), at.clone()));
+                }
+                at
+            }
+        };
+        self.capped(&at, x, y, yaw, cap)
+    }
+
+    /// `clearance_among` the modes `at`, where below `cap`, looking only at
+    /// the modes that can come that near; infinite where it is not below.
+    fn capped(&self, at: &StepModes, x: f64, y: f64, yaw: f64, cap: f64) -> f64 {
+        let Some(world) = self.world else {
+            return f64::INFINITY;
+        };
+        let (s, c) = yaw.sin_cos();
+        let room = cap + self.margin;
+        let seed = room + 1e-9 * (1.0 + room.abs());
+        let mut best = seed;
+        if at.modes.len() <= FEW_MODES {
+            best = at.modes.iter().fold(best, |best, &m| self.nearer(m, x, y, s, c, best));
+        } else {
+            at.cells.within(x, y, seed + self.disc_radius + at.widest, |k| best = self.nearer(at.modes[k], x, y, s, c, best));
+        }
+        let best = self.grid_nearest(world, best, x, y, s, c);
+        if best < seed { best - self.margin } else { f64::INFINITY }
     }
 
     /// Centre and grown radius of every obstacle mode `t` seconds from now.
@@ -211,23 +290,31 @@ impl<'a> CollisionChecker<'a> {
         let Some(world) = self.world else {
             return f64::INFINITY;
         };
-        let mut best = f64::INFINITY;
         let (s, c) = yaw.sin_cos();
-        for (mx, my, grow) in modes {
-            let (dx, dy) = (mx - x, my - y);
-            let centre = (dx * dx + dy * dy).sqrt();
-            // The footprint lies within the bounding disc, so a mode past it
-            // by more than the nearest so far cannot be nearer.
-            if centre - self.disc_radius - grow >= best {
-                continue;
-            }
-            let d = if self.polygon.is_empty() {
-                centre - self.disc_radius
-            } else {
-                polygon_distance(&self.polygon, c * dx + s * dy, -s * dx + c * dy)
-            };
-            best = best.min(d - grow);
+        let best = modes.fold(f64::INFINITY, |best, m| self.nearer(m, x, y, s, c, best));
+        self.grid_nearest(world, best, x, y, s, c) - self.margin
+    }
+
+    /// The smaller of `best` and the clearance of the footprint at `(x, y)`
+    /// (heading sine `s`, cosine `c`) to the mode `(mx, my, grow)`.
+    fn nearer(&self, (mx, my, grow): (f64, f64, f64), x: f64, y: f64, s: f64, c: f64, best: f64) -> f64 {
+        let (dx, dy) = (mx - x, my - y);
+        let centre = (dx * dx + dy * dy).sqrt();
+        // The footprint lies within the bounding disc, so a mode past it by
+        // more than the nearest so far cannot be nearer.
+        if centre - self.disc_radius - grow >= best {
+            return best;
         }
+        let d = if self.polygon.is_empty() {
+            centre - self.disc_radius
+        } else {
+            polygon_distance(&self.polygon, c * dx + s * dy, -s * dx + c * dy)
+        };
+        best.min(d - grow)
+    }
+
+    /// `best` against the occupancy grid as well.
+    fn grid_nearest(&self, world: &WorldConstraints, mut best: f64, x: f64, y: f64, s: f64, c: f64) -> f64 {
         if let Some(grid) = &world.grid {
             if self.samples.is_empty() {
                 best = best.min(grid.distance_to_occupied(x, y) - self.disc_radius);
@@ -240,7 +327,16 @@ impl<'a> CollisionChecker<'a> {
                 }
             }
         }
-        best - self.margin
+        best
+    }
+
+    /// The obstacle modes `t` seconds from now, sorted into cells.
+    fn step_modes(&self, t: f64) -> StepModes {
+        let modes: Vec<(f64, f64, f64)> = self.grown_modes(t).collect();
+        let widest = modes.iter().map(|m| m.2).fold(0.0_f64, f64::max);
+        let points: Vec<(f64, f64)> = modes.iter().map(|m| (m.0, m.1)).collect();
+        let cells = Buckets::new(&points, (self.disc_radius + widest).max(1.0));
+        StepModes { modes, cells, widest }
     }
 
     /// Distance from the footprint at `(x, y, yaw)` to the point `(px, py)`,
@@ -342,6 +438,89 @@ pub fn obstacle_barrier(
         }
     }
     b
+}
+
+/// `obstacle_barrier` against fixed obstacles, discs, spread, weight and
+/// scale at `t = j · step` for step `j`, each step's obstacle modes worked
+/// out once and sorted into cells so a pose looks only at those in reach.
+pub struct BarrierField<'a> {
+    obstacles: &'a [Obstacle],
+    discs: Vec<(f64, f64)>,
+    step: f64,
+    spread: f64,
+    weight: f64,
+    scale: f64,
+    table: Vec<std::sync::OnceLock<BarrierStep>>,
+}
+
+/// The obstacle modes of one step: centre, radius and spread, sorted into
+/// cells, and the distance from the pose past which none adds cost.
+struct BarrierStep {
+    modes: Vec<(f64, f64, f64, f64)>,
+    cells: Buckets,
+    reach: f64,
+}
+
+impl<'a> BarrierField<'a> {
+    pub fn new(obstacles: &'a [Obstacle], discs: &[(f64, f64)], step: f64, spread: f64, weight: f64, scale: f64) -> Self {
+        let steps = if obstacles.is_empty() { 0 } else { TABLE_STEPS };
+        let table = (0..steps).map(|_| std::sync::OnceLock::new()).collect();
+        Self { obstacles, discs: discs.to_vec(), step, spread, weight, scale, table }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.obstacles.is_empty()
+    }
+
+    fn step_at(&self, t: f64) -> BarrierStep {
+        let modes: Vec<(f64, f64, f64, f64)> =
+            self.obstacles.iter().flat_map(|o| modes_at(o, t, self.step)).map(|m| (m.x, m.y, m.radius, m.std_x.max(m.std_y))).collect();
+        let body = self.discs.iter().map(|&(off, r)| off.abs() + r).fold(0.0_f64, f64::max);
+        let widest = modes.iter().map(|m| m.2 + self.spread * m.3).fold(0.0_f64, f64::max);
+        let reach = body + widest + 8.0 * self.scale + 1e-6;
+        let points: Vec<(f64, f64)> = modes.iter().map(|m| (m.0, m.1)).collect();
+        BarrierStep { cells: Buckets::new(&points, (0.5 * reach).max(0.5)), modes, reach }
+    }
+
+    /// The barrier at the pose `(x, y, yaw)` at step `j`.
+    pub fn at(&self, j: usize, (x, y, yaw): (f64, f64, f64)) -> Barrier {
+        let t = j as f64 * self.step;
+        let Some(cell) = self.table.get(j) else {
+            return obstacle_barrier(self.obstacles, &self.discs, t, self.step, self.spread, (x, y, yaw), self.weight, self.scale);
+        };
+        let mut b = Barrier::default();
+        if self.weight <= 0.0 || self.scale <= 0.0 {
+            return b;
+        }
+        let at = cell.get_or_init(|| self.step_at(t));
+        let (s, c) = yaw.sin_cos();
+        let (weight, scale) = (self.weight, self.scale);
+        at.cells.within_sorted(x, y, at.reach, |k| k as u32, |found| {
+            for &k in found {
+                let (mx, my, radius, std) = at.modes[k as usize];
+                for &(off, r) in &self.discs {
+                    let (px, py) = (x + off * c, y + off * s);
+                    let (dx, dy) = (px - mx, py - my);
+                    let dist = (dx * dx + dy * dy).sqrt().max(1e-6);
+                    let d = dist - radius - r - self.spread * std;
+                    if d > 8.0 * scale {
+                        continue;
+                    }
+                    let q = weight * (-d / scale).min(30.0).exp();
+                    let (nx, ny) = (dx / dist, dy / dist);
+                    let g = [nx, ny, off * (ny * c - nx * s)];
+                    b.cost += q;
+                    for k in 0..3 {
+                        b.grad[k] -= q / scale * g[k];
+                        for l in 0..3 {
+                            b.hess[k][l] += q / (scale * scale) * g[k] * g[l];
+                        }
+                    }
+                }
+            }
+        });
+        b
+    }
 }
 
 pub fn footprint_discs(constraints: &RobotConstraints) -> Vec<(f64, f64)> {
@@ -472,6 +651,66 @@ mod tests {
         let c = constraints();
         let checker = CollisionChecker::new(Some(world), &c, 0.1).with_spread(1.0);
         yield_share(&checker, &arc_course((0.0, 0.0, 0.0), 0.0), 1.2, v_now, 1.5, 0.5, &[1.0, 0.6, 0.3])
+    }
+
+    /// Many walkers with two modes each, spread over 40 × 30 m.
+    fn crowd() -> Vec<Obstacle> {
+        let mut s = 0x2545_f491_4f6c_dd1d_u64;
+        let mut draw = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 11) as f64 / (1u64 << 53) as f64
+        };
+        (0..120)
+            .map(|id| {
+                let (x, y, vx, vy) = (40.0 * draw(), 30.0 * draw() - 15.0, draw() - 0.5, draw() - 0.5);
+                let mode = |w: f64, turn: f64| GaussianMode {
+                    weight: w,
+                    mean_x: (0..=30).map(|k| x + vx * k as f64 * 0.2).collect(),
+                    mean_y: (0..=30).map(|k| y + (vy + turn) * k as f64 * 0.2).collect(),
+                    std_x: (0..=30).map(|k| 0.05 + 0.02 * k as f64).collect(),
+                    std_y: (0..=30).map(|k| 0.05 + 0.03 * k as f64).collect(),
+                };
+                Obstacle { id, radius: 0.3 + 0.4 * draw(), modes: vec![mode(0.7, 0.0), mode(0.3, 0.4)], dt: 0.2 }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn capped_clearance_matches_every_obstacle_looked_at() {
+        let world = WorldConstraints { obstacles: crowd(), ..Default::default() };
+        let mut c = constraints();
+        c.footprint = Footprint::Polygon { points: vec![(2.5, 1.1), (-2.5, 1.1), (-2.5, -1.1), (2.5, -1.1)] };
+        let checker = CollisionChecker::new(Some(&world), &c, 0.2).with_step(0.15).with_spread(1.0);
+        for cap in [0.0, 0.8, 3.0] {
+            for step in [0, 3, 17, 40, 300] {
+                for k in 0..200 {
+                    let (x, y, yaw) = (-5.0 + 0.27 * k as f64, 8.0 * (0.1 * k as f64).sin(), 0.05 * k as f64);
+                    let t = step as f64 * 0.15;
+                    let all = checker.clearance_at(t, x, y, yaw);
+                    let want = if all < cap { all } else { f64::INFINITY };
+                    assert_eq!(checker.clearance(step, x, y, yaw), all, "step {step} pose {k}");
+                    assert_eq!(checker.clearance_within(step, x, y, yaw, cap), want, "step {step} pose {k} cap {cap}");
+                    assert_eq!(checker.clearance_at_within(t, x, y, yaw, cap), want, "t {t} pose {k} cap {cap}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bucketed_barrier_matches_every_obstacle_looked_at() {
+        let obstacles = crowd();
+        let discs = [(-1.7, 1.43), (0.0, 1.43), (1.7, 1.43)];
+        let field = BarrierField::new(&obstacles, &discs, 0.2, 1.0, 50.0, 0.2);
+        for j in [1, 5, 22, 29] {
+            for k in 0..200 {
+                let pose = (-5.0 + 0.27 * k as f64, 8.0 * (0.1 * k as f64).sin(), 0.05 * k as f64);
+                let a = field.at(j, pose);
+                let b = obstacle_barrier(&obstacles, &discs, j as f64 * 0.2, 0.2, 1.0, pose, 50.0, 0.2);
+                assert_eq!((a.cost, a.grad, a.hess), (b.cost, b.grad, b.hess), "step {j} pose {k}");
+            }
+        }
     }
 
     #[test]
