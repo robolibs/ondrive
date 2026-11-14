@@ -468,7 +468,7 @@ impl Controller for SocFollower {
             from: prep.proj.arc_length,
         };
         let swerve = Swerve::of(constraints, speed.max(v_now.abs()));
-        let robot = (state.pose.point.x, state.pose.point.y);
+        let robot = (state.pose.point.x, state.pose.point.y, crate::core::math::yaw_of(&state.pose));
         let plan = if obstacles.is_empty() {
             self.avoid = (0.0, 1.0);
             None
@@ -504,7 +504,10 @@ impl Controller for SocFollower {
         if let Some(plan) = &plan {
             let points = plan.guide.as_ref().map_or(Vec::new(), |g| left_by(&plan.reference, g));
             if self.debug_level >= DebugLevel::Basic {
-                self.debug.guides = guide_paths(&plan.reference, obstacles, robot_radius(constraints), cfg.dt, swerve);
+                self.debug.guides = match &plan.guide {
+                    Some(g) => vec![(0..g.x.len()).map(|i| Point::new(g.x[i], g.y[i], 0.0)).collect()],
+                    None => guide_paths(&plan.reference, obstacles, robot_radius(constraints), cfg.dt, swerve),
+                };
             }
             reference.relax_with(&detour_relax(&points, (speed * cfg.dt).max(0.3)));
         }

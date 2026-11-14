@@ -16,7 +16,7 @@ use crate::core::kinematics::{
     max_curvature, planning, steering_limit, wheelbase,
 };
 use crate::core::math::normalize_angle;
-use crate::core::obstacles::{CollisionChecker, footprint_extent, mode_rates, modes_at, robot_radius, yield_share};
+use crate::core::obstacles::{CollisionChecker, ModeAt, footprint_extent, mode_rates, modes_at, robot_radius, yield_share};
 use crate::core::path::{PathCursor, PathProjection, sample};
 use crate::pred::mpc::{DETOUR_MARGIN, DETOUR_RAMP, DETOURED_WEIGHT};
 use crate::types::{
@@ -220,6 +220,25 @@ const SWERVE_ROOM: f64 = 1.5;
 /// Least room, metres, a detour keeps beside the body: past the margin the
 /// obstacle critics count as contact.
 const DETOUR_BODY_MARGIN: f64 = 0.45;
+/// Least room, metres, a threaded guide keeps beside the body past a mode's
+/// radius and spread, tried in turn: past the MPPI safety margin, then down
+/// to less where no way keeps more.
+const GUIDE_ROOMS: [f64; 3] = [0.8, 0.65, 0.5];
+/// Sideways reach, metres, a threaded guide has past four body widths.
+const GUIDE_SPARE_M: f64 = 1.0;
+/// Steepest a threaded guide leaves or rejoins the reference, radians.
+const GUIDE_SLOPE: f64 = 0.8;
+/// Cost per station of a threaded guide's shift, per body width squared.
+const GUIDE_SHIFT_COST: f64 = 1.0;
+/// Cost per station of a threaded guide coming nearer a mode than the room
+/// a detour keeps, per that room squared.
+const GUIDE_ROOM_COST: f64 = 4.0;
+/// Cost per station of a threaded guide's slope, squared.
+const GUIDE_TURN_COST: f64 = 2.0;
+/// Least distance, metres, a threaded guide looks ahead.
+const GUIDE_LOOKOUT_M: f64 = 20.0;
+/// Least distance a threaded guide looks ahead, in body lengths.
+const GUIDE_LOOKOUT_BODIES: f64 = 8.0;
 /// Share of the body's width a detour keeps beside it at least: a wide,
 /// long machine tracks its detour less closely than a small one.
 const BODY_ROOM_SHARE: f64 = 0.4;
@@ -324,20 +343,32 @@ impl Reference {
         })
     }
 
-    /// This reference moved sideways round every obstacle mode it meets at
-    /// its own time (passes within the mode's radius plus its spread, as the
-    /// obstacle critics grow it, plus the room `swerve` keeps for `reach` of
-    /// its body), passing them on
-    /// `side` (+1 left, −1 right), ramped in and out over `ramp` points or
-    /// the length `swerve` needs for the largest shift, if longer: the
-    /// guidance that keeps a solve in one homotopy class. `None` when it
-    /// meets no obstacle.
-    pub fn detour(&self, obstacles: &[Obstacle], reach: f64, dt: f64, side: f64, ramp: usize, swerve: Swerve) -> Option<Reference> {
+    /// This reference moved sideways at each point by as much as `guide`
+    /// leaves `base` there, `base` starting as this one does and at least as
+    /// long.
+    fn shifted_like(&self, base: &Reference, guide: &Reference) -> Reference {
+        let mut out = self.clone();
+        for i in 0..self.x.len().min(base.x.len()).min(guide.x.len()) {
+            let (bs, bc) = base.yaw[i].sin_cos();
+            let d = -(guide.x[i] - base.x[i]) * bs + (guide.y[i] - base.y[i]) * bc;
+            let (s, c) = self.yaw[i].sin_cos();
+            out.x[i] = self.x[i] - s * d;
+            out.y[i] = self.y[i] + c * d;
+        }
+        out.lateral.clear();
+        out
+    }
+
+    /// For each point, the sideways shift to `side` (+1 left, −1 right) that
+    /// `detour` needs there to clear the obstacle modes it meets, 0 where it
+    /// meets none, and the furthest to `side` any of their centres lies,
+    /// −∞ where it meets none.
+    fn needs(&self, obstacles: &[Obstacle], reach: f64, dt: f64, side: f64, swerve: Swerve) -> (Vec<f64>, Vec<f64>) {
         let n = self.x.len();
         let (back, front, half, keep) = swerve.keep(reach);
         let pad = half + keep + back.abs().max(front.abs());
         let trig: Vec<(f64, f64)> = self.yaw.iter().take(n).map(|y| y.sin_cos()).collect();
-        let mut need = vec![0.0_f64; n];
+        let (mut need, mut centre) = (vec![0.0_f64; n], vec![f64::NEG_INFINITY; n]);
         for o in obstacles {
             let rates = mode_rates(o, dt);
             for b in (0..n).step_by(BLOCK).filter(|&b| self.may_meet(o, &rates, b, dt, pad)) {
@@ -352,11 +383,192 @@ impl Reference {
                         if past * past + lateral * lateral < room * room {
                             let edge = lateral + side * (room * room - past * past).sqrt();
                             need[i] = need[i].max(side * edge);
+                            centre[i] = centre[i].max(side * lateral);
                         }
                     }
                 }
             }
         }
+        (need, centre)
+    }
+
+    /// The cheapest way along this reference past every mode of `obstacles`
+    /// met at the reference's own time, for each side (+1 left, −1 right):
+    /// shifted sideways at stations along it, setting off from the robot at
+    /// `from` (sideways offset, heading off the reference), and turning no
+    /// tighter than `swerve` can. It keeps the body the room `swerve` keeps
+    /// for `reach` past every mode's radius and spread, else the first of
+    /// `rooms` below that which leaves a way, and is charged for coming
+    /// nearer than that room, for its shift and for how fast it changes. On
+    /// side `s` it passes the modes whose `centres[s]` (from `needs`) it
+    /// meets on that side.
+    #[allow(clippy::too_many_arguments)]
+    pub fn threaded(&self, obstacles: &[Obstacle], centres: [&[f64]; 2], from: (f64, f64), rooms: &[f64], reach: f64, dt: f64, swerve: Swerve) -> [Option<Reference>; 2] {
+        let n = self.x.len();
+        if n < 2 || obstacles.is_empty() {
+            return [None, None];
+        }
+        let (back, front, half, keep) = swerve.keep(reach);
+        let side_room = if swerve.body.is_some() { half } else { swerve.disc };
+        let width = (2.0 * side_room).max(0.2);
+        let (step, widest) = ((width / 8.0).max(0.1), 4.0 * width + keep + GUIDE_SPARE_M);
+        let span: f64 = (1..n).map(|i| (self.x[i] - self.x[i - 1]).hypot(self.y[i] - self.y[i - 1])).sum();
+        let spacing = (span / (n - 1) as f64).max(1e-3);
+        let stride = ((0.5 * width).max(0.5) / spacing).ceil().max(1.0) as usize;
+        let mut stations: Vec<usize> = (0..n).step_by(stride).collect();
+        if stations.last() != Some(&(n - 1)) {
+            stations.push(n - 1);
+        }
+        let extent = back.abs().max(front.abs());
+        // Modes farther than this past the body neither block nor cost.
+        let care = rooms.iter().copied().fold(keep, f64::max);
+        let half_offsets = (widest / step).ceil() as i64;
+        let offsets: Vec<f64> = (-half_offsets..=half_offsets).map(|k| k as f64 * step).collect();
+        let slope = GUIDE_SLOPE.tan();
+        // Length from the station before, and the most offsets the guide may
+        // shift by over it.
+        let ds: Vec<f64> = (0..stations.len())
+            .map(|j| if j == 0 { 1.0 } else { (self.x[stations[j]] - self.x[stations[j - 1]]).hypot(self.y[stations[j]] - self.y[stations[j - 1]]).max(1e-3) })
+            .collect();
+        let shifts: Vec<usize> = (0..stations.len()).map(|j| if j == 0 { 0 } else { (ds[j] * slope / step).floor() as usize }).collect();
+        let heading = |j: usize, t: usize| ((t as f64 - shifts[j] as f64) * step / ds[j]).atan();
+        // Clearance of the body to the nearest mode at each station and
+        // offset, heading along the guide arriving there by each shift.
+        let gaps: Vec<Vec<Vec<f64>>> = (0..stations.len())
+            .map(|j| {
+                let i = stations[j];
+                let (sy, cy) = self.yaw[i].sin_cos();
+                let modes: Vec<ModeAt> = obstacles
+                    .iter()
+                    .flat_map(|o| modes_at(o, i as f64 * dt, dt))
+                    .filter(|m| (m.x - self.x[i]).hypot(m.y - self.y[i]) < widest + extent + side_room + m.radius + m.std_x.max(m.std_y) + care)
+                    .collect();
+                offsets
+                    .iter()
+                    .map(|d| {
+                        let (px, py) = (self.x[i] - sy * d, self.y[i] + cy * d);
+                        let near: Vec<&ModeAt> =
+                            modes.iter().filter(|m| (m.x - px).hypot(m.y - py) - extent - side_room - m.radius - m.std_x.max(m.std_y) < care).collect();
+                        (0..=2 * shifts[j])
+                            .map(|t| {
+                                let (s, c) = (self.yaw[i] + heading(j, t)).sin_cos();
+                                near.iter().fold(f64::INFINITY, |best, m| {
+                                    let (dx, dy) = (m.x - px, m.y - py);
+                                    let along = dx * c + dy * s;
+                                    let past = along - along.clamp(back, front);
+                                    let lateral = -dx * s + dy * c;
+                                    best.min((past * past + lateral * lateral).sqrt() - side_room - m.radius - m.std_x.max(m.std_y))
+                                })
+                            })
+                            .collect()
+                    })
+                    .collect()
+            })
+            .collect();
+        let (from, lead) = (from.0, from.1.clamp(-GUIDE_SLOPE, GUIDE_SLOPE));
+        let start = offsets.iter().enumerate().min_by(|a, b| (a.1 - from).abs().total_cmp(&(b.1 - from).abs())).map_or(0, |(k, _)| k);
+        let charge = |d: f64, gap: f64| -> f64 {
+            let short = ((keep - gap) / keep.max(1e-3)).max(0.0);
+            GUIDE_SHIFT_COST * (d / width).powi(2) + GUIDE_ROOM_COST * short * short
+        };
+        // The shifts arriving at station `j - 1` a guide can turn from onto
+        // each shift arriving at station `j`: a run of them, headings rising.
+        let turns: Vec<Vec<(usize, usize)>> = (0..stations.len())
+            .map(|j| {
+                if j == 0 {
+                    return Vec::new();
+                }
+                let turn = if swerve.radius > 0.0 { ds[j] / swerve.radius + 1e-9 } else { f64::INFINITY };
+                (0..=2 * shifts[j])
+                    .map(|t| {
+                        let h = heading(j, t);
+                        let fits = |tp: usize| (h - if j == 1 { lead } else { heading(j - 1, tp) }).abs() <= turn;
+                        let before = 2 * shifts[j - 1] + 1;
+                        let lo = (0..before).find(|&tp| fits(tp)).unwrap_or(before);
+                        let hi = (lo..before).take_while(|&tp| fits(tp)).last().map_or(lo, |tp| tp + 1);
+                        (lo, hi)
+                    })
+                    .collect()
+            })
+            .collect();
+        let plan = |side: usize, centre: &[f64], room: f64| -> Option<Reference> {
+            let sign = if side == 0 { 1.0 } else { -1.0 };
+            // States are (offset, shift arriving by), with their costs and,
+            // in `came`, the state before.
+            let mut cost: Vec<f64> = (0..offsets.len()).map(|k| if k == start { charge(offsets[k], gaps[0][k][0]) } else { f64::INFINITY }).collect();
+            let mut came: Vec<Vec<u32>> = Vec::with_capacity(stations.len());
+            for j in 1..stations.len() {
+                let (r, wide, before) = (shifts[j], 2 * shifts[j] + 1, 2 * shifts[j - 1] + 1);
+                let mut next = vec![f64::INFINITY; offsets.len() * wide];
+                let mut prior = vec![u32::MAX; offsets.len() * wide];
+                for k in 0..offsets.len() {
+                    if sign * offsets[k] < centre[stations[j]] {
+                        continue;
+                    }
+                    for t in 0..wide {
+                        let p = k as i64 + r as i64 - t as i64;
+                        let gap = gaps[j][k][t];
+                        if p < 0 || p >= offsets.len() as i64 || gap < room {
+                            continue;
+                        }
+                        let p = p as usize;
+                        let change = (offsets[k] - offsets[p]) / ds[j];
+                        let here = charge(offsets[k], gap) + GUIDE_TURN_COST * change * change;
+                        let (lo, hi) = turns[j][t];
+                        for tp in lo..hi {
+                            let was = cost[p * before + tp];
+                            if was + here < next[k * wide + t] {
+                                next[k * wide + t] = was + here;
+                                prior[k * wide + t] = (p * before + tp) as u32;
+                            }
+                        }
+                    }
+                }
+                cost = next;
+                came.push(prior);
+            }
+            let (mut at, best) = cost.iter().enumerate().min_by(|a, b| a.1.total_cmp(b.1))?;
+            if !best.is_finite() {
+                return None;
+            }
+            let mut picked = vec![start; stations.len()];
+            for j in (1..stations.len()).rev() {
+                picked[j] = at / (2 * shifts[j] + 1);
+                at = came[j - 1][at] as usize;
+            }
+            let mut out = self.clone();
+            for w in 0..stations.len() - 1 {
+                let (a, b) = (stations[w], stations[w + 1]);
+                for i in a..=b {
+                    let f = (i - a) as f64 / (b - a).max(1) as f64;
+                    let d = offsets[picked[w]] + f * (offsets[picked[w + 1]] - offsets[picked[w]]);
+                    let (s, c) = self.yaw[i].sin_cos();
+                    out.x[i] = self.x[i] - s * d;
+                    out.y[i] = self.y[i] + c * d;
+                }
+            }
+            out.lateral.clear();
+            Some(out)
+        };
+        // The room a detour keeps first, then less, as `rooms` allow.
+        std::iter::once(keep)
+            .chain(rooms.iter().copied().filter(|r| *r < keep))
+            .map(|room| [plan(0, centres[0], room), plan(1, centres[1], room)])
+            .find(|ways| ways.iter().any(Option::is_some))
+            .unwrap_or([None, None])
+    }
+
+    /// This reference moved sideways round every obstacle mode it meets at
+    /// its own time (passes within the mode's radius plus its spread, as the
+    /// obstacle critics grow it, plus the room `swerve` keeps for `reach` of
+    /// its body), passing them on
+    /// `side` (+1 left, −1 right), ramped in and out over `ramp` points or
+    /// the length `swerve` needs for the largest shift, if longer: the
+    /// guidance that keeps a solve in one homotopy class. `None` when it
+    /// meets no obstacle.
+    pub fn detour(&self, obstacles: &[Obstacle], reach: f64, dt: f64, side: f64, ramp: usize, swerve: Swerve) -> Option<Reference> {
+        let n = self.x.len();
+        let (need, _) = self.needs(obstacles, reach, dt, side, swerve);
         if need.iter().all(|v| *v <= 0.0) {
             return None;
         }
@@ -941,6 +1153,8 @@ pub struct MppiFollower {
     avoid: (f64, f64),
     /// The detour taken round the obstacles ahead, pursued by one sample.
     guide: Vec<(f64, f64)>,
+    /// A threaded guide the corridor is laid along instead of the path.
+    follow: Vec<(f64, f64)>,
     debug_level: DebugLevel,
     debug: DebugFrame,
 }
@@ -995,15 +1209,21 @@ impl MppiFollower {
         let along = Along { path: &self.base.path, cum: &self.cursor.cum, trajectory: self.trajectory.as_ref(), clock: self.clock, from };
         let speed = speed.max(v.abs());
         let swerve = Swerve::of(constraints, speed);
-        let robot = (state.pose.point.x, state.pose.point.y);
+        let robot = (state.pose.point.x, state.pose.point.y, crate::core::math::yaw_of(&state.pose));
         let plan = plan_avoidance(&along, obstacles, reach, swerve, n, step, speed, robot, &mut self.avoid);
         if self.debug_level >= DebugLevel::Basic {
-            self.debug.guides = guide_paths(&plan.reference, obstacles, reach, step, swerve);
+            self.debug.guides = match &plan.guide {
+                Some(g) => vec![(0..g.x.len()).map(|i| Point::new(g.x[i], g.y[i], 0.0)).collect()],
+                None => guide_paths(&plan.reference, obstacles, reach, step, swerve),
+            };
         }
         let paced = speed * plan.pace;
         let share = match &plan.guide {
             Some(g) => {
                 self.guide = (0..g.x.len()).map(|i| (g.x[i], g.y[i])).collect();
+                if plan.threaded {
+                    self.follow = self.guide.clone();
+                }
                 give_way_share(&along.reference(n, step, paced), obstacles, constraints, &course_through(&self.guide), paced, v, step, GIVE_WAY_MARGIN)
             }
             None => give_way_ahead(&along, obstacles, constraints, n, step, paced, v, GIVE_WAY_MARGIN),
@@ -1022,6 +1242,7 @@ impl MppiFollower {
     pub(crate) fn clear_guides(&mut self) {
         self.debug.guides.clear();
         self.guide.clear();
+        self.follow.clear();
     }
 
     pub fn with_mppi_config(cfg: MppiConfig) -> Self {
@@ -1052,6 +1273,7 @@ impl MppiFollower {
             last_steer: 0.0,
             avoid: (0.0, 1.0),
             guide: Vec::new(),
+            follow: Vec::new(),
             debug_level: DebugLevel::Off,
             debug: DebugFrame::default(),
             mppi_config: cfg,
@@ -1148,6 +1370,9 @@ impl MppiFollower {
         let mut corridor = corridor;
         corridor.release = (0.5 * prep.pos_tol).max(0.05);
         corridor.relax_with(relax);
+        if !self.follow.is_empty() {
+            corridor = corridor.along_guide(&self.follow);
+        }
         let w = self.weights(&working);
         let cost_of = |steer: &[f64], accel: &[f64], accel_lat: &[f64], collect: bool| match &reference {
             Some(r) => rollout(&model, steer, accel, accel_lat, r, &w, extra, collect),
@@ -1513,6 +1738,47 @@ pub(crate) struct Corridor {
 }
 
 impl Corridor {
+    /// This corridor laid along `guide` instead, from its first point:
+    /// points `spacing` apart heading along it, at this one's speeds, with
+    /// the full weights. Unchanged across cusps, against the way this one
+    /// heads, or for a guide under two points.
+    pub(crate) fn along_guide(&self, guide: &[(f64, f64)]) -> Corridor {
+        let heads = |a: (f64, f64), b: (f64, f64)| (b.1 - a.1).atan2(b.0 - a.0);
+        let opposed = self.yaw.first().is_some_and(|yaw| guide.len() >= 2 && normalize_angle(heads(guide[0], guide[1]) - yaw).abs() > 0.5 * PI);
+        if guide.len() < 2 || !self.cusps.is_empty() || self.x.is_empty() || opposed {
+            return self.clone();
+        }
+        let mut out = Corridor { spacing: self.spacing, release: self.release, ..Corridor::default() };
+        let (mut seg, mut into) = (0usize, 0.0_f64);
+        for i in 0..self.x.len() {
+            if i > 0 {
+                let mut left = self.spacing;
+                while seg + 1 < guide.len() {
+                    let length = (guide[seg + 1].0 - guide[seg].0).hypot(guide[seg + 1].1 - guide[seg].1);
+                    if into + left <= length {
+                        into += left;
+                        break;
+                    }
+                    left -= length - into;
+                    (seg, into) = (seg + 1, 0.0);
+                }
+                if seg + 1 >= guide.len() {
+                    break;
+                }
+            }
+            let (a, b) = (guide[seg], guide[(seg + 1).min(guide.len() - 1)]);
+            let length = (b.0 - a.0).hypot(b.1 - a.1).max(1e-9);
+            out.x.push(a.0 + (b.0 - a.0) * into / length);
+            out.y.push(a.1 + (b.1 - a.1) * into / length);
+            out.yaw.push(heads(a, b));
+            out.v.push(self.v[i]);
+            out.lateral.push(1.0);
+            out.allow.push(0.0);
+            out.toward.push(0.0);
+        }
+        out
+    }
+
     /// Eases the lateral and heading weights at each point by `relax`:
     /// `(scale, allow, toward)`.
     pub(crate) fn relax_with(&mut self, relax: &dyn Fn(f64, f64) -> (f64, f64, f64)) {
@@ -2011,12 +2277,25 @@ pub(crate) fn pick_detour(
     use crate::pred::mpc::SIDE_SWITCH_COST;
     let behinds = behind_sides(obstacles, reference, step, reach);
     let only = pass_behind(obstacles, reference, step, reach);
+    let room = reach + DETOUR_MARGIN;
+    // Among a field of standing obstacles the way is threaded past them all,
+    // by the side the nearest one met is passed on; else, or where no way is
+    // found, it detours round them all on either side.
+    let ways = match in_field(reference, obstacles, room, step, swerve) {
+        Some(nearest) => {
+            let centres = [1.0, -1.0].map(|s| reference.needs(&[nearest.clone()], room, step, s, swerve).1);
+            reference.threaded(obstacles, [&centres[0], &centres[1]], (0.0, 0.0), &GUIDE_ROOMS, room, step, swerve)
+        }
+        None => [None, None],
+    };
+    let found = ways.iter().any(Option::is_some);
     let mut best: Option<(f64, f64, Reference)> = None;
-    for s in [1.0, -1.0] {
+    for (k, s) in [1.0, -1.0].into_iter().enumerate() {
         if only.is_some_and(|b| b != s) {
             continue;
         }
-        let Some(g) = reference.detour(obstacles, reach + DETOUR_MARGIN, step, s, DETOUR_RAMP, swerve) else {
+        let way = if found { ways[k].clone() } else { reference.detour(obstacles, room, step, s, DETOUR_RAMP, swerve) };
+        let Some(g) = way else {
             continue;
         };
         let total: f64 = (0..g.x.len()).map(|i| (g.x[i] - reference.x[i]).hypot(g.y[i] - reference.y[i])).sum();
@@ -2030,6 +2309,24 @@ pub(crate) fn pick_detour(
     best.map(|b| b.2)
 }
 
+/// The obstacle of `obstacles` that `reference` meets first (within the
+/// room `detour` keeps for `reach`), when it meets at least `FIELD_POSTS`
+/// standing ones: a field to thread through rather than go round.
+fn in_field(reference: &Reference, obstacles: &[Obstacle], reach: f64, step: f64, swerve: Swerve) -> Option<Obstacle> {
+    let standing = |o: &Obstacle| match (modes_at(o, 0.0, 1.0).next(), modes_at(o, 1.0, 1.0).next()) {
+        (Some(a), Some(b)) => (b.x - a.x).hypot(b.y - a.y) < CROSSING_MIN_SPEED,
+        _ => false,
+    };
+    let met: Vec<(usize, &Obstacle)> = obstacles.iter().filter_map(|o| reference.first_met(o, reach, step, swerve).map(|i| (i, o))).collect();
+    if met.iter().filter(|(_, o)| standing(o)).count() < FIELD_POSTS {
+        return None;
+    }
+    met.into_iter().min_by_key(|m| m.0).map(|m| m.1.clone())
+}
+
+/// Standing obstacles a reference must meet to count as among a field.
+const FIELD_POSTS: usize = 2;
+
 /// How to get past the obstacles ahead: the share of the reference speed
 /// to drive at, the reference ahead at that pace, and the detour of it to
 /// steer by, if any.
@@ -2037,9 +2334,12 @@ pub(crate) struct Avoidance {
     pub pace: f64,
     pub reference: Reference,
     pub guide: Option<Reference>,
+    /// Whether `guide` was threaded past everything round, not only the
+    /// nearest cluster.
+    pub threaded: bool,
 }
 
-/// The way past `obstacles` ahead of `along` for the robot at `robot`:
+/// The way past `obstacles` ahead of `along` for the robot at `robot` (x, y, heading):
 /// of each pace of `AVOID_PACES` (only the first on a timed trajectory),
 /// driven as is or detoured to either side over `n` steps of `step` at
 /// that share of `speed` and on for `swerve`'s lookahead (at least
@@ -2061,7 +2361,7 @@ pub(crate) fn plan_avoidance(
     n: usize,
     step: f64,
     speed: f64,
-    robot: (f64, f64),
+    robot: (f64, f64, f64),
     last: &mut (f64, f64),
 ) -> Avoidance {
     use crate::pred::mpc::SIDE_SWITCH_COST;
@@ -2083,11 +2383,38 @@ pub(crate) fn plan_avoidance(
         // Traffic crossing the way is given way to, not gone round.
         let around: Vec<Obstacle> = (0..obstacles.len()).filter(|&k| !crossing[k]).map(|k| obstacles[k].clone()).collect();
         let (first, room) = nearest_cluster(&reference, &around, reach + DETOUR_MARGIN, step, swerve, width);
-        let mut options: Vec<(f64, f64, Option<Reference>)> = Vec::new();
+        let mut options: Vec<(f64, f64, Option<Reference>, bool)> = Vec::new();
         let mut met = false;
-        for s in [1.0, -1.0] {
-            let Some(g) = reference.detour(&first, reach + DETOUR_MARGIN, step, s, DETOUR_RAMP, swerve) else {
+        let olds = [1.0, -1.0].map(|s| reference.detour(&first, reach + DETOUR_MARGIN, step, s, DETOUR_RAMP, swerve));
+        let offset = match (reference.x.first(), reference.y.first(), reference.yaw.first()) {
+            (Some(&x), Some(&y), Some(&yaw)) => -(robot.0 - x) * yaw.sin() + (robot.1 - y) * yaw.cos(),
+            _ => 0.0,
+        };
+        // Among a field of standing obstacles the way is threaded past
+        // everything round, over a longer stretch to see a way through end
+        // blind, by the side the nearest one met is passed on.
+        let field = if olds.iter().any(Option::is_some) { in_field(&reference, &around, reach + DETOUR_MARGIN, step, swerve) } else { None };
+        let threaded = match field {
+            Some(nearest) => {
+                let ahead_m = GUIDE_LOOKOUT_M.max(GUIDE_LOOKOUT_BODIES * swerve.body.map_or(2.0 * swerve.disc, |b| b.1 - b.0));
+                let long_n = ((ahead_m / (speed * pace * step).abs().max(1e-3)).ceil() as usize).max(reference.x.len());
+                let long = along.reference(long_n, step, speed * pace);
+                let centres = [1.0, -1.0].map(|s| long.needs(&[nearest.clone()], reach + DETOUR_MARGIN, step, s, swerve).1);
+                let lead = long.yaw.first().map_or(0.0, |yaw| normalize_angle(robot.2 - yaw));
+                long.threaded(&around, [&centres[0], &centres[1]], (offset, lead), &GUIDE_ROOMS, reach + DETOUR_MARGIN, step, swerve)
+                    .map(|g| g.map(|g| reference.shifted_like(&long, &g)))
+            }
+            None => [None, None],
+        };
+        let found = threaded.iter().any(Option::is_some);
+        for (k, s) in [1.0, -1.0].into_iter().enumerate() {
+            let Some(old) = &olds[k] else {
                 continue;
+            };
+            let (g, threads) = match (&threaded[k], found) {
+                (Some(g), _) => (g.clone(), true),
+                (None, true) => continue,
+                (None, false) => (old.clone(), false),
             };
             met = true;
             let points: Vec<(f64, f64)> = (0..g.x.len()).map(|i| (g.x[i], g.y[i])).collect();
@@ -2102,20 +2429,20 @@ pub(crate) fn plan_avoidance(
             }
             // A detour the robot can still swerve onto before it meets the
             // obstacles, or is already swerving onto, is not begun too late.
-            let gap = guide_gap(&reference, &points, robot);
+            let gap = guide_gap(&reference, &points, (robot.0, robot.1));
             let onto = s == last.0 || swerve.length(gap) < room;
             let late = if onto { 0.0 } else { LATE_COST * (gap - SWERVE_SLACK).max(0.0) };
             let wide = widest + (widest - width).max(0.0).powi(2) / width;
-            options.push((s, if in_front { AHEAD_COST } else { 1.0 } * wide + late, Some(g)));
+            options.push((s, if in_front { AHEAD_COST } else { 1.0 } * wide + late, Some(g), threads));
         }
         if !met {
-            options.push((0.0, 0.0, None));
+            options.push((0.0, 0.0, None, false));
         }
-        for (s, shift, guide) in options {
+        for (s, shift, guide, threaded) in options {
             let kept = (s == last.0 || last.0 == 0.0) && (pace - last.1).abs() < 1e-9;
             let cost = (shift + PACE_COST * (1.0 - pace)) * if kept { 1.0 } else { SIDE_SWITCH_COST };
             if best.as_ref().is_none_or(|b| cost < b.0) {
-                best = Some((cost, s, Avoidance { pace, reference: reference.clone(), guide }));
+                best = Some((cost, s, Avoidance { pace, reference: reference.clone(), guide, threaded }));
             }
         }
     }
@@ -2127,7 +2454,7 @@ pub(crate) fn plan_avoidance(
         None => {
             let pace = *paces.last().unwrap_or(&1.0);
             *last = (0.0, pace);
-            Avoidance { pace, reference: along.reference(far, step, speed), guide: None }
+            Avoidance { pace, reference: along.reference(far, step, speed), guide: None, threaded: false }
         }
     }
 }
@@ -2334,7 +2661,7 @@ mod tests {
         let reach = crate::core::obstacles::robot_radius(&c);
         let along = Along { path: &path, cum: &cum, trajectory: None, clock: 0.0, from: 19.0 };
         let mut last = (-1.0, 1.0);
-        let plan = plan_avoidance(&along, &gates, reach, Swerve::of(&c, 1.0), 30, 0.2, 1.0, (19.0, -1.2), &mut last);
+        let plan = plan_avoidance(&along, &gates, reach, Swerve::of(&c, 1.0), 30, 0.2, 1.0, (19.0, -1.2, 0.0), &mut last);
         assert!(plan.guide.is_some(), "no detour round the next gate");
         assert_eq!(last.0, 1.0, "the gate on the right is passed on the left, not round the far side");
     }
@@ -2362,8 +2689,49 @@ mod tests {
         let mover = Obstacle { id: 0, radius: 0.5, modes: vec![mode], dt };
         let reach = crate::core::obstacles::robot_radius(&c);
         let mut last = (0.0, 1.0);
-        let plan = plan_avoidance(&along, &[mover], reach, Swerve::of(&c, 1.0), 30, 0.2, 1.0, (0.0, 0.0), &mut last);
+        let plan = plan_avoidance(&along, &[mover], reach, Swerve::of(&c, 1.0), 30, 0.2, 1.0, (0.0, 0.0, 0.0), &mut last);
         assert!(plan.guide.is_none(), "detours round crossing traffic");
+    }
+
+    /// A tractor on a straight reference with a post on it at x = 20 and two
+    /// beside it on the left.
+    #[test]
+    fn threads_a_way_clear_of_posts_beside_the_one_on_the_path() {
+        let mut c = RobotConstraints::default();
+        c.steering_type = SteeringType::Ackermann;
+        c.wheelbase = 2.7;
+        c.max_linear_velocity = 2.0;
+        c.max_steering_angle = 0.6;
+        c.footprint = Footprint::Polygon { points: vec![(2.535, 1.15), (-2.565, 1.15), (-2.565, -1.15), (2.535, -1.15)] };
+        let (n, step) = (200, 0.15);
+        let reference = Reference {
+            x: (0..=n).map(|i| 0.3 * i as f64).collect(),
+            y: vec![0.0; n + 1],
+            yaw: vec![0.0; n + 1],
+            v: vec![2.0; n + 1],
+            ..Default::default()
+        };
+        let post = |id: u64, x: f64, y: f64, r: f64| {
+            let mode = GaussianMode { weight: 1.0, mean_x: vec![x; 31], mean_y: vec![y; 31], std_x: vec![0.05; 31], std_y: vec![0.05; 31] };
+            Obstacle { id, radius: r, modes: vec![mode], dt: 0.2 }
+        };
+        let posts = [post(0, 20.0, 0.3, 1.35), post(1, 25.0, 4.2, 1.0), post(2, 15.0, 5.4, 1.26)];
+        let swerve = Swerve::of(&c, 2.0);
+        let reach = crate::core::obstacles::robot_radius(&c) + super::DETOUR_MARGIN;
+        let needs = [1.0, -1.0].map(|s| reference.needs(&posts[..1], reach, step, s, swerve));
+        let ways = reference.threaded(&posts, [&needs[0].1, &needs[1].1], (0.0, 0.0), &super::GUIDE_ROOMS[..1], reach, step, swerve);
+        assert!(ways[1].is_some(), "no way on the open right");
+        for (k, way) in ways.iter().enumerate().filter_map(|(k, w)| w.as_ref().map(|w| (k, w))) {
+            for i in 0..way.x.len() {
+                for p in &posts {
+                    let m = &p.modes[0];
+                    let gap = (way.x[i] - m.mean_x[0]).hypot(way.y[i] - m.mean_y[0]) - p.radius - 1.15;
+                    assert!(gap > 0.0, "side {k} point {i} at ({:.1}, {:.1}) within {gap:.2} of post {}", way.x[i], way.y[i], p.id);
+                }
+            }
+            let y = way.y[(20.0 / 0.3) as usize];
+            assert!(if k == 0 { y > 0.3 } else { y < 0.3 }, "side {k} passes the post on the path at {y:.2}");
+        }
     }
 
     /// A straight reference along x from `robot_x` at 1 m/s and a mover
