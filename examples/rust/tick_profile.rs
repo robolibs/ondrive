@@ -139,7 +139,7 @@ fn main() {
         times.sort_by(f64::total_cmp);
         let at = |q: f64| times[((times.len() as f64 * q) as usize).min(times.len() - 1)];
         println!(
-            "{name:18} ticks={ticks} mean={mean:6.2} ms median={:6.2} ms p95={:6.2} ms max={:6.2} ms  end x={x:5.1}",
+            "{name:18} ticks={ticks} mean={mean:6.2} ms median={:6.2} ms p95={:6.2} ms max={:6.2} ms  end x={x:5.1} pose=({x:.9}, {y:.9}, {yaw:.9})",
             at(0.5),
             at(0.95),
             times[times.len() - 1]
