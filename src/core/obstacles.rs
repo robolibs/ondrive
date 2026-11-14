@@ -72,6 +72,28 @@ pub fn modes_at(obs: &Obstacle, t: f64, step: f64) -> impl Iterator<Item = ModeA
     })
 }
 
+/// For each mode of `obs` `modes_at` yields, in order, the most metres per
+/// second its mean moves and the most its spread grows per second; infinite
+/// where its prediction is not all finite.
+pub fn mode_rates(obs: &Obstacle, step: f64) -> Vec<(f64, f64)> {
+    let h = if obs.dt > 0.0 { obs.dt } else { step.max(1e-9) };
+    let finite = |v: &[f64]| v.iter().all(|a| a.is_finite());
+    let slope = |v: &[f64]| v.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0_f64, f64::max);
+    obs.modes
+        .iter()
+        .filter(|md| md.weight.is_finite() && md.weight > 0.0 && md.mean_x.len().min(md.mean_y.len()) > 0)
+        .map(|md| {
+            let n = md.mean_x.len().min(md.mean_y.len());
+            let (x, y) = (&md.mean_x[..n], &md.mean_y[..n]);
+            if !(finite(x) && finite(y) && finite(&md.std_x) && finite(&md.std_y)) {
+                return (f64::INFINITY, f64::INFINITY);
+            }
+            let v = x.windows(2).zip(y.windows(2)).map(|(a, b)| (a[1] - a[0]).hypot(b[1] - b[0])).fold(0.0_f64, f64::max);
+            (v / h, slope(&md.std_x).max(slope(&md.std_y)) / h)
+        })
+        .collect()
+}
+
 /// Smallest clearance between a disc of `radius` at `(x, y)` and every
 /// obstacle mode at `t` seconds, for a controller planning in `step`s.
 pub fn clearance_at(obstacles: &[Obstacle], t: f64, step: f64, x: f64, y: f64, radius: f64) -> f64 {
@@ -693,6 +715,21 @@ mod tests {
                     assert_eq!(checker.clearance(step, x, y, yaw), all, "step {step} pose {k}");
                     assert_eq!(checker.clearance_within(step, x, y, yaw, cap), want, "step {step} pose {k} cap {cap}");
                     assert_eq!(checker.clearance_at_within(t, x, y, yaw, cap), want, "t {t} pose {k} cap {cap}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn modes_move_and_spread_no_faster_than_their_rates() {
+        for o in crowd().iter().take(20) {
+            let rates = mode_rates(o, 0.15);
+            for k in 0..120 {
+                let (t0, t1) = (0.13 * k as f64, 0.13 * k as f64 + 0.37 * (k % 7) as f64);
+                for ((a, b), (v, s)) in modes_at(o, t0, 0.15).zip(modes_at(o, t1, 0.15)).zip(&rates) {
+                    let slack = 1e-9 + (t1 - t0) * 1e-9;
+                    assert!((b.x - a.x).hypot(b.y - a.y) <= v * (t1 - t0) + slack, "obstacle {} from {t0} to {t1}", o.id);
+                    assert!((b.std_x.max(b.std_y) - a.std_x.max(a.std_y)).abs() <= s * (t1 - t0) + slack);
                 }
             }
         }

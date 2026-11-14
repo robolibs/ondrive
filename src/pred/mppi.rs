@@ -16,7 +16,7 @@ use crate::core::kinematics::{
     max_curvature, planning, steering_limit, wheelbase,
 };
 use crate::core::math::normalize_angle;
-use crate::core::obstacles::{CollisionChecker, footprint_extent, modes_at, robot_radius, yield_share};
+use crate::core::obstacles::{CollisionChecker, footprint_extent, mode_rates, modes_at, robot_radius, yield_share};
 use crate::core::path::{PathCursor, PathProjection, sample};
 use crate::pred::mpc::{DETOUR_MARGIN, DETOUR_RAMP, DETOURED_WEIGHT};
 use crate::types::{
@@ -290,16 +290,37 @@ impl Reference {
     /// within the room `detour` keeps from it, if any.
     pub fn first_met(&self, o: &Obstacle, reach: f64, dt: f64, swerve: Swerve) -> Option<usize> {
         let (back, front, half, keep) = swerve.keep(reach);
-        (0..self.x.len()).find(|&i| {
-            let (s, c) = self.yaw[i].sin_cos();
-            modes_at(o, i as f64 * dt, dt).any(|m| {
-                let room = m.radius + half + keep + m.std_x.max(m.std_y);
-                let (dx, dy) = (m.x - self.x[i], m.y - self.y[i]);
-                let along = dx * c + dy * s;
-                let past = along - along.clamp(back, front);
-                let lateral = -dx * s + dy * c;
-                past * past + lateral * lateral < room * room
+        let pad = half + keep + back.abs().max(front.abs());
+        let rates = mode_rates(o, dt);
+        let n = self.x.len();
+        (0..n).step_by(BLOCK).filter(|&b| self.may_meet(o, &rates, b, dt, pad)).find_map(|b| {
+            (b..(b + BLOCK).min(n)).find(|&i| {
+                let (s, c) = self.yaw[i].sin_cos();
+                modes_at(o, i as f64 * dt, dt).any(|m| {
+                    let room = m.radius + half + keep + m.std_x.max(m.std_y);
+                    let (dx, dy) = (m.x - self.x[i], m.y - self.y[i]);
+                    let along = dx * c + dy * s;
+                    let past = along - along.clamp(back, front);
+                    let lateral = -dx * s + dy * c;
+                    past * past + lateral * lateral < room * room
+                })
             })
+        })
+    }
+
+    /// Whether a mode of `o`, moving at most at its `rates` (`mode_rates`)
+    /// from where it is at point `from`'s time, can come within its radius
+    /// and spread plus `pad` of the points `from` to `from + BLOCK` at
+    /// their times, `dt` seconds apart.
+    fn may_meet(&self, o: &Obstacle, rates: &[(f64, f64)], from: usize, dt: f64, pad: f64) -> bool {
+        let to = (from + BLOCK).min(self.x.len());
+        let (x0, x1) = self.x[from..to].iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        let (y0, y1) = self.y[from..to].iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        let span = (to - 1 - from) as f64 * dt;
+        modes_at(o, from as f64 * dt, dt).zip(rates).any(|(m, &(v, s))| {
+            let (gx, gy) = ((x0 - m.x).max(m.x - x1).max(0.0), (y0 - m.y).max(m.y - y1).max(0.0));
+            let bound = m.radius + m.std_x.max(m.std_y) + pad + (v + s) * span;
+            !(gx.hypot(gy) > bound * (1.0 + 1e-9) + 1e-6)
         })
     }
 
@@ -314,18 +335,25 @@ impl Reference {
     pub fn detour(&self, obstacles: &[Obstacle], reach: f64, dt: f64, side: f64, ramp: usize, swerve: Swerve) -> Option<Reference> {
         let n = self.x.len();
         let (back, front, half, keep) = swerve.keep(reach);
+        let pad = half + keep + back.abs().max(front.abs());
+        let trig: Vec<(f64, f64)> = self.yaw.iter().take(n).map(|y| y.sin_cos()).collect();
         let mut need = vec![0.0_f64; n];
-        for (i, need) in need.iter_mut().enumerate() {
-            let (s, c) = self.yaw[i].sin_cos();
-            for m in obstacles.iter().flat_map(|o| modes_at(o, i as f64 * dt, dt)) {
-                let room = m.radius + half + keep + m.std_x.max(m.std_y);
-                let (dx, dy) = (m.x - self.x[i], m.y - self.y[i]);
-                let along = dx * c + dy * s;
-                let past = along - along.clamp(back, front);
-                let lateral = -dx * s + dy * c;
-                if past * past + lateral * lateral < room * room {
-                    let edge = lateral + side * (room * room - past * past).sqrt();
-                    *need = need.max(side * edge);
+        for o in obstacles {
+            let rates = mode_rates(o, dt);
+            for b in (0..n).step_by(BLOCK).filter(|&b| self.may_meet(o, &rates, b, dt, pad)) {
+                for i in b..(b + BLOCK).min(n) {
+                    let (s, c) = trig[i];
+                    for m in modes_at(o, i as f64 * dt, dt) {
+                        let room = m.radius + half + keep + m.std_x.max(m.std_y);
+                        let (dx, dy) = (m.x - self.x[i], m.y - self.y[i]);
+                        let along = dx * c + dy * s;
+                        let past = along - along.clamp(back, front);
+                        let lateral = -dx * s + dy * c;
+                        if past * past + lateral * lateral < room * room {
+                            let edge = lateral + side * (room * room - past * past).sqrt();
+                            need[i] = need[i].max(side * edge);
+                        }
+                    }
                 }
             }
         }
@@ -1864,6 +1892,10 @@ fn comes_near(o: &Obstacle, reference: &Reference, step: f64, reach: f64) -> boo
 /// Distance, metres beyond an obstacle's radius, within which its predicted
 /// track counts as reaching the path.
 const CROSSING_REACH: f64 = 2.0;
+
+/// Points of a reference looked at together against where an obstacle can
+/// be over them.
+const BLOCK: usize = 8;
 
 fn moves_across(o: &Obstacle, reference: &Reference, step: f64) -> bool {
     velocity_on(o, reference, step).is_some_and(|(across, along)| across.abs() > along.abs())
