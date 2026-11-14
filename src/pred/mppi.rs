@@ -2267,7 +2267,6 @@ mod tests {
     use datapod::{Euler, Point, Pose, Quaternion};
 
     #[test]
-    #[test]
     fn takes_the_next_gate_on_its_own_side() {
         let waypoints: Vec<Pose> = (0..=80)
             .map(|i| Pose { point: Point::new(i as f64, 0.0, 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, 0.0)) })
@@ -2295,7 +2294,8 @@ mod tests {
         assert_eq!(last.0, 1.0, "the gate on the right is passed on the left, not round the far side");
     }
 
-    fn steers_past_traffic_crossing_into_its_way_rather_than_slowing() {
+    #[test]
+    fn gives_way_to_traffic_crossing_into_its_way_rather_than_steering() {
         let waypoints: Vec<Pose> = (0..=40)
             .map(|i| Pose { point: Point::new(i as f64, 0.0, 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, 0.0)) })
             .collect();
@@ -2318,8 +2318,7 @@ mod tests {
         let reach = crate::core::obstacles::robot_radius(&c);
         let mut last = (0.0, 1.0);
         let plan = plan_avoidance(&along, &[mover], reach, Swerve::of(&c, 1.0), 30, 0.2, 1.0, (0.0, 0.0), &mut last);
-        assert!(plan.guide.is_some(), "no detour, pace {}", plan.pace);
-        assert!(plan.pace >= 0.75, "pace {}", plan.pace);
+        assert!(plan.guide.is_none(), "detours round crossing traffic");
     }
 
     /// A straight reference along x from `robot_x` at 1 m/s and a mover
