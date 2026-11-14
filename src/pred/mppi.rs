@@ -344,18 +344,44 @@ impl Reference {
     }
 
     /// This reference moved sideways at each point by as much as `guide`
-    /// leaves `base` there, `base` starting as this one does and at least as
-    /// long.
-    fn shifted_like(&self, base: &Reference, guide: &Reference) -> Reference {
+    /// leaves `base` the same distance along, `base` starting where this one
+    /// does; past `base`'s end by its last shift.
+    fn shifted_by_arc(&self, base: &Reference, guide: &Reference) -> Reference {
+        let along = |r: &Reference| -> Vec<f64> {
+            let mut s = vec![0.0; r.x.len()];
+            for i in 1..r.x.len() {
+                s[i] = s[i - 1] + (r.x[i] - r.x[i - 1]).hypot(r.y[i] - r.y[i - 1]);
+            }
+            s
+        };
+        let m = base.x.len().min(guide.x.len());
         let mut out = self.clone();
-        for i in 0..self.x.len().min(base.x.len()).min(guide.x.len()) {
-            let (bs, bc) = base.yaw[i].sin_cos();
-            let d = -(guide.x[i] - base.x[i]) * bs + (guide.y[i] - base.y[i]) * bc;
-            let (s, c) = self.yaw[i].sin_cos();
-            out.x[i] = self.x[i] - s * d;
-            out.y[i] = self.y[i] + c * d;
-        }
         out.lateral.clear();
+        if m == 0 {
+            return out;
+        }
+        let at = along(base);
+        let shift: Vec<f64> = (0..m)
+            .map(|j| {
+                let (s, c) = base.yaw[j].sin_cos();
+                -(guide.x[j] - base.x[j]) * s + (guide.y[j] - base.y[j]) * c
+            })
+            .collect();
+        let mut j = 0;
+        for (i, s) in along(self).into_iter().enumerate() {
+            while j + 1 < m && at[j + 1] < s {
+                j += 1;
+            }
+            let d = if j + 1 < m && at[j + 1] > at[j] {
+                let f = ((s - at[j]) / (at[j + 1] - at[j])).clamp(0.0, 1.0);
+                shift[j] + f * (shift[j + 1] - shift[j])
+            } else {
+                shift[j]
+            };
+            let (sn, cs) = self.yaw[i].sin_cos();
+            out.x[i] = self.x[i] - sn * d;
+            out.y[i] = self.y[i] + cs * d;
+        }
         out
     }
 
@@ -2376,6 +2402,7 @@ pub(crate) fn plan_avoidance(
     }
     let paces: &[f64] = if along.trajectory.is_some() { &AVOID_PACES[..1] } else { &AVOID_PACES };
     let mut best: Option<(f64, f64, Avoidance)> = None;
+    let mut once: Option<(Reference, [Option<Reference>; 2])> = None;
     for &pace in paces {
         let reference = along.reference((far as f64 / pace).ceil() as usize, step, speed * pace);
         let crossing: Vec<bool> = obstacles.iter().map(|o| crosses(o, &reference, step, reach)).collect();
@@ -2396,13 +2423,19 @@ pub(crate) fn plan_avoidance(
         let field = if olds.iter().any(Option::is_some) { in_field(&reference, &around, reach + DETOUR_MARGIN, step, swerve) } else { None };
         let threaded = match field {
             Some(nearest) => {
-                let ahead_m = GUIDE_LOOKOUT_M.max(GUIDE_LOOKOUT_BODIES * swerve.body.map_or(2.0 * swerve.disc, |b| b.1 - b.0));
-                let long_n = ((ahead_m / (speed * pace * step).abs().max(1e-3)).ceil() as usize).max(reference.x.len());
-                let long = along.reference(long_n, step, speed * pace);
-                let centres = [1.0, -1.0].map(|s| long.needs(&[nearest.clone()], reach + DETOUR_MARGIN, step, s, swerve).1);
-                let lead = long.yaw.first().map_or(0.0, |yaw| normalize_angle(robot.2 - yaw));
-                long.threaded(&around, [&centres[0], &centres[1]], (offset, lead), &GUIDE_ROOMS, reach + DETOUR_MARGIN, step, swerve)
-                    .map(|g| g.map(|g| reference.shifted_like(&long, &g)))
+                // Threaded once a tick, at the first pace that meets a field,
+                // and laid onto each pace's reference by distance along it.
+                if once.is_none() {
+                    let ahead_m = GUIDE_LOOKOUT_M.max(GUIDE_LOOKOUT_BODIES * swerve.body.map_or(2.0 * swerve.disc, |b| b.1 - b.0));
+                    let long_n = ((ahead_m / (speed * pace * step).abs().max(1e-3)).ceil() as usize).max(reference.x.len());
+                    let long = along.reference(long_n, step, speed * pace);
+                    let centres = [1.0, -1.0].map(|s| long.needs(&[nearest.clone()], reach + DETOUR_MARGIN, step, s, swerve).1);
+                    let lead = long.yaw.first().map_or(0.0, |yaw| normalize_angle(robot.2 - yaw));
+                    let ways = long.threaded(&around, [&centres[0], &centres[1]], (offset, lead), &GUIDE_ROOMS, reach + DETOUR_MARGIN, step, swerve);
+                    once = Some((long, ways));
+                }
+                let (long, ways) = once.as_ref().expect("threaded above");
+                ways.each_ref().map(|g| g.as_ref().map(|g| reference.shifted_by_arc(long, g)))
             }
             None => [None, None],
         };
