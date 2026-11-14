@@ -95,8 +95,33 @@ fn main() {
             (x, side * (4.0 + 20.0 * draw()), 0.3 * (draw() - 0.5), -side * speed)
         })
         .collect();
+    // `ONDRIVE_POSTS` standing posts over the 14.5 m either side of the path
+    // from x = 15 m, at least 5.4 m apart edge to edge, four of them on it.
+    let posts_wanted: usize = std::env::var("ONDRIVE_POSTS").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut posts: Vec<(f64, f64, f64)> = if posts_wanted > 0 { vec![(27.0, 0.45, 1.35), (57.0, -0.6, 1.35), (87.0, 0.3, 1.35)] } else { Vec::new() };
+    for _ in 0..20000 {
+        if posts.len() >= posts_wanted {
+            break;
+        }
+        let (x, y, r) = (15.0 + 75.0 * draw(), 13.5 * (2.0 * draw() - 1.0), 0.75 + 0.75 * draw());
+        if posts.iter().all(|&(px, py, pr)| (x - px).hypot(y - py) >= r + pr + 5.4) {
+            posts.push((x, y, r));
+        }
+    }
+    // Or the posts listed `x y radius` per line in `ONDRIVE_POSTS_FILE`.
+    if let Ok(file) = std::env::var("ONDRIVE_POSTS_FILE") {
+        let text = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("{file}: {e}"));
+        posts = text
+            .lines()
+            .filter_map(|l| {
+                let v: Vec<f64> = l.split_whitespace().filter_map(|t| t.parse().ok()).collect();
+                (v.len() == 3).then(|| (v[0], v[1], v[2]))
+            })
+            .collect();
+    }
+    let length: f64 = std::env::var("ONDRIVE_PATH_M").ok().and_then(|v| v.parse().ok()).unwrap_or(90.0);
     let mut path = Path::default();
-    path.waypoints = (0..=180).map(|i| pose(0.5 * i as f64, 0.0, 0.0)).collect();
+    path.waypoints = (0..=(2.0 * length) as usize).map(|i| pose(0.5 * i as f64, 0.0, 0.0)).collect();
     for name in &kinds {
         let mut t = Tracker::new(kind_of(name));
         let mut cfg = ControllerConfig::default();
@@ -117,6 +142,7 @@ fn main() {
                 obstacle(2, 90.0 - 0.6 * now, 0.6, -0.6, 0.0, 0.5),
             ];
             obstacles.extend(crowd.iter().enumerate().map(|(i, &(x, y, vx, vy))| obstacle(3 + i as u64, x + vx * now, y + vy * now, vx, vy, 0.4)));
+            obstacles.extend(posts.iter().enumerate().map(|(i, &(x, y, r))| obstacle(1000 + i as u64, x, y, 0.0, 0.0, r)));
             let world = WorldConstraints { obstacles, ..Default::default() };
             let state = RobotState {
                 pose: pose(x, y, yaw),
