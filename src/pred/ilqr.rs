@@ -17,7 +17,7 @@ use crate::core::obstacles::{BarrierField, footprint_discs};
 use crate::core::path::PathCursor;
 use crate::pred::mpc::{SIDE_SWITCH_COST, guided};
 use crate::pred::mppi::{
-    Model, Reference, build_reference, build_timed_reference, command_from_controls, eased_lateral,
+    Choice, Model, Reference, build_reference, build_timed_reference, command_from_controls, eased_lateral,
     current_lateral_speed, current_speed, prepare, speed_at_arc_length, update_turn_in_place,
 };
 use crate::types::{
@@ -99,6 +99,9 @@ pub struct IlqrFollower {
     shift_accum: f64,
     /// Side obstacles were last passed on: +1 left, −1 right, 0 none.
     side: f64,
+    /// Side and pace of the last way past the obstacles ahead, see
+    /// `plan_avoidance`.
+    avoid: Choice,
     last_iterations: usize,
     last_cost: f64,
     trajectory: Option<Trajectory>,
@@ -408,6 +411,7 @@ impl IlqrFollower {
             debug: DebugFrame::default(),
             shift_accum: 0.0,
             side: 0.0,
+            avoid: Choice::default(),
             last_iterations: 0,
             last_cost: 0.0,
             trajectory: None,
@@ -516,10 +520,18 @@ impl Controller for IlqrFollower {
             ),
         };
         let footprint = footprint_discs(constraints);
-        let reach = footprint.iter().map(|d| d.1).fold(0.0_f64, f64::max);
         let discs: Vec<(f64, f64)> = footprint.into_iter().map(|(off, r)| (off + model.axle_offset, r)).collect();
         let obstacles: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
-        let guides = guided(&mut reference, obstacles, reach, cfg.dt, constraints);
+        let along = crate::pred::mppi::Along {
+            path: &self.base.path,
+            cum: &self.cursor.cum,
+            trajectory: self.trajectory.as_ref(),
+            clock: self.clock,
+            from: prep.proj.arc_length,
+        };
+        let robot = (state.pose.point.x, state.pose.point.y, crate::core::math::yaw_of(&state.pose));
+        let speed = cfg.ref_velocity.min(constraints.max_linear_velocity);
+        let guides = guided(&mut reference, &along, obstacles, cfg.dt, speed, constraints, robot, &mut self.avoid);
         let kept = crate::pred::mppi::with_body_room(obstacles, constraints);
         let obstacles: &[Obstacle] = &kept;
         let field = BarrierField::new(obstacles, &discs, model.dt, 1.0, cfg.weight_obstacle, cfg.obstacle_scale);

@@ -19,7 +19,7 @@ use crate::core::kinematics::planning;
 use crate::core::obstacles::{CollisionChecker, robot_radius};
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
-    Along, CostWeights, Model, Swerve, Track, plan_avoidance, command_from_controls, current_lateral_speed,
+    Along, Choice, CostWeights, Model, Swerve, Track, plan_avoidance, command_from_controls, current_lateral_speed,
     correlated_noise, current_speed, detour_relax, effective_sample_size, guide_paths, left_by, pursue, savitzky_golay,
     importance_weights, integrated_noise, prepare, speed_at_arc_length, update_turn_in_place,
 };
@@ -164,7 +164,7 @@ pub struct SocFollower {
     shift_accum: f64,
     /// Side (+1 left, −1 right, 0 none) and pace of the last way past the
     /// obstacles ahead: see `plan_avoidance`.
-    avoid: (f64, f64),
+    avoid: Choice,
     debug_level: DebugLevel,
     debug: DebugFrame,
     trajectory: Option<Trajectory>,
@@ -270,7 +270,7 @@ impl SocFollower {
             last_v: 0.0,
             last_vy: 0.0,
             shift_accum: 0.0,
-            avoid: (0.0, 1.0),
+            avoid: Choice::default(),
             debug_level: DebugLevel::Off,
             debug: DebugFrame::default(),
             trajectory: None,
@@ -470,7 +470,7 @@ impl Controller for SocFollower {
         let swerve = Swerve::of(constraints, speed.max(v_now.abs()));
         let robot = (state.pose.point.x, state.pose.point.y, crate::core::math::yaw_of(&state.pose));
         let plan = if obstacles.is_empty() {
-            self.avoid = (0.0, 1.0);
+            self.avoid = Choice::default();
             None
         } else {
             Some(plan_avoidance(&along, obstacles, robot_radius(constraints), swerve, n, cfg.dt, speed.max(v_now.abs()), robot, &mut self.avoid))

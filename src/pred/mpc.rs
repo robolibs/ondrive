@@ -7,11 +7,11 @@
 
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::planning;
-use crate::core::obstacles::{BarrierField, CollisionChecker, footprint_discs};
+use crate::core::obstacles::{BarrierField, CollisionChecker, footprint_discs, robot_radius};
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
-    CostWeights, Model, Reference, Resume, build_reference, build_timed_reference, command_from_controls,
-    current_lateral_speed, current_speed, prepare, rollout, rollout_resumed, speed_at_arc_length,
+    Along, Choice, CostWeights, Model, Reference, Resume, Swerve, build_reference, build_timed_reference, command_from_controls,
+    current_lateral_speed, current_speed, plan_avoidance, prepare, rollout, rollout_resumed, speed_at_arc_length,
     update_turn_in_place,
 };
 use crate::types::{
@@ -96,6 +96,9 @@ pub struct MpcFollower {
     shift_accum: f64,
     /// Side obstacles were last passed on: +1 left, −1 right, 0 none.
     side: f64,
+    /// Side and pace of the last way past the obstacles ahead, see
+    /// `plan_avoidance`.
+    avoid: Choice,
     trajectory: Option<Trajectory>,
     clock: f64,
 }
@@ -150,31 +153,41 @@ pub(crate) fn actuated_after(model: &Model, previous: Option<f64>, command: f64,
 }
 
 /// The references to solve against, each with the side it passes
-/// obstacles on (0 none): `reference`; its detours round the obstacles on
-/// either side, each met where it is predicted at the reference's own time,
-/// ramped as the machine of `constraints` can swerve, `reference` relaxed
-/// where they leave it (topology-guided MPC, de Groot et al. 2024); and,
-/// wherever it meets an obstacle, the reference at `PACES` of its pace (the
-/// same idea over time instead of space). Every one is solved against every
-/// obstacle and the cheapest is driven.
-pub(crate) fn guided(reference: &mut Reference, obstacles: &[Obstacle], reach: f64, dt: f64, constraints: &RobotConstraints) -> Vec<Guide> {
-    let speed = reference.v.iter().copied().fold(0.0_f64, |a, v| a.max(v.abs()));
-    let swerve = crate::pred::mppi::Swerve::of(constraints, speed);
-    let detours: Vec<Guide> = [1.0, -1.0]
-        .into_iter()
-        .filter_map(|side| {
-            reference.detour(obstacles, reach + DETOUR_MARGIN, dt, side, DETOUR_RAMP, swerve).map(|r| Guide { reference: r, side })
-        })
-        .collect();
-    reference.relax_where_detoured(detours.iter().map(|d| &d.reference), DETOURED_WEIGHT);
-    // Wherever the reference meets an obstacle, standing or moving, slower
-    // paces are solved too: the way past it before or after it is there.
-    let paced: Vec<Guide> = if detours.is_empty() {
-        Vec::new()
-    } else {
-        PACES.iter().map(|s| Guide { reference: reference.paced(*s), side: 0.0 }).collect()
-    };
-    std::iter::once(Guide { reference: reference.clone(), side: 0.0 }).chain(detours).chain(paced).collect()
+/// obstacles on (0 none): `reference`, and, where obstacles are met, the
+/// way past them that the avoidance planner shared with MPPI (`plan_avoidance`)
+/// picks over space and time, its side and pace, cut to `reference`'s length,
+/// `reference` relaxed where that way leaves it (topology-guided MPC, de
+/// Groot et al. 2024: a guidance planner picks the way, the solve refines
+/// it). Both are solved against every obstacle and the cheaper is driven.
+/// `last` is the planner's (side, pace), kept across ticks.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn guided(
+    reference: &mut Reference,
+    along: &Along,
+    obstacles: &[Obstacle],
+    dt: f64,
+    speed: f64,
+    constraints: &RobotConstraints,
+    robot: (f64, f64, f64),
+    last: &mut crate::pred::mppi::Choice,
+) -> Vec<Guide> {
+    let len = reference.x.len();
+    if obstacles.is_empty() || len < 2 {
+        *last = crate::pred::mppi::Choice::default();
+        return vec![Guide { reference: reference.clone(), side: 0.0 }];
+    }
+    let swerve = Swerve::of(constraints, speed);
+    let plan = plan_avoidance(along, obstacles, robot_radius(constraints), swerve, len - 1, dt, speed, robot, last);
+    let way = plan.guide.as_ref().map(|g| g.cut(len));
+    if let Some(g) = &way {
+        reference.relax_where_detoured(std::iter::once(g), DETOURED_WEIGHT);
+    }
+    let plain = Guide { reference: reference.clone(), side: 0.0 };
+    match way {
+        Some(g) => vec![plain, Guide { reference: g, side: last.side }],
+        None if plan.pace < 1.0 => vec![plain, Guide { reference: plan.reference.cut(len), side: 0.0 }],
+        None => vec![plain],
+    }
 }
 
 /// A reference to solve against: the side it passes obstacles on (+1 left,
@@ -184,9 +197,6 @@ pub(crate) struct Guide {
     pub side: f64,
 }
 
-/// Shares of the reference's pace also solved for wherever it meets an
-/// obstacle.
-const PACES: [f64; 3] = [0.6, 0.3, 0.0];
 
 /// Control channel `k` of `controls`: steering, acceleration, lateral
 /// acceleration.
@@ -284,6 +294,7 @@ impl MpcFollower {
             debug: DebugFrame::default(),
             shift_accum: 0.0,
             side: 0.0,
+            avoid: Choice::default(),
             trajectory: None,
             clock: 0.0,
             mpc_config: cfg,
@@ -478,7 +489,6 @@ impl Controller for MpcFollower {
 
         let discs = footprint_discs(constraints);
         let obstacles: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
-        let reach = discs.iter().map(|d| d.1).fold(0.0_f64, f64::max);
         let kept = crate::pred::mppi::with_body_room(obstacles, constraints);
         let checker = CollisionChecker::new(world, constraints, 0.0);
         let grid = world.is_some_and(|w| w.grid.is_some());
@@ -492,7 +502,16 @@ impl Controller for MpcFollower {
             c
         };
 
-        let guides = guided(&mut reference, obstacles, reach, cfg.dt, constraints);
+        let along = crate::pred::mppi::Along {
+            path: &self.base.path,
+            cum: &self.cursor.cum,
+            trajectory: self.trajectory.as_ref(),
+            clock: self.clock,
+            from: prep.proj.arc_length,
+        };
+        let robot = (state.pose.point.x, state.pose.point.y, crate::core::math::yaw_of(&state.pose));
+        let speed = cfg.ref_velocity.min(constraints.max_linear_velocity);
+        let guides = guided(&mut reference, &along, obstacles, cfg.dt, speed, constraints, robot, &mut self.avoid);
         let mut best: Option<(f64, f64, Controls)> = None;
         let mut tried: Vec<(Vec<Point>, f64)> = Vec::new();
         if self.debug_level >= DebugLevel::Basic {

@@ -287,27 +287,6 @@ impl Reference {
         self.lateral.get(i).copied().unwrap_or(1.0)
     }
 
-    /// This reference driven at `share` of its pace: point `i` is the one it
-    /// reached at `share · i`, interpolated, and its speeds scaled.
-    pub fn paced(&self, share: f64) -> Reference {
-        let n = self.x.len();
-        let at = |v: &[f64], u: f64| -> f64 {
-            let k = (u.floor() as usize).min(n.saturating_sub(2));
-            let f = (u - k as f64).clamp(0.0, 1.0);
-            if n < 2 { v.first().copied().unwrap_or(0.0) } else { v[k] + f * (v[k + 1] - v[k]) }
-        };
-        let mut out = self.clone();
-        for i in 0..n {
-            let u = share * i as f64;
-            out.x[i] = at(&self.x, u);
-            out.y[i] = at(&self.y, u);
-            let k = (u.round() as usize).min(n - 1);
-            out.yaw[i] = self.yaw[k];
-            out.v[i] = share * self.v[k];
-        }
-        out
-    }
-
     pub fn allow_at(&self, i: usize) -> f64 {
         self.allow.get(i).copied().unwrap_or(0.0)
     }
@@ -400,8 +379,15 @@ impl Reference {
         let (back, front, half, _) = swerve.keep(0.0);
         let side_room = if swerve.body.is_some() { half } else { swerve.disc };
         let pad = side_room + back.abs().max(front.abs()) + cap;
+        // Heading along a chord of at least `HEADING_CHORD` about each point,
+        // as the body sits over it, not along its nearest neighbours.
+        let chord = HEADING_CHORD.max(0.5 * (front - back));
         let heading = |i: usize| {
-            let (a, b) = (i.saturating_sub(1), (i + 1).min(n - 1));
+            let (mut a, mut b) = (i, i);
+            while (self.x[b] - self.x[a]).hypot(self.y[b] - self.y[a]) < chord && (a > 0 || b + 1 < n) {
+                a = a.saturating_sub(1);
+                b = (b + 1).min(n - 1);
+            }
             if b > a { (self.y[b] - self.y[a]).atan2(self.x[b] - self.x[a]) } else { self.yaw[i] }
         };
         let mut least = cap;
@@ -658,6 +644,50 @@ impl Reference {
     /// `guides` leaves this reference, up to the guide's offset there plus a
     /// margin, so going round is not charged as tracking error but going
     /// further round than that is.
+    /// This reference moved sideways onto the polyline `way` (world
+    /// points): each point along its normal to where that crosses `way`,
+    /// the nearest crossing within `LAY_REACH`; points past where `way`
+    /// reaches keep the shift of the last point that met it. `None` when no
+    /// point meets it.
+    pub fn laid_along(&self, way: &[(f64, f64)]) -> Option<Reference> {
+        if way.len() < 2 {
+            return None;
+        }
+        let cross = |a: (f64, f64), b: (f64, f64)| a.0 * b.1 - a.1 * b.0;
+        let mut out = self.clone();
+        let (mut held, mut met) = (0.0, false);
+        for i in 0..self.x.len() {
+            let (s, c) = self.yaw[i].sin_cos();
+            let (p, n) = ((self.x[i], self.y[i]), (-s, c));
+            let mut best: Option<f64> = None;
+            for w in way.windows(2) {
+                let e = (w[1].0 - w[0].0, w[1].1 - w[0].1);
+                let ne = cross(n, e);
+                if ne.abs() < 1e-9 {
+                    continue;
+                }
+                let q = (w[0].0 - p.0, w[0].1 - p.1);
+                let (d, u) = (cross(q, e) / ne, cross(q, n) / ne);
+                if (0.0..=1.0).contains(&u) && d.abs() <= LAY_REACH && best.is_none_or(|b| d.abs() < b.abs()) {
+                    best = Some(d);
+                }
+            }
+            if let Some(d) = best {
+                (held, met) = (d, true);
+            }
+            out.x[i] = self.x[i] + n.0 * held;
+            out.y[i] = self.y[i] + n.1 * held;
+        }
+        out.lateral.clear();
+        met.then_some(out)
+    }
+
+    /// This reference's first `len` points, or all of it when shorter.
+    pub fn cut(&self, len: usize) -> Reference {
+        let first = |v: &Vec<f64>| v[..v.len().min(len)].to_vec();
+        Reference { x: first(&self.x), y: first(&self.y), yaw: first(&self.yaw), v: first(&self.v), lateral: first(&self.lateral), allow: first(&self.allow) }
+    }
+
     pub fn relax_where_detoured<'a>(&mut self, guides: impl IntoIterator<Item = &'a Reference>, scale: f64) {
         let mut lateral = vec![1.0; self.x.len()];
         let mut allow = vec![0.0; self.x.len()];
@@ -1214,7 +1244,7 @@ pub struct MppiFollower {
     last_steer: f64,
     /// Side (+1 left, −1 right, 0 none) and pace of the last way past the
     /// obstacles ahead: see `plan_avoidance`.
-    avoid: (f64, f64),
+    avoid: Choice,
     /// The detour taken round the obstacles ahead, pursued by one sample.
     guide: Vec<(f64, f64)>,
     /// A threaded guide the corridor is laid along instead of the path.
@@ -1259,7 +1289,7 @@ impl MppiFollower {
         speed: f64,
     ) -> (Vec<(f64, f64, f64)>, f64) {
         if obstacles.is_empty() {
-            self.avoid = (0.0, 1.0);
+            self.avoid = Choice::default();
             return (Vec::new(), 1.0);
         }
         let from = match &self.trajectory {
@@ -1324,7 +1354,7 @@ impl MppiFollower {
             cursor: PathCursor::default(),
             lambda: cfg.temperature.max(1e-6),
             last_steer: 0.0,
-            avoid: (0.0, 1.0),
+            avoid: Choice::default(),
             guide: Vec::new(),
             follow: Vec::new(),
             debug_level: DebugLevel::Off,
@@ -2320,6 +2350,32 @@ fn near_cost(g: &Reference, obstacles: &[Obstacle], reach: f64, step: f64, swerv
     (least >= GUIDE_CONTACT).then(|| NEAR_COST * ((keep - least) / keep).max(0.0).powi(2))
 }
 
+/// The way past the obstacles last chosen, kept across ticks: the side it
+/// passes them on (+1 left, −1 right, 0 none), its pace, where it runs in
+/// the world, and whether it was threaded past everything round.
+#[derive(Clone, Debug)]
+pub(crate) struct Choice {
+    pub side: f64,
+    pub pace: f64,
+    pub way: Vec<(f64, f64)>,
+    pub threaded: bool,
+}
+
+impl Default for Choice {
+    fn default() -> Self {
+        Choice { side: 0.0, pace: 1.0, way: Vec::new(), threaded: false }
+    }
+}
+
+/// Factor on the cost of the way chosen last tick, carried on: another is
+/// taken only when cheaper by more than this (T-MPC's consistency, de Groot
+/// et al. 2024).
+const CONSISTENCY: f64 = 0.75;
+/// Metres sideways a reference point looks for the way carried on.
+const LAY_REACH: f64 = 10.0;
+/// Least chord, metres, a candidate way's heading is read over.
+const HEADING_CHORD: f64 = 1.0;
+
 /// How to get past the obstacles ahead: the share of the reference speed
 /// to drive at, the reference ahead at that pace, and the detour of it to
 /// steer by, if any.
@@ -2353,7 +2409,7 @@ pub(crate) fn plan_avoidance(
     step: f64,
     speed: f64,
     robot: (f64, f64, f64),
-    last: &mut (f64, f64),
+    last: &mut Choice,
 ) -> Avoidance {
     use crate::pred::mpc::SIDE_SWITCH_COST;
     let (_, _, half, _) = swerve.keep(reach);
@@ -2371,9 +2427,9 @@ pub(crate) fn plan_avoidance(
     for &pace in paces {
         let reference = along.reference((far as f64 / pace).ceil() as usize, step, speed * pace);
         let (first, room) = nearest_cluster(&reference, obstacles, room_kept, step, swerve, width);
-        let mut options: Vec<(f64, f64, Option<Reference>, bool)> = Vec::new();
+        let mut options: Vec<(f64, f64, Option<Reference>, bool, bool)> = Vec::new();
         if first.is_empty() {
-            options.push((0.0, 0.0, None, false));
+            options.push((0.0, 0.0, None, false, false));
         } else {
             let offset = match (reference.x.first(), reference.y.first(), reference.yaw.first()) {
                 (Some(&x), Some(&y), Some(&yaw)) => -(robot.0 - x) * yaw.sin() + (robot.1 - y) * yaw.cos(),
@@ -2407,16 +2463,27 @@ pub(crate) fn plan_avoidance(
                     // the obstacles, or is already swerving onto, is not begun
                     // too late.
                     let gap = guide_gap(&reference, &points, (robot.0, robot.1));
-                    let onto = s == last.0 || swerve.length(gap) < room;
+                    let onto = s == last.side || swerve.length(gap) < room;
                     let late = if onto { 0.0 } else { LATE_COST * (gap - SWERVE_SLACK).max(0.0) };
                     let wide = widest + (widest - width).max(0.0).powi(2) / width;
-                    options.push((s, wide + late + near, Some(g), threads));
+                    options.push((s, wide + late + near, Some(g), threads, false));
+                }
+            }
+            // The way chosen last tick, carried on where it still stays clear.
+            if (pace - last.pace).abs() < 1e-9 && last.side != 0.0 {
+                let carried = reference.laid_along(&last.way).and_then(|g| near_cost(&g, obstacles, room_kept, step, swerve).map(|c| (g, c)));
+                if let Some((g, near)) = carried {
+                    let widest = (0..g.x.len()).map(|i| (g.x[i] - reference.x[i]).hypot(g.y[i] - reference.y[i])).fold(0.0_f64, f64::max);
+                    let wide = widest + (widest - width).max(0.0).powi(2) / width;
+                    options.push((last.side, wide + near, Some(g), last.threaded, true));
                 }
             }
         }
-        for (s, shift, guide, threaded) in options {
-            let kept = (s == last.0 || last.0 == 0.0) && (pace - last.1).abs() < 1e-9;
-            let cost = (shift + PACE_COST * (1.0 - pace)) * if kept { 1.0 } else { SIDE_SWITCH_COST };
+        for (s, shift, guide, threaded, carried) in options {
+            let kept = (s == last.side || last.side == 0.0) && (pace - last.pace).abs() < 1e-9;
+            let cost = (shift + PACE_COST * (1.0 - pace))
+                * if kept { 1.0 } else { SIDE_SWITCH_COST }
+                * if carried { CONSISTENCY } else { 1.0 };
             if best.as_ref().is_none_or(|b| cost < b.0) {
                 best = Some((cost, s, Avoidance { pace, reference: reference.clone(), guide, threaded }));
             }
@@ -2424,12 +2491,13 @@ pub(crate) fn plan_avoidance(
     }
     match best {
         Some((_, s, a)) => {
-            *last = (s, a.pace);
+            let way = a.guide.as_ref().map_or(Vec::new(), |g| (0..g.x.len()).map(|i| (g.x[i], g.y[i])).collect());
+            *last = Choice { side: s, pace: a.pace, way, threaded: a.threaded };
             a
         }
         None => {
             let pace = *paces.last().unwrap_or(&1.0);
-            *last = (0.0, pace);
+            *last = Choice { pace, ..Choice::default() };
             Avoidance { pace, reference: along.reference(far, step, speed), guide: None, threaded: false }
         }
     }
@@ -2630,10 +2698,10 @@ mod tests {
         let gates = [gate(0, 12.0, 0.8), gate(1, 32.0, -0.8)];
         let reach = crate::core::obstacles::robot_radius(&c);
         let along = Along { path: &path, cum: &cum, trajectory: None, clock: 0.0, from: 19.0 };
-        let mut last = (-1.0, 1.0);
+        let mut last = super::Choice { side: -1.0, ..Default::default() };
         let plan = plan_avoidance(&along, &gates, reach, Swerve::of(&c, 1.0), 30, 0.2, 1.0, (19.0, -1.2, 0.0), &mut last);
         assert!(plan.guide.is_some(), "no detour round the next gate");
-        assert_eq!(last.0, 1.0, "the gate on the right is passed on the left, not round the far side");
+        assert_eq!(last.side, 1.0, "the gate on the right is passed on the left, not round the far side");
     }
 
     #[test]
@@ -2658,7 +2726,7 @@ mod tests {
         };
         let mover = Obstacle { id: 0, radius: 0.5, modes: vec![mode], dt };
         let reach = crate::core::obstacles::robot_radius(&c);
-        let mut last = (0.0, 1.0);
+        let mut last = super::Choice::default();
         let plan = plan_avoidance(&along, &[mover], reach, Swerve::of(&c, 1.0), 30, 0.2, 1.0, (0.0, 0.0, 0.0), &mut last);
         assert!(plan.guide.is_some(), "no way past, pace {}", plan.pace);
         assert!(plan.pace >= 0.75, "pace {}", plan.pace);
