@@ -741,9 +741,10 @@ impl Tracker {
     }
 
     /// For a kind that follows paths on a platform that may reverse, the
-    /// caller's path split round its first turn tighter than the platform
-    /// steers (`manoeuvre::split_at_tight`): the run up to it is driven, the
-    /// turn itself by `drive_turn`, then the rest; checked once a path.
+    /// first turn of the caller's path tighter than the platform steers
+    /// (`manoeuvre::split_at_tight`), kept to be driven by `drive_turn` once
+    /// the controller, following the whole path into it, can go no further;
+    /// checked once a path.
     fn manoeuvre(&mut self, state: &RobotState, _world: Option<&WorldConstraints>) {
         if self.manoeuvred || self.planned_for.is_some() || self.trajectory.is_some() || self.kind.is_point_controller() {
             return;
@@ -755,30 +756,97 @@ impl Tracker {
         let Some((before, target, rest)) = manoeuvre::split_at_tight(path, tightest) else {
             return;
         };
+        let length = |p: &Path| cumulative_lengths(&p.waypoints).last().copied().unwrap_or(0.0);
+        let bend = (length(&before) + tightest).min(length(path));
         let from = before.waypoints.last().copied().unwrap_or(state.pose);
         let wanted = crate::core::math::normalize_angle(target.rotation.to_euler().yaw - from.rotation.to_euler().yaw);
         let (s, c) = from.rotation.to_euler().yaw.sin_cos();
         let across = c * (target.point.y - from.point.y) - s * (target.point.x - from.point.x);
         let side = if wanted.abs() > TURN_ABOUT { across.signum() } else { wanted.signum() };
-        self.drive(before);
-        self.turn = Some(Turn { from, target, rest, side, dir: 1.0, ..Turn::default() });
+        self.turn = Some(Turn { target, rest, side, dir: 1.0, bend, ..Turn::default() });
     }
 
-    /// Once the run up to a turn tighter than the machine steers is driven,
-    /// or the machine stands within the stop tolerance of its end or past it,
-    /// the turn itself: the one `manoeuvre::plan_turn` picks from the
-    /// turners, where one keeps clear, else in legs at full lock
-    /// (`drive_legs`). `None` while the controller drives.
-    fn drive_turn(&mut self, state: &RobotState, world: Option<&WorldConstraints>, dt: f64) -> Option<VelocityCommand> {
-        let reach = self.stop_tolerance();
+    /// Whether the machine, following the path, has come within the wheels'
+    /// swing to lock at turn speed of where it turns tighter than the machine
+    /// steers.
+    fn at_bend(&mut self, state: &RobotState) -> bool {
+        let c = &self.constraints;
+        let speed = (TURN_SPEED_SHARE * c.max_linear_velocity.abs()).clamp(TURN_SPEED_MIN, TURN_SPEED_MAX);
+        let rate = if c.max_steering_rate > 0.0 { c.max_steering_rate } else { TURN_STEER_RATE };
+        let lead = c.max_steering_angle.abs() / rate * speed;
+        let (Some(path), Some(turn)) = (self.path.as_ref(), self.turn.as_mut()) else {
+            return false;
+        };
+        let Some(proj) = self.cursor.project(&path.waypoints, state.pose.point, turn.seen) else {
+            return self.path_completed;
+        };
+        turn.seen = proj.segment;
+        self.path_completed || proj.arc_length >= turn.bend - lead
+    }
+
+    /// Into the bend the path turns tighter than the machine steers: forward
+    /// at full lock its way round, as far as the body, stopping, keeps
+    /// `TURN_ROOM_M` from every obstacle that stays put. `None` once that far,
+    /// the turn then planned from where the machine stops, or with the turn
+    /// handed back to the controller where the machine got round facing on.
+    fn drive_into_bend(&mut self, state: &RobotState, world: Option<&WorldConstraints>) -> Option<VelocityCommand> {
+        let c = &self.constraints;
+        let radius = manoeuvre::tightest(c)?;
+        let speed = (TURN_SPEED_SHARE * c.max_linear_velocity.abs()).clamp(TURN_SPEED_MIN, TURN_SPEED_MAX);
+        let a = c.max_linear_acceleration.abs().max(0.1);
+        let units = match self.controller.get_config().output_units {
+            OutputUnits::Physical => (1.0, 1.0),
+            OutputUnits::Normalized => (c.max_linear_velocity.max(1e-6), c.max_angular_velocity.max(1e-6)),
+        };
         let turn = self.turn.as_mut()?;
-        let end = turn.from.point;
-        let (s, c) = turn.from.rotation.to_euler().yaw.sin_cos();
-        let past = (state.pose.point.x - end.x) * c + (state.pose.point.y - end.y) * s;
-        turn.started |= self.path_completed || state.pose.point.distance_to_2d(end) < reach || past > 0.0;
-        if !turn.started {
+        let yaw = state.pose.rotation.to_euler().yaw;
+        let left = (turn.side * (crate::core::math::yaw_of(&turn.target) - yaw)).rem_euclid(std::f64::consts::TAU);
+        let rolling = if state.velocity_valid { state.velocity.linear } else { 0.0 };
+        let stopping = rolling * rolling / (2.0 * a);
+        if left < TURN_FACING + stopping / radius || left > std::f64::consts::TAU - TURN_PAST {
+            return self.finish_turn(0.0);
+        }
+        let curvature = turn.side / radius;
+        let standing = manoeuvre::standing(world);
+        let checker = CollisionChecker::new(Some(&standing), c, 0.0);
+        let here = (state.pose.point.x, state.pose.point.y, yaw);
+        let ahead = stopping.max(speed * speed / (2.0 * a)) + TURN_MARGIN_M;
+        if swept(&checker, here, ahead, curvature, TURN_ROOM_M, crate::core::kinematics::axle_offset(c)).is_none() {
+            turn.entered = true;
+            turn.braking = true;
             return None;
         }
+        Some(VelocityCommand {
+            valid: true,
+            linear_velocity: speed / units.0,
+            angular_velocity: speed * curvature / units.1,
+            steering_angle: curvature_to_steering(curvature, c),
+            status_message: "Turning: into the bend".to_string(),
+            ..Default::default()
+        })
+    }
+
+    /// Once the machine, following the path, comes to where it turns tighter
+    /// than the machine steers, the turn itself: on into the bend as far as
+    /// it can (`drive_into_bend`), then the one `manoeuvre::plan_turn` picks from
+    /// the turners from where it stops, where one keeps clear, else in legs
+    /// at full lock (`drive_legs`). `None` while the controller drives.
+    fn drive_turn(&mut self, state: &RobotState, world: Option<&WorldConstraints>, dt: f64) -> Option<VelocityCommand> {
+        let reach = self.stop_tolerance();
+        if !self.turn.as_ref()?.started {
+            let there = self.at_bend(state);
+            self.turn.as_mut()?.started = there;
+            if !there {
+                return None;
+            }
+        }
+        if !self.turn.as_ref()?.entered {
+            let cmd = self.drive_into_bend(state, world);
+            if cmd.is_some() || self.turn.is_none() {
+                return cmd;
+            }
+        }
+        let turn = self.turn.as_ref()?;
         if !turn.fallback {
             let cmd = self.drive_planned(state, world, dt, reach);
             if cmd.is_some() || self.turn.is_none() {
@@ -2019,10 +2087,14 @@ struct Turn {
     piece: usize,
     piece_done: bool,
     stops: usize,
+    /// Metres along the path the turn starts, the segment the machine was
+    /// last seen on, and whether the machine has
+    /// gone into it as far as it can.
+    bend: f64,
+    seen: usize,
+    entered: bool,
     /// Whether the turn is driven in legs, no planned one keeping clear.
     fallback: bool,
-    /// Where the run up to the turn ends.
-    from: Pose,
     /// Pose past the turn, facing the path on.
     target: Pose,
     /// The path past the turn.
