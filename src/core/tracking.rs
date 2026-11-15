@@ -37,6 +37,10 @@ pub struct TrackingConfig {
     /// Prediction steps given out, and seconds between them.
     pub horizon_steps: usize,
     pub step: f64,
+    /// Squared Mahalanobis distance of the velocity estimate from rest
+    /// below which an obstacle is predicted to stay where it is
+    /// (chi-square, two degrees of freedom, 95%).
+    pub motion_gate: f64,
     /// Standard deviation, metres per metre an obstacle is predicted to
     /// travel, added to its predicted spread.
     pub motion_spread: f64,
@@ -54,6 +58,7 @@ impl Default for TrackingConfig {
             max_age: 1.0,
             horizon_steps: 30,
             step: 0.2,
+            motion_gate: 5.99,
             motion_spread: 0.15,
             radius_gain: 0.2,
         }
@@ -109,6 +114,17 @@ impl Track {
             p[vel][vel] += c;
         }
         (s, p)
+    }
+
+    /// Squared Mahalanobis distance of the velocity estimate from rest.
+    fn moving(&self) -> f64 {
+        let (a, b, c, d) = (self.p[2][2], self.p[2][3], self.p[3][2], self.p[3][3]);
+        let det = a * d - b * c;
+        if det <= 0.0 {
+            return f64::INFINITY;
+        }
+        let (vx, vy) = (self.s[2], self.s[3]);
+        (d * vx * vx - (b + c) * vx * vy + a * vy * vy) / det
     }
 
     /// Innovation and its covariance for a detection at `(x, y)`.
@@ -263,6 +279,23 @@ impl ObstacleTracker {
         self.tracks
             .iter()
             .map(|t| {
+                // An obstacle whose velocity is not told apart from rest by
+                // its own covariance is predicted to stay where it is.
+                let still = {
+                    let mut s = t.clone();
+                    if t.moving() < cfg.motion_gate {
+                        (s.s[2], s.s[3]) = (0.0, 0.0);
+                        for i in 0..4 {
+                            for j in 0..4 {
+                                if i >= 2 || j >= 2 {
+                                    s.p[i][j] = 0.0;
+                                }
+                            }
+                        }
+                    }
+                    s
+                };
+                let t = &still;
                 let at: Vec<([f64; 4], [[f64; 4]; 4])> = (0..=cfg.horizon_steps).map(|k| t.ahead(k as f64 * step, 0.0)).collect();
                 let speed = t.s[2].hypot(t.s[3]);
                 let grown = |k: usize, var: f64| var.max(0.0).sqrt() + cfg.motion_spread.max(0.0) * speed * k as f64 * step;
@@ -322,6 +355,19 @@ mod tests {
         }
         let (vx, vy) = tr.velocity(1).expect("tracked");
         assert!(vx.hypot(vy) < 0.1, "speed {:.3}", vx.hypot(vy));
+    }
+
+    #[test]
+    fn a_noisy_standing_post_is_predicted_to_stay_put() {
+        let mut tr = ObstacleTracker::new(TrackingConfig::default());
+        let mut seed = 23u64;
+        for k in 0..80 {
+            tr.update(0.05 * k as f64, &[Detection { id: Some(1), x: 5.0 + noise(&mut seed), y: 2.0 + noise(&mut seed), radius: 0.5 }]);
+        }
+        let m = &tr.obstacles()[0].modes[0];
+        let drift = (m.mean_x[30] - m.mean_x[0]).hypot(m.mean_y[30] - m.mean_y[0]);
+        assert!(drift < 1e-9, "drifts {drift:.3} m in 6 s");
+        assert!(m.std_x[30] < 0.1, "spread {:.3} m after 6 s", m.std_x[30]);
     }
 
     #[test]
