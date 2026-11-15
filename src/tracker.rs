@@ -3,6 +3,7 @@ use crate::core::kinematics::{
     actuation_delay, braked_for_bends, can_turn_in_place, curvature_to_steering, is_ackermann, is_holonomic, path_speed, stop,
     wheelbase,
 };
+use crate::core::manoeuvre;
 use crate::core::obstacles::CollisionChecker;
 use crate::core::path::{
     PathCursor, PathProjection, cumulative_lengths, curvature_at_arc_length, curvature_at_projection, cusp_after, end_heading,
@@ -152,6 +153,9 @@ pub struct Tracker {
     /// Goal pose `(x, y, yaw)` the installed path was planned to, when the
     /// tracker planned it for a goal on its own.
     planned_for: Option<(f64, f64, f64)>,
+    /// Whether the caller's path has been checked for turns tighter than
+    /// the machine steers, to drive in more than one go.
+    manoeuvred: bool,
     /// Control barrier filter on the final command against moving obstacles.
     safety: crate::core::safety::SafetyConfig,
     /// The caller's path while the tracker drives it detoured round standing
@@ -193,6 +197,7 @@ impl Tracker {
             last_command: None,
             stalled_for: 0.0,
             planned_for: None,
+            manoeuvred: false,
             safety: crate::core::safety::SafetyConfig { enabled: !kind.avoids_obstacles(), ..Default::default() },
             original: None,
             follow_side: 0.0,
@@ -237,6 +242,7 @@ impl Tracker {
     /// lap and never completes.
     pub fn set_path(&mut self, path: Path) {
         self.planned_for = None;
+        self.manoeuvred = false;
         self.original = None;
         self.follow_side = 0.0;
         self.trajectory = None;
@@ -438,12 +444,15 @@ impl Tracker {
             self.controller.set_time(self.clock);
         }
 
+        self.manoeuvre(state, world);
+
         // Only the obstacles the robot could meet within `CULL_LOOKOUT_S`.
         let culled = world.and_then(|w| reachable(w, state, &self.constraints));
+        let full = world;
         let world = culled.as_ref().or(world);
 
         self.next_lap(state);
-        self.plan_to_goal(state);
+        self.plan_to_goal(state, full);
         self.steer_round(state, world, dt);
         let goal = match self.resolve_goal(state, world) {
             Ok(Some(g)) => g,
@@ -702,14 +711,41 @@ impl Tracker {
         }
     }
 
+    /// Whether the machine may reverse.
+    fn reverses(&self, state: &RobotState) -> bool {
+        crate::core::kinematics::reverse_allowed(&self.controller.get_config(), state)
+    }
+
+    /// For a kind that follows paths on a platform that may reverse, the
+    /// caller's path with its turns tighter than the platform steers driven
+    /// in more than one go (`manoeuvre::repaired`) round the standing
+    /// obstacles of `world`; checked once a path.
+    fn manoeuvre(&mut self, state: &RobotState, world: Option<&WorldConstraints>) {
+        if self.manoeuvred || self.planned_for.is_some() || self.trajectory.is_some() || self.kind.is_point_controller() {
+            return;
+        }
+        self.manoeuvred = true;
+        let (Some(tightest), true, Some(path)) = (manoeuvre::tightest(&self.constraints), self.reverses(state), self.path.as_ref()) else {
+            return;
+        };
+        let standing = manoeuvre::standing(world);
+        let checker = CollisionChecker::new(Some(&standing), &self.constraints, 0.0);
+        let speed = self.constraints.max_linear_velocity.abs().max(0.1);
+        if let Some(repaired) = manoeuvre::repaired(path, tightest, speed, &checker, MANOEUVRE_ROOM_M) {
+            self.drive(repaired);
+        }
+    }
+
     /// For a kind that follows paths, or a point controller that cannot turn
     /// in place, given a goal and no path of its own, plan
     /// the shortest Dubins path from `state` to the goal, turning no
     /// tighter than the platform can (`PLANNED_TURN_RADIUS` for one that
     /// turns in place), and drive it; planned again when the goal moves.
     /// One that cannot turn in place comes at the goal along a straight of
-    /// a lookahead and the position tolerance, when that adds no loop.
-    fn plan_to_goal(&mut self, state: &RobotState) {
+    /// a lookahead and the position tolerance, when that adds no loop. One
+    /// that may reverse drives the cheapest Reeds–Shepp way clear of the
+    /// standing obstacles of `world` instead, where there is one.
+    fn plan_to_goal(&mut self, state: &RobotState, world: Option<&WorldConstraints>) {
         let Some(goal) = &self.goal else {
             return;
         };
@@ -730,6 +766,17 @@ impl Tracker {
         let key = (target.point.x, target.point.y, target.rotation.to_euler().yaw);
         if self.planned_for == Some(key) {
             return;
+        }
+        if let (Some(tightest), true) = (manoeuvre::tightest(&self.constraints), self.reverses(state)) {
+            let standing = manoeuvre::standing(world);
+            let checker = CollisionChecker::new(Some(&standing), &self.constraints, 0.0);
+            if let Some(way) = manoeuvre::way_between(&state.pose, target, tightest, &checker, MANOEUVRE_ROOM_M) {
+                let speed = self.constraints.max_linear_velocity.abs().max(0.1);
+                let speeds = way.directions.iter().map(|d| speed * *d as f64).collect();
+                self.drive(Path { waypoints: way.poses, speeds, is_closed: false });
+                self.planned_for = Some(key);
+                return;
+            }
         }
         let k = crate::core::kinematics::max_curvature(&self.constraints);
         let radius = if k.is_finite() && k > 0.0 { PLANNED_RADIUS_MARGIN / k } else { PLANNED_TURN_RADIUS };
@@ -1621,6 +1668,10 @@ const PLANNED_TURN_RADIUS: f64 = 0.5;
 const PLANNED_RADIUS_MARGIN: f64 = 1.25;
 /// Metres between the poses of a path planned to a goal.
 const PLANNED_STEP: f64 = 0.1;
+
+/// Metres a way planned in more than one go keeps the body from standing
+/// obstacles.
+const MANOEUVRE_ROOM_M: f64 = 0.6;
 /// Metres into the leg past a cusp its starting curvature is read at.
 const PRE_STEER_LOOK: f64 = 1.0;
 /// Share of the lookahead a point controller's carrot sits ahead of it.

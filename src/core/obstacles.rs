@@ -163,7 +163,7 @@ struct Split {
 
 /// Whether every mode of `obs` is predicted at the same place and spread
 /// over its whole horizon, so where it is does not depend on the time.
-fn stays_put(obs: &Obstacle) -> bool {
+pub(crate) fn stays_put(obs: &Obstacle) -> bool {
     let flat = |v: &[f64]| v.iter().all(|a| a.is_finite()) && v.windows(2).all(|w| w[0] == w[1]);
     obs.modes.iter().all(|m| flat(&m.mean_x) && flat(&m.mean_y) && flat(&m.std_x) && flat(&m.std_y))
 }
