@@ -5,8 +5,9 @@
 //! Gaussian-mixture prediction at that point's time, that falls within the
 //! combined radius of an obstacle and one of the discs covering the robot.
 //! Obstacles combine as independent events. The cost adds a soft term
-//! proportional to that probability with the discs grown by
-//! `robot_radius_margin` and, when the bare discs' probability passes
+//! proportional to that probability averaged over the discs grown by every
+//! share of `robot_radius_margin`, which rises across the margin to contact
+//! rather than at its edge, and, when the bare discs' probability passes
 //! `risk_threshold`, a hard term that is larger the sooner the collision
 //! would come, so a batch whose every rollout is at risk still prefers the
 //! one that brakes or turns away.
@@ -201,25 +202,49 @@ impl Near {
     }
 }
 
-/// Probability that a disc of `radius` at `(x, y)` meets an obstacle mode:
-/// the share of `normals`, scaled by the mode's spread, inside the combined
-/// radius.
-fn hit_probability(m: &ModeAt, x: f64, y: f64, radius: f64, normals: &[(f64, f64)]) -> f64 {
-    let reach = radius + m.radius;
+/// Probability that a disc of `radius` at `(x, y)` meets an obstacle mode,
+/// averaged over the disc grown by every share of `margin`: over `normals`,
+/// scaled by the mode's spread, the share of the margin each position is
+/// inside, 1 within the bare combined radius. Without a margin, the share of
+/// positions inside the combined radius.
+fn hit_probability(m: &ModeAt, x: f64, y: f64, radius: f64, margin: f64, normals: &[(f64, f64)]) -> f64 {
+    let bare = radius + m.radius;
+    let full = bare + margin;
     let d = (m.x - x).hypot(m.y - y);
     let spread = m.std_x.max(m.std_y);
-    if d > reach + 4.0 * spread {
+    if d > full + 4.0 * spread {
         return 0.0;
     }
-    if spread < 1e-6 {
-        return if d < reach { 1.0 } else { 0.0 };
+    let inside = |dist: f64| ((full - dist) / margin).clamp(0.0, 1.0);
+    if margin <= 0.0 {
+        if spread < 1e-6 {
+            return if d < bare { 1.0 } else { 0.0 };
+        }
+        let r2 = bare * bare;
+        let hits = normals
+            .iter()
+            .filter(|(zx, zy)| (m.x + m.std_x * zx - x).powi(2) + (m.y + m.std_y * zy - y).powi(2) < r2)
+            .count();
+        return hits as f64 / normals.len() as f64;
     }
-    let r2 = reach * reach;
-    let hits = normals
+    if spread < 1e-6 {
+        return inside(d);
+    }
+    let (b2, f2) = (bare * bare, full * full);
+    let total: f64 = normals
         .iter()
-        .filter(|(zx, zy)| (m.x + m.std_x * zx - x).powi(2) + (m.y + m.std_y * zy - y).powi(2) < r2)
-        .count();
-    hits as f64 / normals.len() as f64
+        .map(|(zx, zy)| {
+            let d2 = (m.x + m.std_x * zx - x).powi(2) + (m.y + m.std_y * zy - y).powi(2);
+            if d2 <= b2 {
+                1.0
+            } else if d2 >= f2 {
+                0.0
+            } else {
+                inside(d2.sqrt())
+            }
+        })
+        .sum();
+    total / normals.len() as f64
 }
 
 impl Controller for McaFollower {
@@ -278,7 +303,7 @@ impl Controller for McaFollower {
             .collect();
         let normals = &self.normals;
         let near: Vec<Near> = modes.iter().map(|at| Near::new(at, &discs)).collect();
-        let probability_of = |i: usize, x: f64, y: f64, yaw: f64, footprint: &[(f64, f64)]| -> f64 {
+        let probability_of = |i: usize, x: f64, y: f64, yaw: f64, grown: f64| -> f64 {
             let i = i.min(n - 1);
             let (s, c) = yaw.sin_cos();
             let near = &near[i];
@@ -288,9 +313,9 @@ impl Controller for McaFollower {
                     let k = k as usize;
                     let (mut p, mut total) = (0.0, 0.0);
                     for m in &modes[i][k] {
-                        let hit = footprint
+                        let hit = bare
                             .iter()
-                            .map(|(dx, r)| hit_probability(m, x + c * dx, y + s * dx, *r, normals))
+                            .map(|(dx, r)| hit_probability(m, x + c * dx, y + s * dx, *r, grown, normals))
                             .fold(0.0_f64, f64::max);
                         p += m.weight * hit;
                         total += m.weight;
@@ -305,8 +330,8 @@ impl Controller for McaFollower {
         let checker = CollisionChecker::new(world, constraints, margin).with_step(step);
         let (soft, hard, threshold) = (cfg.weight_soft_risk, cfg.weight_hard_risk, cfg.risk_threshold);
         let extra = |i: usize, x: f64, y: f64, yaw: f64| -> f64 {
-            let mut p = probability_of(i, x, y, yaw, &discs);
-            let mut p_hit = probability_of(i, x, y, yaw, &bare);
+            let mut p = probability_of(i, x, y, yaw, margin);
+            let mut p_hit = probability_of(i, x, y, yaw, 0.0);
             if has_grid && checker.grid_clearance(x, y, yaw) < 0.0 {
                 (p, p_hit) = (1.0, 1.0);
             }
