@@ -121,8 +121,8 @@ impl Default for MppiConfig {
             smoothing: true,
             smooth_sampling: true,
             weight_collision: 2000.0,
-            weight_repulsion: 400.0,
-            repulsion_distance: 1.0,
+            weight_repulsion: 200.0,
+            repulsion_distance: 0.4,
             safety_margin: default_safety_margin(),
         }
     }
@@ -408,6 +408,50 @@ impl Reference {
             }
         }
         least
+    }
+
+    /// How soon, at worst, a moving obstacle comes to where this reference
+    /// stands after it is there: `exp(−headway / HEADWAY_S)` for the
+    /// shortest headway over its points, the time from the point's own to
+    /// when a mode of an obstacle that moves first comes within `room` of
+    /// the body there; 0 where none comes after. Crossing a mover's path
+    /// ahead of it is dear, the sooner it arrives the dearer, behind it free.
+    fn headway(&self, obstacles: &[Obstacle], room: f64, dt: f64, swerve: Swerve) -> f64 {
+        let n = self.x.len();
+        let (back, front, half, _) = swerve.keep(0.0);
+        let body = (if swerve.body.is_some() { half } else { swerve.disc }).max(back.abs().max(front.abs()));
+        let mut worst = 0.0_f64;
+        for o in obstacles.iter().filter(|o| !crate::core::obstacles::stays_put(o)) {
+            let horizon = o.modes.iter().map(|m| m.mean_x.len().min(m.mean_y.len())).max().unwrap_or(0);
+            let h = if o.dt > 0.0 { o.dt } else { dt.max(1e-9) };
+            let steps = ((horizon.saturating_sub(1)) as f64 * h / dt.max(1e-9)).ceil() as usize;
+            // Only points within reach of where the obstacle is predicted at all.
+            let grow = o.radius.max(0.0) + body + room + o.modes.iter().flat_map(|m| m.std_x.iter().chain(&m.std_y)).fold(0.0_f64, |a, s| a.max(*s));
+            let xs = o.modes.iter().flat_map(|m| m.mean_x.iter());
+            let ys = o.modes.iter().flat_map(|m| m.mean_y.iter());
+            let (x0, x1) = xs.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(*v), b.max(*v)));
+            let (y0, y1) = ys.fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(*v), b.max(*v)));
+            for i in 0..n {
+                if self.x[i] < x0 - grow || self.x[i] > x1 + grow || self.y[i] < y0 - grow || self.y[i] > y1 + grow {
+                    continue;
+                }
+                let t = i as f64 * dt;
+                for k in i + 1..=steps {
+                    let ahead = k as f64 * dt - t;
+                    if (-ahead / HEADWAY_S).exp() <= worst {
+                        break;
+                    }
+                    let near = modes_at(o, k as f64 * dt, dt).any(|m| {
+                        (m.x - self.x[i]).hypot(m.y - self.y[i]) < body + m.radius + m.std_x.max(m.std_y) + room
+                    });
+                    if near {
+                        worst = worst.max((-ahead / HEADWAY_S).exp());
+                        break;
+                    }
+                }
+            }
+        }
+        worst
     }
 
     /// For each point, the sideways shift to `side` (+1 left, −1 right) that
@@ -967,6 +1011,9 @@ impl<'a> Model<'a> {
 /// Speed, in m/s, from which a speed and turn rate command turns Ackermann
 /// steering at its full rate.
 const STEERING_SPEED: f64 = 0.1;
+
+/// Share of the reference speed the backing sample reverses at.
+const BACKING_SHARE: f64 = 0.5;
 
 /// Roll out one control sequence and return `(cost, trajectory)`. `extra`
 /// receives `(step index, x, y, yaw)` after every integration step and
@@ -1549,6 +1596,19 @@ impl MppiFollower {
                         v += accel[t] * model.dt;
                     }
                 }
+                // Backing off on the opposite steering, which turns the
+                // heading on the way it was turning: the move between the
+                // legs of a turn in more than one go.
+                5 if model.v_min < 0.0 => {
+                    let back = model.v_min.max(-BACKING_SHARE * v_ref.abs().max(0.2));
+                    let mut v = model.v0;
+                    for t in 0..n {
+                        steer[t] = -self.mean_steering[t];
+                        accel[t] = ((back - v) / model.dt).clamp(-ab, ab);
+                        accel_lat[t] = 0.0;
+                        v += accel[t] * model.dt;
+                    }
+                }
                 _ if working.smooth_sampling => {
                     integrated_noise(&mut steer, sigma_s, &mut self.rng);
                     integrated_noise(&mut accel, sigma_a, &mut self.rng);
@@ -1595,11 +1655,11 @@ impl MppiFollower {
         let full = self.debug_level == DebugLevel::Full;
         let rolled = crate::core::parallel::map_indexed(k, |j| {
             let (s, a, al) = &drawn[j];
-            cost_of(s, a, al, full && (j < 5 || j % ROLLOUT_STRIDE == 0))
+            cost_of(s, a, al, full && (j < 6 || j % ROLLOUT_STRIDE == 0))
         });
         for (j, (c, traj)) in rolled.into_iter().enumerate() {
             costs[j] = c + gamma * control_costs[j] * model.dt;
-            if full && (j < 5 || j % ROLLOUT_STRIDE == 0) {
+            if full && (j < 6 || j % ROLLOUT_STRIDE == 0) {
                 kept.push((traj, costs[j]));
             }
         }
@@ -2433,6 +2493,13 @@ impl Default for Choice {
 /// taken only when cheaper by more than this (T-MPC's consistency, de Groot
 /// et al. 2024).
 const CONSISTENCY: f64 = 0.75;
+/// Cost, in metres of detour, of a way a moving obstacle comes to right
+/// after the robot is there, falling off over `HEADWAY_S` seconds of headway.
+const HEADWAY_COST: f64 = 30.0;
+/// Seconds of headway over which crossing ahead of a mover gets cheaper.
+const HEADWAY_S: f64 = 1.5;
+/// Metres past the body a mover counts as coming to a point.
+const HEADWAY_ROOM_M: f64 = 0.2;
 /// Metres sideways a reference point looks for the way carried on.
 const LAY_REACH: f64 = 10.0;
 /// Least chord, metres, a candidate way's heading is read over.
@@ -2528,7 +2595,8 @@ pub(crate) fn plan_avoidance(
                     let onto = s == last.side || swerve.length(gap) < room;
                     let late = if onto { 0.0 } else { LATE_COST * (gap - SWERVE_SLACK).max(0.0) };
                     let wide = widest + (widest - width).max(0.0).powi(2) / width;
-                    options.push((s, wide + late + near, Some(g), threads, false));
+                    let ahead = HEADWAY_COST * g.headway(obstacles, HEADWAY_ROOM_M, step, swerve);
+                    options.push((s, wide + late + near + ahead, Some(g), threads, false));
                 }
             }
             // The way chosen last tick, carried on at every pace where it
@@ -2538,7 +2606,8 @@ pub(crate) fn plan_avoidance(
                 if let Some((g, near)) = carried {
                     let widest = (0..g.x.len()).map(|i| (g.x[i] - reference.x[i]).hypot(g.y[i] - reference.y[i])).fold(0.0_f64, f64::max);
                     let wide = widest + (widest - width).max(0.0).powi(2) / width;
-                    options.push((last.side, wide + near, Some(g), last.threaded, true));
+                    let ahead = HEADWAY_COST * g.headway(obstacles, HEADWAY_ROOM_M, step, swerve);
+                    options.push((last.side, wide + near + ahead, Some(g), last.threaded, true));
                 }
             }
         }
@@ -2765,6 +2834,37 @@ mod tests {
         let plan = plan_avoidance(&along, &gates, reach, Swerve::of(&c, 1.0), 30, 0.2, 1.0, (19.0, -1.2, 0.0), &mut last);
         assert!(plan.guide.is_some(), "no detour round the next gate");
         assert_eq!(last.side, 1.0, "the gate on the right is passed on the left, not round the far side");
+    }
+
+    /// A mover crossing the path at x = 6, there 6.7 s from now: a way
+    /// reaching it first, 0.7 s ahead, pays for the headway; one reaching it
+    /// once the mover has gone pays nothing.
+    #[test]
+    fn crossing_ahead_of_a_mover_costs_and_behind_it_does_not() {
+        let waypoints: Vec<Pose> = (0..=40)
+            .map(|i| Pose { point: Point::new(i as f64, 0.0, 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, 0.0)) })
+            .collect();
+        let cum = crate::core::path::cumulative_lengths(&waypoints);
+        let path = Path { waypoints, speeds: Vec::new(), is_closed: false };
+        let along = Along { path: &path, cum: &cum, trajectory: None, clock: 0.0, from: 0.0 };
+        let mut c = RobotConstraints::default();
+        c.steering_type = SteeringType::Differential;
+        c.max_linear_velocity = 1.0;
+        c.footprint = Footprint::Polygon { points: vec![(0.5, 0.35), (-0.5, 0.35), (-0.5, -0.35), (0.5, -0.35)] };
+        let (steps, dt) = (60, 0.2);
+        let mode = GaussianMode {
+            weight: 1.0,
+            mean_x: vec![6.0; steps + 1],
+            mean_y: (0..=steps).map(|k| 4.0 - 0.6 * k as f64 * dt).collect(),
+            std_x: vec![0.05; steps + 1],
+            std_y: vec![0.05; steps + 1],
+        };
+        let mover = Obstacle { id: 0, radius: 0.5, modes: vec![mode], dt };
+        let swerve = Swerve::of(&c, 1.0);
+        let ahead = along.reference(100, 0.1, 1.0).headway(std::slice::from_ref(&mover), 0.5, 0.1, swerve);
+        let behind = along.reference(200, 0.1, 0.4).headway(std::slice::from_ref(&mover), 0.5, 0.1, swerve);
+        assert!(ahead > 0.5, "crossing 0.7 s ahead costs only {ahead:.2}");
+        assert_eq!(behind, 0.0, "crossing behind costs {behind:.2}");
     }
 
     #[test]
