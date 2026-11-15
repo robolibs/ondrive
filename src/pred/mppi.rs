@@ -73,14 +73,15 @@ pub struct MppiConfig {
     #[serde(default = "default_smooth_sampling")]
     pub smooth_sampling: bool,
     /// Obstacle critics against each step's predicted obstacles and the
-    /// grid: `weight_collision` for every step in
-    /// contact, `weight_repulsion · (1 − d / repulsion_distance)²` closer
+    /// grid, at clearance `d` past `safety_margin`: `weight_collision` for
+    /// every step in contact, rising to it from `weight_repulsion` across
+    /// the margin, `weight_repulsion · (1 − d / repulsion_distance)²` closer
     /// than `repulsion_distance`; 0 ignores obstacles.
     pub weight_collision: f64,
     pub weight_repulsion: f64,
     pub repulsion_distance: f64,
-    /// Room, metres, beyond the footprint that the obstacle critics count
-    /// as contact.
+    /// Room, metres, beyond the footprint over which the obstacle critics
+    /// rise to the contact cost.
     #[serde(default = "default_safety_margin")]
     pub safety_margin: f64,
 }
@@ -948,7 +949,24 @@ impl<'a> Model<'a> {
             *vy *= vyb / speed;
         }
     }
+
+    /// The steering reached a step after `actual` on commanding `target`
+    /// with acceleration `accel` from speed `v`: through the steering rate,
+    /// and for Ackermann steering only as fast as the commanded speed
+    /// carries a curvature, none at a stand.
+    pub fn steered(&self, actual: f64, target: f64, v: f64, accel: f64) -> f64 {
+        let share = if self.ackermann { ((v + accel * self.dt).clamp(self.v_min, self.v_max).abs() / STEERING_SPEED).min(1.0) } else { 1.0 };
+        if share <= 0.0 {
+            return actual;
+        }
+        let lag = self.steer_rate * self.dt * share;
+        actual + (target - actual).clamp(-lag, lag)
+    }
 }
+
+/// Speed, in m/s, from which a speed and turn rate command turns Ackermann
+/// steering at its full rate.
+const STEERING_SPEED: f64 = 0.1;
 
 /// Roll out one control sequence and return `(cost, trajectory)`. `extra`
 /// receives `(step index, x, y, yaw)` after every integration step and
@@ -1013,7 +1031,6 @@ pub(crate) fn rollout_resumed(
     let (first, at) = from.map_or((0, Resume::start(model)), |(i, r)| (i, *r));
     let (mut x, mut y, mut yaw, mut v, mut vy) = (at.x, at.y, at.yaw, at.v, at.vy);
     let mut actual = at.actual;
-    let lag = model.steer_rate * model.dt;
     let mut traj = Vec::new();
     if collect {
         traj.reserve(n + 1);
@@ -1028,7 +1045,7 @@ pub(crate) fn rollout_resumed(
         let s = steer[i].clamp(-sb, sb);
         let a = accel[i].clamp(-ab, ab);
         let al = accel_lat[i].clamp(-lb, lb);
-        actual += (s - actual).clamp(-lag, lag);
+        actual = model.steered(actual, s, v, a);
         model.step(&mut x, &mut y, &mut yaw, &mut v, &mut vy, actual, a, al);
         let (x, y) = model.origin(x, y, yaw);
         let yaw_here = yaw;
@@ -1276,9 +1293,7 @@ impl MppiFollower {
     /// The way past the obstacles ahead (`n` steps of `step` at `speed`, or
     /// the robot's speed if faster): the points of the reference its detour
     /// leaves, where tracking the path gives way to going round, and the
-    /// share of the speed to drive, `plan_avoidance`'s pace held lower by
-    /// `give_way_share` at that pace along its detour, or the path, and
-    /// along the last plan driven.
+    /// share of the speed to drive, `plan_avoidance`'s pace.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn avoidance(
         &mut self,
@@ -1294,10 +1309,18 @@ impl MppiFollower {
             self.avoid = Choice::default();
             return (Vec::new(), 1.0);
         }
+        let first = !self.cursor.started;
         let from = match &self.trajectory {
             Some(_) => 0.0,
             None => match self.cursor.project(&self.base.path.waypoints, state.pose.point, self.base.path_index) {
-                Some(p) => p.arc_length,
+                Some(p) => {
+                    // The first projection searches the whole path; later
+                    // ones search a window round the segment it found.
+                    if first {
+                        self.base.path_index = p.segment;
+                    }
+                    p.arc_length
+                }
                 None => return (Vec::new(), 1.0),
             },
         };
@@ -1458,6 +1481,7 @@ impl MppiFollower {
         if !self.follow.is_empty() {
             corridor = corridor.along_guide(&self.follow);
         }
+        corridor.cost_ahead(extra, working.dt);
         let w = self.weights(&working);
         let cost_of = |steer: &[f64], accel: &[f64], accel_lat: &[f64], collect: bool| match &reference {
             Some(r) => rollout(&model, steer, accel, accel_lat, r, &w, extra, collect),
@@ -1571,11 +1595,11 @@ impl MppiFollower {
         let full = self.debug_level == DebugLevel::Full;
         let rolled = crate::core::parallel::map_indexed(k, |j| {
             let (s, a, al) = &drawn[j];
-            cost_of(s, a, al, full && j % ROLLOUT_STRIDE == 0)
+            cost_of(s, a, al, full && (j < 5 || j % ROLLOUT_STRIDE == 0))
         });
         for (j, (c, traj)) in rolled.into_iter().enumerate() {
             costs[j] = c + gamma * control_costs[j] * model.dt;
-            if full && j % ROLLOUT_STRIDE == 0 {
+            if full && (j < 5 || j % ROLLOUT_STRIDE == 0) {
                 kept.push((traj, costs[j]));
             }
         }
@@ -1707,11 +1731,14 @@ impl Controller for MppiFollower {
         let (n, step) = self.plan_for(constraints);
         let (n, step) = (n.max(1), step.max(1e-3));
         let (collision, repulsion, reach) = (cfg.weight_collision, cfg.weight_repulsion, cfg.repulsion_distance.max(1e-3));
-        let checker = CollisionChecker::new(world, constraints, cfg.safety_margin.max(0.0)).with_step(step).with_spread(1.0);
+        let margin = cfg.safety_margin.max(0.0);
+        let checker = CollisionChecker::new(world, constraints, margin).with_step(step).with_spread(1.0);
         let critic = |i: usize, x: f64, y: f64, yaw: f64| -> f64 {
             let d = checker.clearance_within(i + 1, x, y, yaw, reach);
-            if d < 0.0 {
+            if d <= -margin {
                 collision
+            } else if d < 0.0 {
+                repulsion + (collision - repulsion).max(0.0) * -d / margin
             } else if d < reach {
                 repulsion * (1.0 - d / reach).powi(2)
             } else {
@@ -1820,9 +1847,43 @@ pub(crate) struct Corridor {
     /// How close a rollout must come to a cusp before it counts as
     /// progressing onto the next leg.
     pub release: f64,
+    /// Obstacle cost run up past each point tracking the rest of the
+    /// corridor at its speeds: the cost to go of a rollout ending there.
+    pub ahead: Vec<f64>,
 }
 
+/// Slowest speed, in m/s, the cost to go along a corridor is timed at.
+const AHEAD_MIN_SPEED: f64 = 0.1;
+
 impl Corridor {
+    /// Fills `ahead` with the stage cost `extra(step, x, y, yaw)` run up
+    /// past each point, tracking the corridor at its speeds over steps
+    /// `dt` long.
+    pub(crate) fn cost_ahead(&mut self, extra: &dyn Fn(usize, f64, f64, f64) -> f64, dt: f64) {
+        let mut t = 0.0;
+        let stage: Vec<f64> = (0..self.x.len())
+            .map(|k| {
+                if k == 0 {
+                    return 0.0;
+                }
+                let seconds = self.spacing / self.v[k].abs().max(AHEAD_MIN_SPEED);
+                t += seconds;
+                let step = ((t / dt.max(1e-6)).round() as usize).saturating_sub(1);
+                extra(step, self.x[k], self.y[k], self.yaw[k]) * seconds
+            })
+            .collect();
+        self.ahead = stage
+            .iter()
+            .rev()
+            .scan(0.0, |sum, s| {
+                let past = *sum;
+                *sum += s;
+                Some(past)
+            })
+            .collect();
+        self.ahead.reverse();
+    }
+
     /// This corridor laid along `guide` instead, from its first point:
     /// points `spacing` apart heading along it, at this one's speeds, with
     /// the full weights. Unchanged across cusps, against the way this one
@@ -1968,7 +2029,6 @@ pub(crate) fn rollout_corridor_resumed(
     let (first, at) = from.map_or((0, Resume::start(model)), |(i, r)| (i, *r));
     let (mut x, mut y, mut yaw, mut v, mut vy) = (at.x, at.y, at.yaw, at.v, at.vy);
     let mut actual = at.actual;
-    let lag = model.steer_rate * model.dt;
     let mut traj = Vec::new();
     if collect {
         traj.reserve(n + 1);
@@ -1989,7 +2049,7 @@ pub(crate) fn rollout_corridor_resumed(
         let s = steer[i].clamp(-sb, sb);
         let a = accel[i].clamp(-ab, ab);
         let al = accel_lat[i].clamp(-lb, lb);
-        actual += (s - actual).clamp(-lag, lag);
+        actual = model.steered(actual, s, v, a);
         model.step(&mut x, &mut y, &mut yaw, &mut v, &mut vy, actual, a, al);
         let (px, py) = model.origin(x, y, yaw);
         if collect {
@@ -2031,7 +2091,7 @@ pub(crate) fn rollout_corridor_resumed(
         cost += stage * model.dt;
     }
     if m > 0 {
-        cost += w.progress * (m - 1 - j) as f64 * corridor.spacing;
+        cost += w.progress * (m - 1 - j) as f64 * corridor.spacing + corridor.ahead.get(j).copied().unwrap_or(0.0);
     }
     (cost, traj)
 }
@@ -2547,6 +2607,7 @@ pub(crate) fn pursue(
     let l = wheelbase(model.constraints);
     let near = if model.ackermann { l } else { 0.5 };
     let (mut x, mut y, mut yaw, mut v, mut vy) = (model.x0, model.y0, model.yaw0, model.v0, model.vy0);
+    let mut actual = model.steer0.clamp(-sb, sb);
     let mut from = 0;
     for t in 0..steer.len().min(accel.len()).min(accel_lat.len()) {
         let d = |p: &(f64, f64)| (p.0 - x).hypot(p.1 - y);
@@ -2559,7 +2620,8 @@ pub(crate) fn pursue(
         steer[t] = if model.ackermann { (kappa * l).atan() } else { speed.max(v.abs()) * kappa }.clamp(-sb, sb);
         accel[t] = ((speed - v) / model.dt).clamp(-ab, ab);
         accel_lat[t] = 0.0;
-        model.step(&mut x, &mut y, &mut yaw, &mut v, &mut vy, steer[t], accel[t], 0.0);
+        actual = model.steered(actual, steer[t], v, accel[t]);
+        model.step(&mut x, &mut y, &mut yaw, &mut v, &mut vy, actual, accel[t], 0.0);
     }
 }
 
@@ -2826,6 +2888,21 @@ mod tests {
         assert_eq!(super::held_speed(0.8, 1.0, 0.3), 1.0);
         assert_eq!(super::held_speed(0.2, 1.0, 0.3), 0.2);
         assert_eq!(super::held_speed(-0.5, 0.0, 0.3), -0.5);
+    }
+
+    #[test]
+    fn ackermann_steering_turns_only_while_the_command_moves_it() {
+        let mut c = RobotConstraints::default();
+        c.steering_type = SteeringType::Ackermann;
+        c.wheelbase = 0.65;
+        c.max_linear_velocity = 1.5;
+        c.max_linear_acceleration = 1.0;
+        c.max_steering_angle = 0.46;
+        c.max_steering_rate = 0.3;
+        let model = super::Model::new(&crate::types::RobotState::default(), &c, 0.0, 0.0, 0.1, false);
+        assert_eq!(model.steered(0.0, 0.4, 0.0, 0.0), 0.0, "turned at a stand");
+        assert!((model.steered(0.0, 0.4, 0.5, 0.0) - 0.03).abs() < 1e-12, "not at the steering rate while moving");
+        assert!((model.steered(0.0, 0.4, 0.0, 0.5) - 0.015).abs() < 1e-12, "not at half the rate starting off at 0.05 m/s");
     }
 
     #[test]
