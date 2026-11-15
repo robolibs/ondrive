@@ -150,6 +150,22 @@ pub struct CollisionChecker<'a> {
     /// step, filled in as the steps are first asked for.
     table: Vec<std::sync::OnceLock<StepModes>>,
     times: TimeCache,
+    split: std::sync::OnceLock<Split>,
+}
+
+/// The modes of the obstacles predicted to stay put, sorted into cells, and
+/// the indices of the obstacles predicted to move.
+#[derive(Clone, Debug)]
+struct Split {
+    still: StepModes,
+    moving: Vec<usize>,
+}
+
+/// Whether every mode of `obs` is predicted at the same place and spread
+/// over its whole horizon, so where it is does not depend on the time.
+fn stays_put(obs: &Obstacle) -> bool {
+    let flat = |v: &[f64]| v.iter().all(|a| a.is_finite()) && v.windows(2).all(|w| w[0] == w[1]);
+    obs.modes.iter().all(|m| flat(&m.mean_x) && flat(&m.mean_y) && flat(&m.std_x) && flat(&m.std_y))
 }
 
 /// The obstacle modes at one controller step: centre and grown radius,
@@ -206,7 +222,7 @@ impl<'a> CollisionChecker<'a> {
             }
             _ => (Vec::new(), Vec::new()),
         };
-        Self { world, polygon, samples, disc_radius: robot_radius(constraints), step: 0.1, spread: 0.0, margin: margin.max(0.0), table: fresh_table(), times: TimeCache::default() }
+        Self { world, polygon, samples, disc_radius: robot_radius(constraints), step: 0.1, spread: 0.0, margin: margin.max(0.0), table: fresh_table(), times: TimeCache::default(), split: std::sync::OnceLock::new() }
     }
 
     /// Seconds per controller step, so `clearance(step, ..)` can read
@@ -216,6 +232,7 @@ impl<'a> CollisionChecker<'a> {
             self.step = seconds;
             self.table = fresh_table();
             self.times = TimeCache::default();
+            self.split = std::sync::OnceLock::new();
         }
         self
     }
@@ -226,6 +243,7 @@ impl<'a> CollisionChecker<'a> {
         self.spread = k.max(0.0);
         self.table = fresh_table();
         self.times = TimeCache::default();
+        self.split = std::sync::OnceLock::new();
         self
     }
 
@@ -260,16 +278,22 @@ impl<'a> CollisionChecker<'a> {
         self.clearance_among(self.grown_modes(t), x, y, yaw)
     }
 
-    /// `clearance_at` where it is below `cap`, infinite where it is not.
-    /// The obstacle modes at the last `TIME_SLOTS` or so times asked for are
-    /// kept.
+    /// `clearance_at` where it is below `cap`, infinite where it is not:
+    /// the nearer of the obstacles that stay put, sorted into cells once,
+    /// and those that move, whose modes at the last `TIME_SLOTS` or so times
+    /// asked for are kept.
     pub fn clearance_at_within(&self, t: f64, x: f64, y: f64, yaw: f64, cap: f64) -> f64 {
+        let split = self.split.get_or_init(|| self.split_modes());
+        let still = self.capped(&split.still, x, y, yaw, cap);
+        if split.moving.is_empty() {
+            return still;
+        }
         let slot = (t.to_bits().wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 55) as usize % TIME_SLOTS;
         let kept = self.times.slots.lock().ok().and_then(|s| s.get(slot).and_then(|k| k.clone()).filter(|k| k.0 == t.to_bits()));
         let at = match kept {
             Some((_, at)) => at,
             None => {
-                let at = std::sync::Arc::new(self.step_modes(t));
+                let at = std::sync::Arc::new(self.modes_among(&split.moving, t));
                 if let Ok(mut slots) = self.times.slots.lock() {
                     slots.resize(TIME_SLOTS, None);
                     slots[slot] = Some((t.to_bits(), at.clone()));
@@ -277,7 +301,7 @@ impl<'a> CollisionChecker<'a> {
                 at
             }
         };
-        self.capped(&at, x, y, yaw, cap)
+        still.min(self.capped(&at, x, y, yaw, cap))
     }
 
     /// `clearance_among` the modes `at`, where below `cap`, looking only at
@@ -301,9 +325,7 @@ impl<'a> CollisionChecker<'a> {
 
     /// Centre and grown radius of every obstacle mode `t` seconds from now.
     fn grown_modes(&self, t: f64) -> impl Iterator<Item = (f64, f64, f64)> + '_ {
-        self.world.into_iter().flat_map(|w| w.obstacles.iter()).flat_map(move |obs| {
-            modes_at(obs, t, self.step).map(move |m| (m.x, m.y, m.radius + self.spread * m.std_x.max(m.std_y)))
-        })
+        self.world.into_iter().flat_map(|w| w.obstacles.iter()).flat_map(move |obs| self.grown(obs, t))
     }
 
     /// `clearance_at` against the obstacle modes `modes` (centre and grown
@@ -354,7 +376,30 @@ impl<'a> CollisionChecker<'a> {
 
     /// The obstacle modes `t` seconds from now, sorted into cells.
     fn step_modes(&self, t: f64) -> StepModes {
-        let modes: Vec<(f64, f64, f64)> = self.grown_modes(t).collect();
+        self.sorted(self.grown_modes(t).collect())
+    }
+
+    /// The modes of the obstacles at `indices`, `t` seconds from now, sorted
+    /// into cells.
+    fn modes_among(&self, indices: &[usize], t: f64) -> StepModes {
+        let obstacles = self.world.map_or(&[][..], |w| &w.obstacles);
+        self.sorted(indices.iter().flat_map(|&k| self.grown(&obstacles[k], t)).collect())
+    }
+
+    /// The obstacles that stay put, with their modes, and those that move.
+    fn split_modes(&self) -> Split {
+        let obstacles = self.world.map_or(&[][..], |w| &w.obstacles);
+        let (still, moving): (Vec<usize>, Vec<usize>) = (0..obstacles.len()).partition(|&k| stays_put(&obstacles[k]));
+        Split { still: self.modes_among(&still, 0.0), moving }
+    }
+
+    /// Centre and grown radius of each mode of `obs` `t` seconds from now.
+    fn grown<'b>(&'b self, obs: &'b Obstacle, t: f64) -> impl Iterator<Item = (f64, f64, f64)> + 'b {
+        modes_at(obs, t, self.step).map(move |m| (m.x, m.y, m.radius + self.spread * m.std_x.max(m.std_y)))
+    }
+
+    /// `modes`, centre and grown radius, sorted into cells.
+    fn sorted(&self, modes: Vec<(f64, f64, f64)>) -> StepModes {
         let widest = modes.iter().map(|m| m.2).fold(0.0_f64, f64::max);
         let points: Vec<(f64, f64)> = modes.iter().map(|m| (m.0, m.1)).collect();
         let cells = Buckets::new(&points, (self.disc_radius + widest).max(1.0));
@@ -701,20 +746,32 @@ mod tests {
 
     #[test]
     fn capped_clearance_matches_every_obstacle_looked_at() {
-        let world = WorldConstraints { obstacles: crowd(), ..Default::default() };
-        let mut c = constraints();
-        c.footprint = Footprint::Polygon { points: vec![(2.5, 1.1), (-2.5, 1.1), (-2.5, -1.1), (2.5, -1.1)] };
-        let checker = CollisionChecker::new(Some(&world), &c, 0.2).with_step(0.15).with_spread(1.0);
-        for cap in [0.0, 0.8, 3.0] {
-            for step in [0, 3, 17, 40, 300] {
-                for k in 0..200 {
-                    let (x, y, yaw) = (-5.0 + 0.27 * k as f64, 8.0 * (0.1 * k as f64).sin(), 0.05 * k as f64);
-                    let t = step as f64 * 0.15;
-                    let all = checker.clearance_at(t, x, y, yaw);
-                    let want = if all < cap { all } else { f64::INFINITY };
-                    assert_eq!(checker.clearance(step, x, y, yaw), all, "step {step} pose {k}");
-                    assert_eq!(checker.clearance_within(step, x, y, yaw, cap), want, "step {step} pose {k} cap {cap}");
-                    assert_eq!(checker.clearance_at_within(t, x, y, yaw, cap), want, "t {t} pose {k} cap {cap}");
+        // The crowd moving, and with every other obstacle standing still.
+        let mut mixed = crowd();
+        for o in mixed.iter_mut().step_by(2) {
+            for m in o.modes.iter_mut() {
+                for v in [&mut m.mean_x, &mut m.mean_y, &mut m.std_x, &mut m.std_y] {
+                    let first = v[0];
+                    v.fill(first);
+                }
+            }
+        }
+        for obstacles in [crowd(), mixed] {
+            let world = WorldConstraints { obstacles, ..Default::default() };
+            let mut c = constraints();
+            c.footprint = Footprint::Polygon { points: vec![(2.5, 1.1), (-2.5, 1.1), (-2.5, -1.1), (2.5, -1.1)] };
+            let checker = CollisionChecker::new(Some(&world), &c, 0.2).with_step(0.15).with_spread(1.0);
+            for cap in [0.0, 0.8, 3.0] {
+                for step in [0, 3, 17, 40, 300] {
+                    for k in 0..200 {
+                        let (x, y, yaw) = (-5.0 + 0.27 * k as f64, 8.0 * (0.1 * k as f64).sin(), 0.05 * k as f64);
+                        let t = step as f64 * 0.15;
+                        let all = checker.clearance_at(t, x, y, yaw);
+                        let want = if all < cap { all } else { f64::INFINITY };
+                        assert_eq!(checker.clearance(step, x, y, yaw), all, "step {step} pose {k}");
+                        assert_eq!(checker.clearance_within(step, x, y, yaw, cap), want, "step {step} pose {k} cap {cap}");
+                        assert_eq!(checker.clearance_at_within(t, x, y, yaw, cap), want, "t {t} pose {k} cap {cap}");
+                    }
                 }
             }
         }
