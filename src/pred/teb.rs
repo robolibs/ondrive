@@ -84,12 +84,14 @@ fn default_turn_filter() -> f64 {
 /// obstacle margin.
 const LAG_MARGIN_GAIN: f64 = 0.25;
 
-/// Poses of the band checked for collision before it is driven
-/// (teb_local_planner's `feasibility_check_no_poses`).
-const FEASIBILITY_POSES: usize = 5;
+/// Poses of the band checked for collision before it is driven: all of
+/// it, so a band that would be in the way when the traffic comes is never
+/// begun (teb_local_planner checks `feasibility_check_no_poses`, 5).
+
+const FEASIBILITY_POSES: usize = usize::MAX;
 /// Metres between the checks along each stretch of band checked.
 const FEASIBILITY_STEP: f64 = 0.1;
-/// Factor on every time interval of the slower alternative band.
+/// Factor on the nominal time interval of the slower alternative band.
 const SLOWER: f64 = 2.0;
 
 #[derive(Clone, Debug, Default)]
@@ -667,16 +669,16 @@ impl Controller for TebFollower {
             start_segment,
             axle: self.axle,
         };
-        // The band as warm-started, and the same band driven slower, which
-        // meets the obstacles later (the time alternative of homotopy-class
-        // planning), are both optimised against every obstacle; the cheaper
-        // one that stays clear is driven.
+        // The band as warm-started and the same band at `SLOWER` times its
+        // nominal timing, which meets the obstacles later (the time
+        // alternative of homotopy-class planning), are both optimised against
+        // every obstacle; the cheaper one that stays clear is driven.
         let warm = self.band.clone();
         self.optimise(&problem);
         if checker.has_obstacles() {
             let first = std::mem::replace(&mut self.band, warm);
             for dt in self.band.dt.iter_mut() {
-                *dt = (*dt * SLOWER).clamp(cfg.dt_min, cfg.dt_max);
+                *dt = (cfg.dt_nominal * SLOWER).clamp(cfg.dt_min, cfg.dt_max);
             }
             self.optimise(&problem);
             let slower = std::mem::replace(&mut self.band, first);
