@@ -1009,6 +1009,22 @@ impl PyWorld {
     fn obstacle_count(&self) -> usize {
         self.inner.obstacles.len()
     }
+
+    /// Each obstacle's prediction as the controllers see it:
+    /// `(id, radius, dt, [(x, y, spread), ...])` along its likeliest mode,
+    /// `spread` the larger standard deviation at each step.
+    fn predictions(&self) -> Vec<(u64, f64, f64, Vec<(f64, f64, f64)>)> {
+        self.inner
+            .obstacles
+            .iter()
+            .filter_map(|o| {
+                let m = o.modes.iter().max_by(|a, b| a.weight.total_cmp(&b.weight))?;
+                let n = m.mean_x.len().min(m.mean_y.len());
+                let spread = |k: usize| m.std_x.get(k).copied().unwrap_or(0.0).max(m.std_y.get(k).copied().unwrap_or(0.0));
+                Some((o.id, o.radius, o.dt, (0..n).map(|k| (m.mean_x[k], m.mean_y[k], spread(k))).collect()))
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
