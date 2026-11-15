@@ -72,6 +72,56 @@ pub fn repaired(path: &Path, radius: f64, speed: f64, checker: &CollisionChecker
     Some(Path { waypoints, speeds, is_closed: false })
 }
 
+/// `path` split round its first stretch that turns tighter than `radius`
+/// allows, `radius` of it either side: the path up to that, the pose `radius`
+/// past it, and the path on from there. `None` where it has no such stretch,
+/// is closed, or already reverses.
+pub fn split_at_tight(path: &Path, radius: f64) -> Option<(Path, Pose, Path)> {
+    let w = &path.waypoints;
+    if w.len() < 3 || path.is_closed || path.speeds.iter().any(|v| *v < 0.0) {
+        return None;
+    }
+    let cum = cumulative_lengths(w);
+    let heading = |i: usize| (w[i + 1].point.y - w[i].point.y).atan2(w[i + 1].point.x - w[i].point.x);
+    let tight: Vec<usize> = (1..w.len() - 1)
+        .filter(|&i| {
+            let ds = 0.5 * (cum[i + 1] - cum[i - 1]);
+            ds > 1e-6 && normalize_angle(heading(i) - heading(i - 1)).abs() / ds > CURVATURE_SLACK / radius
+        })
+        .collect();
+    let first = *tight.first()?;
+    let mut last = first;
+    for &i in &tight[1..] {
+        if cum[i] - cum[last] > 2.0 * radius {
+            break;
+        }
+        last = i;
+    }
+    let (from, to) = ((cum[first] - radius).max(0.0), (cum[last] + radius).min(*cum.last()?));
+    let pose = |s: f64| {
+        let (p, h) = sample(w, &cum, s);
+        Pose { point: Point::new(p.x, p.y, w[first].point.z), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, h)) }
+    };
+    let speed = |i: usize| path.speeds.get(i).copied().unwrap_or(0.0);
+    let part = |keep: &dyn Fn(f64) -> bool, ends: Pose, at_end: bool| {
+        let kept: Vec<usize> = (0..w.len()).filter(|&i| keep(cum[i])).collect();
+        let mut waypoints: Vec<Pose> = kept.iter().map(|&i| w[i]).collect();
+        let mut speeds: Vec<f64> = kept.iter().map(|&i| speed(i)).collect();
+        let edge = if at_end { speeds.last().copied() } else { speeds.first().copied() }.unwrap_or(0.0);
+        if at_end {
+            waypoints.push(ends);
+            speeds.push(edge);
+        } else {
+            waypoints.insert(0, ends);
+            speeds.insert(0, edge);
+        }
+        Path { waypoints, speeds, is_closed: false }
+    };
+    let before = part(&|s| s < from - 1e-6, pose(from), true);
+    let after = part(&|s| s > to + 1e-6, pose(to), false);
+    Some((before, pose(to), after))
+}
+
 /// The tightest radius an Ackermann `constraints` turns at, if it has one.
 pub fn tightest(constraints: &RobotConstraints) -> Option<f64> {
     let k = crate::core::kinematics::max_curvature(constraints);

@@ -161,6 +161,8 @@ pub struct Tracker {
     /// Whether the caller's path has been checked for turns tighter than
     /// the machine steers, to drive in more than one go.
     manoeuvred: bool,
+    /// A turn tighter than the machine steers, driven by the tracker itself.
+    turn: Option<Turn>,
     /// Control barrier filter on the final command against moving obstacles.
     safety: crate::core::safety::SafetyConfig,
     /// The caller's path while the tracker drives it detoured round standing
@@ -205,6 +207,7 @@ impl Tracker {
             creep: 0.0,
             planned_for: None,
             manoeuvred: false,
+            turn: None,
             safety: crate::core::safety::SafetyConfig { enabled: !kind.avoids_obstacles(), ..Default::default() },
             original: None,
             follow_side: 0.0,
@@ -250,6 +253,7 @@ impl Tracker {
     pub fn set_path(&mut self, path: Path) {
         self.planned_for = None;
         self.manoeuvred = false;
+        self.turn = None;
         self.original = None;
         self.follow_side = 0.0;
         self.trajectory = None;
@@ -452,6 +456,9 @@ impl Tracker {
         }
 
         self.manoeuvre(state, world);
+        if let Some(cmd) = self.drive_turn(state, world) {
+            return self.limit(cmd, state, dt, world);
+        }
 
         // Only the obstacles the robot could meet within `CULL_LOOKOUT_S`.
         let culled = world.and_then(|w| reachable(w, state, &self.constraints));
@@ -732,10 +739,10 @@ impl Tracker {
     }
 
     /// For a kind that follows paths on a platform that may reverse, the
-    /// caller's path with its turns tighter than the platform steers driven
-    /// in more than one go (`manoeuvre::repaired`) round the standing
-    /// obstacles of `world`; checked once a path.
-    fn manoeuvre(&mut self, state: &RobotState, world: Option<&WorldConstraints>) {
+    /// caller's path split round its first turn tighter than the platform
+    /// steers (`manoeuvre::split_at_tight`): the run up to it is driven, the
+    /// turn itself by `drive_turn`, then the rest; checked once a path.
+    fn manoeuvre(&mut self, state: &RobotState, _world: Option<&WorldConstraints>) {
         if self.manoeuvred || self.planned_for.is_some() || self.trajectory.is_some() || self.kind.is_point_controller() {
             return;
         }
@@ -743,12 +750,102 @@ impl Tracker {
         let (Some(tightest), true, Some(path)) = (manoeuvre::tightest(&self.constraints), self.reverses(state), self.path.as_ref()) else {
             return;
         };
-        let standing = manoeuvre::standing(world);
-        let checker = CollisionChecker::new(Some(&standing), &self.constraints, 0.0);
-        let speed = self.constraints.max_linear_velocity.abs().max(0.1);
-        if let Some(repaired) = manoeuvre::repaired(path, tightest, speed, &checker, MANOEUVRE_ROOM_M) {
-            self.drive(repaired);
+        let Some((before, target, rest)) = manoeuvre::split_at_tight(path, tightest) else {
+            return;
+        };
+        let from = before.waypoints.last().copied().unwrap_or(state.pose);
+        let wanted = crate::core::math::normalize_angle(target.rotation.to_euler().yaw - from.rotation.to_euler().yaw);
+        let (s, c) = from.rotation.to_euler().yaw.sin_cos();
+        let across = c * (target.point.y - from.point.y) - s * (target.point.x - from.point.x);
+        let side = if wanted.abs() > TURN_ABOUT { across.signum() } else { wanted.signum() };
+        self.drive(before);
+        self.turn = Some(Turn { from, target, rest, side, dir: 1.0, ..Turn::default() });
+    }
+
+    /// Once the run up to a turn tighter than the machine steers is driven,
+    /// or the machine stands within the stop tolerance of its end or past it,
+    /// the turn itself, in legs at full lock: forward towards the far side
+    /// until the body, stopping, would come within `TURN_ROOM_M` of an
+    /// obstacle that stays put, then back at the other lock the same way,
+    /// every leg turning the machine the same way round, until it faces the
+    /// path past the turn, which it then drives on. `None` while the
+    /// controller drives.
+    fn drive_turn(&mut self, state: &RobotState, world: Option<&WorldConstraints>) -> Option<VelocityCommand> {
+        let reach = self.stop_tolerance();
+        let turn = self.turn.as_mut()?;
+        let end = turn.from.point;
+        let (s, c) = turn.from.rotation.to_euler().yaw.sin_cos();
+        let past = (state.pose.point.x - end.x) * c + (state.pose.point.y - end.y) * s;
+        turn.started |= self.path_completed || state.pose.point.distance_to_2d(end) < reach || past > 0.0;
+        if !turn.started {
+            return None;
         }
+        let yaw = state.pose.rotation.to_euler().yaw;
+        let left = (turn.side * (turn.target.rotation.to_euler().yaw - yaw)).rem_euclid(std::f64::consts::TAU);
+        let facing = !(TURN_FACING..=std::f64::consts::TAU - TURN_PAST).contains(&left);
+        if facing || turn.legs > TURN_MOST_LEGS {
+            let rest = self.turn.take()?.rest;
+            self.drive(rest);
+            self.manoeuvred = false;
+            return None;
+        }
+        let rolling = if state.velocity_valid { state.velocity.linear } else { 0.0 };
+        if turn.braking {
+            if rolling.abs() > STANDING_SPEED {
+                return Some(stop("Turning: stopping for the next leg"));
+            }
+            if turn.last_leg {
+                let rest = self.turn.take()?.rest;
+                self.drive(rest);
+                self.manoeuvred = false;
+                return None;
+            }
+            turn.braking = false;
+            turn.dir = -turn.dir;
+            turn.driven = 0.0;
+            turn.legs += 1;
+        }
+        turn.driven += turn.last.map_or(0.0, |p| p.distance_to_2d(state.pose.point));
+        turn.last = Some(state.pose.point);
+        let c = &self.constraints;
+        let radius = manoeuvre::tightest(c)?;
+        let speed = (TURN_SPEED_SHARE * c.max_linear_velocity.abs()).clamp(TURN_SPEED_MIN, TURN_SPEED_MAX);
+        let a = c.max_linear_acceleration.abs().max(0.1);
+        let curvature = turn.side * turn.dir / radius;
+        let standing = manoeuvre::standing(world);
+        let checker = CollisionChecker::new(Some(&standing), c, 0.0);
+        let ahead = speed * speed / (2.0 * a) + TURN_MARGIN_M;
+        let steps = (ahead / TURN_STEP_M).ceil() as usize;
+        let (mut x, mut y, mut heading) = (state.pose.point.x, state.pose.point.y, yaw);
+        let blocked = (0..steps).any(|_| {
+            let ds = turn.dir * TURN_STEP_M;
+            let mid = heading + 0.5 * curvature * ds;
+            x += ds * mid.cos();
+            y += ds * mid.sin();
+            heading += curvature * ds;
+            checker.clearance(0, x, y, heading) < TURN_ROOM_M
+        });
+        // The machine turns on while it stops, so the last leg brakes that early.
+        if left < TURN_FACING + speed * speed / (2.0 * a) / radius {
+            turn.last_leg = true;
+        }
+        if blocked || turn.last_leg || turn.driven > std::f64::consts::PI * radius {
+            turn.braking = true;
+            return Some(stop("Turning: end of leg"));
+        }
+        let (linear_unit, angular_unit) = match self.controller.get_config().output_units {
+            OutputUnits::Physical => (1.0, 1.0),
+            OutputUnits::Normalized => (c.max_linear_velocity.max(1e-6), c.max_angular_velocity.max(1e-6)),
+        };
+        let v = turn.dir * speed;
+        Some(VelocityCommand {
+            valid: true,
+            linear_velocity: v / linear_unit,
+            angular_velocity: v * curvature / angular_unit,
+            steering_angle: curvature_to_steering(curvature, c),
+            status_message: format!("Turning: leg {} {}", turn.legs + 1, if turn.dir > 0.0 { "forward" } else { "reversing" }),
+            ..Default::default()
+        })
     }
 
     /// For a kind that follows paths, or a point controller that cannot turn
@@ -1072,7 +1169,7 @@ impl Tracker {
 
     /// True once a path driven without an explicit goal has been consumed.
     pub fn is_path_completed(&self) -> bool {
-        self.path_completed
+        self.path_completed && self.turn.is_none()
     }
 
     /// How much of its internals the controller records each tick.
@@ -1687,6 +1784,49 @@ const PLANNED_STEP: f64 = 0.1;
 /// Metres a way planned in more than one go keeps the body from standing
 /// obstacles.
 const MANOEUVRE_ROOM_M: f64 = 0.6;
+/// Radians off its own heading past which a turn counts as turning about,
+/// made towards the side its end lies on.
+const TURN_ABOUT: f64 = 3.0;
+/// Radians short of the end heading at which a turn is done.
+const TURN_FACING: f64 = 0.12;
+/// Radians past the end heading a turn may have swung and still be done.
+const TURN_PAST: f64 = 0.5;
+/// Most legs a turn is driven in before the controller takes over again.
+const TURN_MOST_LEGS: usize = 12;
+/// Share of top speed a turn's legs are driven at, and its bounds, m/s.
+const TURN_SPEED_SHARE: f64 = 0.3;
+const TURN_SPEED_MIN: f64 = 0.2;
+const TURN_SPEED_MAX: f64 = 0.5;
+/// Room, metres, a leg keeps from standing obstacles once stopped, the
+/// margin past the stopping distance it looks ahead, and its step.
+const TURN_ROOM_M: f64 = 0.3;
+const TURN_MARGIN_M: f64 = 0.3;
+const TURN_STEP_M: f64 = 0.05;
+
+/// A turn tighter than the machine steers, driven in legs at full lock.
+#[derive(Clone, Debug, Default)]
+struct Turn {
+    /// Where the run up to the turn ends.
+    from: Pose,
+    /// Pose past the turn, facing the path on.
+    target: Pose,
+    /// The path past the turn.
+    rest: Path,
+    /// Which way round: 1 left, -1 right.
+    side: f64,
+    /// Direction of the leg being driven: 1 forward, -1 reversing.
+    dir: f64,
+    /// Whether the run up to the turn is done.
+    started: bool,
+    /// Whether the leg is ending, the machine stopping before the next.
+    braking: bool,
+    /// Metres driven on this leg, and where the machine last stood.
+    driven: f64,
+    last: Option<Point>,
+    /// Legs driven, and whether the one ending is the last.
+    legs: usize,
+    last_leg: bool,
+}
 /// Metres into the leg past a cusp its starting curvature is read at.
 const PRE_STEER_LOOK: f64 = 1.0;
 /// Share of the lookahead a point controller's carrot sits ahead of it.
