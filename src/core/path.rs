@@ -128,7 +128,9 @@ pub fn project(
     let s_ref = cum[start.min(seg_count - 1)];
     let reach = if window == usize::MAX { f64::INFINITY } else { cum[start.min(seg_count - 1) + 1] + MAX_ADVANCE };
 
-    let mut best: Option<(PathProjection, f64)> = None;
+    // Nearest point of the scanned segments: (segment, t, point, distance,
+    // arc length, jump), framed by its segment's heading once found.
+    let mut best: Option<(usize, f64, Point, f64, f64, f64)> = None;
     for s in first..last {
         if cum[s] > reach {
             break;
@@ -147,29 +149,28 @@ pub fn project(
         let d = p.distance_to_2d(q);
         let arc_length = cum[s] + t * (cum[s + 1] - cum[s]);
         let jump = (arc_length - s_ref).abs();
-        let better = match &best {
+        let better = match best {
             None => true,
-            Some((b, b_jump)) => d < b.distance - TIE || (d <= b.distance + TIE && jump <= b_jump + TIE),
+            Some((.., b_distance, _, b_jump)) => d < b_distance - TIE || (d <= b_distance + TIE && jump <= b_jump + TIE),
         };
         if better {
-            let heading = segment_heading(waypoints, s);
-            let (lat, along) = frame_offsets(q, heading, p);
-            let proj = PathProjection {
-                segment: s,
-                t,
-                point: q,
-                heading,
-                lateral_error: lat,
-                distance: d,
-                arc_length,
-                beyond_end: (s + 1 == seg_count || q.distance_to_2d(end) < 1e-9)
-                    && t >= 1.0 - 1e-9
-                    && along > 0.0,
-            };
-            best = Some((proj, jump));
+            best = Some((s, t, q, d, arc_length, jump));
         }
     }
-    best.map(|(proj, _)| proj)
+    best.map(|(s, t, q, d, arc_length, _)| {
+        let heading = segment_heading(waypoints, s);
+        let (lat, along) = frame_offsets(q, heading, p);
+        PathProjection {
+            segment: s,
+            t,
+            point: q,
+            heading,
+            lateral_error: lat,
+            distance: d,
+            arc_length,
+            beyond_end: (s + 1 == seg_count || q.distance_to_2d(end) < 1e-9) && t >= 1.0 - 1e-9 && along > 0.0,
+        }
+    })
 }
 
 /// First waypoint after segment `segment` where the path turns back on
