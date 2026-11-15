@@ -121,6 +121,23 @@ struct Band {
     tail_s: f64,
 }
 
+/// A band's cost in parts: the smooth terms, the obstacle penalty at each
+/// pose and segment middle, each pose's path deviation, and the segment
+/// each pose lies off, which the next pose's search starts from.
+struct Parts {
+    smooth: f64,
+    poses: Vec<f64>,
+    middles: Vec<f64>,
+    path: Vec<f64>,
+    segments: Vec<usize>,
+}
+
+impl Parts {
+    fn total(&self) -> f64 {
+        self.smooth + self.poses.iter().sum::<f64>() + self.middles.iter().sum::<f64>() + self.path.iter().sum::<f64>()
+    }
+}
+
 struct Problem<'a> {
     cfg: &'a TebConfig,
     constraints: &'a RobotConstraints,
@@ -204,7 +221,86 @@ impl Problem<'_> {
         }
     }
 
+    /// Seconds from now at which `b` reaches each pose.
+    fn times(b: &Band) -> Vec<f64> {
+        let mut times = vec![0.0; b.x.len()];
+        for i in 0..b.dt.len() {
+            times[i + 1] = times[i] + b.dt[i].max(1e-4);
+        }
+        times
+    }
+
+    /// The obstacle penalty at pose `i` of `b`, reached at `times[i]`.
+    fn at_pose(&self, b: &Band, times: &[f64], i: usize) -> f64 {
+        self.obstacle_cost(times[i], b.x[i], b.y[i], b.yaw[i])
+    }
+
+    /// The obstacle penalty halfway along segment `i` of `b`.
+    fn at_middle(&self, b: &Band, times: &[f64], i: usize) -> f64 {
+        self.obstacle_cost(times[i] + 0.5 * b.dt[i].max(1e-4), 0.5 * (b.x[i] + b.x[i + 1]), 0.5 * (b.y[i] + b.y[i + 1]), b.yaw[i])
+    }
+
+    /// The deviation penalty of pose `i` of `b` from the waypoints, searched
+    /// from segment `hint`, and the segment it lies off.
+    fn off_path(&self, b: &Band, i: usize, hint: usize) -> (f64, usize) {
+        let (px, py) = self.pose_of(b.x[i], b.y[i], b.yaw[i]);
+        match project(self.waypoints, self.cum, Point::new(px, py, 0.0), hint, 2, 64) {
+            Some(p) => (self.cfg.weight_path_deviation * p.distance * p.distance, p.segment),
+            None => (0.0, hint),
+        }
+    }
+
+    /// `b`'s cost in parts: the smooth terms, and the obstacle penalty at
+    /// each pose and segment middle and the deviation of each pose.
+    fn parts(&self, b: &Band) -> Parts {
+        let n = b.x.len();
+        let times = Self::times(b);
+        let poses: Vec<f64> = (0..n).map(|i| self.at_pose(b, &times, i)).collect();
+        let middles: Vec<f64> = (0..n - 1).map(|i| self.at_middle(b, &times, i)).collect();
+        let (mut path, mut segments) = (vec![0.0; n], vec![self.start_segment; n]);
+        if !self.waypoints.is_empty() {
+            for i in 1..n {
+                (path[i], segments[i]) = self.off_path(b, i, segments[i - 1]);
+            }
+        }
+        Parts { smooth: self.smooth(b), poses, middles, path, segments }
+    }
+
     fn cost(&self, b: &Band) -> f64 {
+        self.parts(b).total()
+    }
+
+    /// The cost of `b`, which differs from the band costed in `base` only
+    /// in optimiser variable `k`: the parts it moves costed afresh.
+    fn varied(&self, b: &Band, base: &Parts, k: usize) -> f64 {
+        let n = b.x.len();
+        let n_pose_vars = (n - 1) * 3;
+        let times = Self::times(b);
+        let (mut poses, mut middles, mut path) = (base.poses.clone(), base.middles.clone(), base.path.clone());
+        if k < n_pose_vars {
+            let i = k / 3 + 1;
+            poses[i] = self.at_pose(b, &times, i);
+            for j in [i - 1, i].into_iter().filter(|&j| j < n - 1) {
+                middles[j] = self.at_middle(b, &times, j);
+            }
+            if !self.waypoints.is_empty() {
+                path[i] = self.off_path(b, i, base.segments[i - 1]).0;
+            }
+        } else {
+            let j = k - n_pose_vars;
+            for (i, p) in poses.iter_mut().enumerate().skip(j + 1) {
+                *p = self.at_pose(b, &times, i);
+            }
+            for (i, m) in middles.iter_mut().enumerate().skip(j) {
+                *m = self.at_middle(b, &times, i);
+            }
+        }
+        Parts { smooth: self.smooth(b), poses, middles, path, segments: Vec::new() }.total()
+    }
+
+    /// The terms of `b`'s cost other than obstacles and path deviation:
+    /// time, speed, turn rate and their changes, kinematics and the goal.
+    fn smooth(&self, b: &Band) -> f64 {
         let n = b.x.len();
         let c = self.cfg;
         let a_max = self.constraints.max_linear_acceleration.abs();
@@ -212,10 +308,6 @@ impl Problem<'_> {
         let mut prev_v: Option<(f64, f64)> = None;
         let mut prev_w: Option<(f64, f64)> = None;
         let mut last_v = 0.0;
-        let mut times = vec![0.0; n];
-        for i in 0..n - 1 {
-            times[i + 1] = times[i] + b.dt[i].max(1e-4);
-        }
 
         for i in 0..n - 1 {
             let dt = b.dt[i].max(1e-4);
@@ -270,27 +362,11 @@ impl Problem<'_> {
                 cost += c.weight_kinematic * r * r;
             }
 
-            cost += self.obstacle_cost(times[i] + 0.5 * dt, 0.5 * (b.x[i] + b.x[i + 1]), 0.5 * (b.y[i] + b.y[i + 1]), b.yaw[i]);
         }
         if let Some((_, pdt)) = prev_v {
             let a_goal = last_v / pdt.max(1e-4);
             let a_over = (a_goal.abs() - a_max).max(0.0);
             cost += 0.25 * c.weight_acceleration_limit * a_over * a_over;
-        }
-
-        if !self.waypoints.is_empty() {
-            let mut hint = self.start_segment;
-            for i in 1..n {
-                let (px, py) = self.pose_of(b.x[i], b.y[i], b.yaw[i]);
-                if let Some(p) = project(self.waypoints, self.cum, Point::new(px, py, 0.0), hint, 2, 64) {
-                    cost += c.weight_path_deviation * p.distance * p.distance;
-                    hint = p.segment;
-                }
-            }
-        }
-
-        for i in 0..n {
-            cost += self.obstacle_cost(times[i], b.x[i], b.y[i], b.yaw[i]);
         }
 
         let (tp, th) = self.target;
@@ -567,12 +643,13 @@ fn optimise(problem: &Problem, cfg: &TebConfig, mut band: Band) -> Band {
     let mut current = problem.cost(&band);
     for _ in 0..cfg.iterations {
         let mut work = band.clone();
+        let base = problem.parts(&band);
         for (k, g) in grad.iter_mut().enumerate() {
             let o = get(&work, k);
             set(&mut work, k, o + eps);
-            let cp = problem.cost(&work);
+            let cp = problem.varied(&work, &base, k);
             set(&mut work, k, o - eps);
-            let cm = problem.cost(&work);
+            let cm = problem.varied(&work, &base, k);
             set(&mut work, k, o);
             *g = (cp - cm) / (2.0 * eps);
         }
@@ -819,5 +896,87 @@ impl Controller for TebFollower {
 
     fn base_mut(&mut self) -> &mut ControllerBase {
         &mut self.base
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Band, Problem, TebConfig};
+    use crate::core::obstacles::CollisionChecker;
+    use crate::core::path::cumulative_lengths;
+    use crate::types::{GaussianMode, Obstacle, RobotConstraints, SteeringType, WorldConstraints};
+    use datapod::{Euler, Point, Pose, Quaternion};
+
+    /// A band nudged in one variable costs the same through the parts that
+    /// variable moves as costed whole, with a post and a crosser near it.
+    #[test]
+    fn a_varied_band_costs_the_same_as_costed_whole() {
+        let mut c = RobotConstraints::default();
+        c.steering_type = SteeringType::Ackermann;
+        c.wheelbase = 1.5;
+        c.max_linear_velocity = 1.5;
+        c.max_steering_angle = 0.5;
+        c.max_steering_rate = 0.3;
+        let n = 31;
+        let mode = |x: f64, y: f64, vx: f64, vy: f64| GaussianMode {
+            weight: 1.0,
+            mean_x: (0..n).map(|k| x + vx * 0.2 * k as f64).collect(),
+            mean_y: (0..n).map(|k| y + vy * 0.2 * k as f64).collect(),
+            std_x: vec![0.05; n],
+            std_y: vec![0.05; n],
+        };
+        let world = WorldConstraints {
+            obstacles: vec![Obstacle { id: 0, radius: 0.5, modes: vec![mode(3.0, 0.6, 0.0, 0.0)], dt: 0.2 }, Obstacle { id: 1, radius: 0.5, modes: vec![mode(5.0, -3.0, 0.0, 1.0)], dt: 0.2 }],
+            ..Default::default()
+        };
+        let checker = CollisionChecker::new(Some(&world), &c, 0.0).with_spread(1.0);
+        let waypoints: Vec<Pose> = (0..=40).map(|i| Pose { point: Point::new(0.25 * i as f64, 0.0, 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, 0.0)) }).collect();
+        let cum = cumulative_lengths(&waypoints);
+        let cfg = TebConfig::default();
+        let problem = Problem {
+            cfg: &cfg,
+            constraints: &c,
+            waypoints: &waypoints,
+            cum: &cum,
+            checker: &checker,
+            target: (Point::new(9.0, 0.0, 0.0), 0.0),
+            kappa_max: 0.5_f64.tan() / 1.5,
+            v_lo: 0.0,
+            v_hi: 1.5,
+            v_start: 0.8,
+            w_start: 0.0,
+            steer_per_wheelbase: 0.3 / 1.5,
+            ackermann: true,
+            holonomic: false,
+            axle: 0.4,
+            start_segment: 0,
+        };
+        let m = 12;
+        let band = Band {
+            x: (0..m).map(|i| 0.7 * i as f64).collect(),
+            y: (0..m).map(|i| 0.3 * (0.6 * i as f64).sin()).collect(),
+            yaw: (0..m).map(|i| 0.2 * (0.6 * i as f64).cos()).collect(),
+            dt: vec![0.3; m - 1],
+            tail_s: 7.7,
+        };
+        let base = problem.parts(&band);
+        let n_pose_vars = (m - 1) * 3;
+        for k in 0..n_pose_vars + (m - 1) {
+            for step in [1e-4, -1e-4, 0.05] {
+                let mut b = band.clone();
+                if k < n_pose_vars {
+                    let i = k / 3 + 1;
+                    match k % 3 {
+                        0 => b.x[i] += step,
+                        1 => b.y[i] += step,
+                        _ => b.yaw[i] += step,
+                    }
+                } else {
+                    b.dt[k - n_pose_vars] += step;
+                }
+                let (whole, varied) = (problem.cost(&b), problem.varied(&b, &base, k));
+                assert!((whole - varied).abs() <= 1e-9 * whole.abs().max(1.0), "variable {k} step {step}: {whole} whole, {varied} varied");
+            }
+        }
     }
 }
