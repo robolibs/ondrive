@@ -150,6 +150,11 @@ pub struct Tracker {
     last_command: Option<(f64, f64, f64)>,
     /// Seconds the machine has stood while commanded to move.
     stalled_for: f64,
+    /// Speed, m/s, the stall ramp last stood at, until the machine moves.
+    kicked: Option<f64>,
+    /// Slowest speed, m/s, a command to move is given at: the ramp that last
+    /// broke the machine free of its drive's dead band.
+    creep: f64,
     /// Goal pose `(x, y, yaw)` the installed path was planned to, when the
     /// tracker planned it for a goal on its own.
     planned_for: Option<(f64, f64, f64)>,
@@ -196,6 +201,8 @@ impl Tracker {
             last_steering: None,
             last_command: None,
             stalled_for: 0.0,
+            kicked: None,
+            creep: 0.0,
             planned_for: None,
             manoeuvred: false,
             safety: crate::core::safety::SafetyConfig { enabled: !kind.avoids_obstacles(), ..Default::default() },
@@ -607,18 +614,26 @@ impl Tracker {
             && state.velocity.linear.hypot(state.velocity.lateral) < STANDING_SPEED
             && state.velocity.angular.abs() < STANDING_TURN;
         self.stalled_for = if standing && speed > 1e-3 { self.stalled_for + dt } else { 0.0 };
+        // The ramp that got a stalled machine moving is how slow it creeps:
+        // standing on a command slower than that, it is given that at once.
+        if !standing && let Some(freed) = self.kicked.take() {
+            self.creep = self.creep.max(freed);
+        }
+        let mut floor = if self.stalled_for > CREEP_AFTER_S { self.creep } else { 0.0 };
         if self.stalled_for > STALL_S
             && let Some((pv, _, pvy)) = self.last_command
         {
             let a = c.max_linear_acceleration.abs() * dt;
             let ramp = (pv.hypot(pvy) + a).min(BREAKAWAY_SPEED);
-            if ramp > speed {
-                let s = ramp / speed;
-                let w_max = c.max_angular_velocity.abs();
-                v *= s;
-                vy *= s;
-                w = if w_max > 0.0 { (w * s).clamp(-w_max, w_max) } else { w * s };
-            }
+            self.kicked = Some(ramp);
+            floor = floor.max(ramp);
+        }
+        if floor > speed && speed > 1e-3 && room_to_creep(state, v.signum() * floor, w / v.abs().max(1e-6) * floor, c, world) {
+            let s = floor / speed;
+            let w_max = c.max_angular_velocity.abs();
+            v *= s;
+            vy *= s;
+            w = if w_max > 0.0 { (w * s).clamp(-w_max, w_max) } else { w * s };
         }
 
         let zone_cap = world.and_then(|w| w.speed_limit_at(state.pose.point));
@@ -1686,8 +1701,35 @@ const STANDING_SPEED: f64 = 0.05;
 const STANDING_TURN: f64 = 0.05;
 /// Seconds a machine stands while told to move before its command is ramped.
 const STALL_S: f64 = 1.0;
+/// Seconds a machine stands on one command before it is given the creep it
+/// was last freed at.
+const CREEP_AFTER_S: f64 = 0.3;
 /// Speed, m/s, the stall ramp goes up to.
 const BREAKAWAY_SPEED: f64 = 0.3;
+/// Seconds of driving at creep speed checked before a slow command is raised
+/// to it, and the room, metres, the body keeps from obstacles throughout.
+const CREEP_LOOK_S: f64 = 1.0;
+const CREEP_ROOM_M: f64 = 0.15;
+
+/// Whether driving at `v` turning at `w` for `CREEP_LOOK_S` from `state`
+/// keeps the footprint `CREEP_ROOM_M` from the obstacles of `world`, or no
+/// nearer than it already stands.
+fn room_to_creep(state: &RobotState, v: f64, w: f64, c: &RobotConstraints, world: Option<&WorldConstraints>) -> bool {
+    let Some(world) = world.filter(|w| !w.obstacles.is_empty() || w.grid.is_some()) else {
+        return true;
+    };
+    let checker = CollisionChecker::new(Some(world), c, 0.0);
+    let (mut x, mut y, mut yaw) = (state.pose.point.x, state.pose.point.y, state.pose.rotation.to_euler().yaw);
+    let room = CREEP_ROOM_M.min(checker.clearance(0, x, y, yaw));
+    const STEPS: usize = 10;
+    let dt = CREEP_LOOK_S / STEPS as f64;
+    (0..STEPS).all(|_| {
+        x += v * yaw.cos() * dt;
+        y += v * yaw.sin() * dt;
+        yaw += w * dt;
+        checker.clearance(0, x, y, yaw) >= room
+    })
+}
 
 /// Seconds of path at top speed checked for the steering-rate speed cap.
 const RATE_PREVIEW_S: f64 = 2.0;
@@ -2105,6 +2147,36 @@ mod tests {
             let cmd = t.limit(turn.clone(), &state, 0.05, None);
             assert!(cmd.angular_velocity.abs() <= 1.5 + 1e-9, "w {}", cmd.angular_velocity);
         }
+    }
+
+    #[test]
+    fn a_machine_freed_from_its_dead_band_creeps_at_the_freeing_speed_but_not_into_a_post() {
+        let mut t = Tracker::new(TrackerKind::Mpc);
+        let mut c = car();
+        c.max_linear_acceleration = 1.0;
+        c.max_angular_velocity = 1.5;
+        t.init(c);
+        let standing = RobotState { velocity_valid: true, ..Default::default() };
+        let rolling = RobotState { velocity_valid: true, velocity: crate::types::Velocity { linear: 0.2, ..Default::default() }, ..Default::default() };
+        let crawl = VelocityCommand { valid: true, linear_velocity: 0.02, ..Default::default() };
+        let mut freed = 0.0;
+        for _ in 0..60 {
+            freed = t.limit(crawl.clone(), &standing, 0.05, None).linear_velocity;
+        }
+        assert!(freed > 0.1, "the stall ramp stood at {freed:.3}");
+        t.limit(crawl.clone(), &rolling, 0.05, None);
+        let mut held = 0.0;
+        for _ in 0..8 {
+            held = t.limit(crawl.clone(), &standing, 0.05, None).linear_velocity;
+        }
+        assert!(held > 0.1, "a machine stalled again crawled at {held:.3}");
+        let mode = crate::types::GaussianMode { weight: 1.0, mean_x: vec![0.75; 31], mean_y: vec![0.0; 31], std_x: vec![0.01; 31], std_y: vec![0.01; 31] };
+        let post = WorldConstraints { obstacles: vec![crate::types::Obstacle { id: 1, radius: 0.2, modes: vec![mode], dt: 0.2 }], ..Default::default() };
+        let mut blocked = 1.0;
+        for _ in 0..8 {
+            blocked = t.limit(crawl.clone(), &standing, 0.05, Some(&post)).linear_velocity;
+        }
+        assert!(blocked < 0.05, "it was pushed at a post at {blocked:.3}");
     }
 
     fn car() -> RobotConstraints {
