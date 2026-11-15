@@ -493,90 +493,121 @@ impl TebFollower {
         }
     }
 
-    fn optimise(&mut self, problem: &Problem) {
-        let cfg = self.teb_config.clone();
+    /// A band laid along `waypoints` from arc length `from`, or from where
+    /// the robot stands on them, pose 0 at the robot, the rest `step` apart
+    /// pushed off obstacles, with its tail placed on the path. `None` where
+    /// the waypoints end before the band or it runs past a cusp.
+    #[allow(clippy::too_many_arguments)]
+    fn laid_along(&self, state: &RobotState, waypoints: &[Pose], cum: &[f64], from: Option<f64>, step: f64, checker: &CollisionChecker, cusp: f64) -> Option<Band> {
         let n = self.band.x.len();
-        let n_pose_vars = (n - 1) * 3;
-        let n_vars = n_pose_vars + (n - 1);
-        let eps = 1e-4;
-        let mut grad = vec![0.0; n_vars];
+        let length = cum.last().copied().unwrap_or(0.0);
+        let from = match from {
+            Some(s) => s,
+            None => crate::core::path::project(waypoints, cum, state.pose.point, 0, 0, usize::MAX)?.arc_length,
+        };
+        if from + (n - 1) as f64 * step > length {
+            return None;
+        }
+        let yaw0 = yaw_of(&state.pose);
+        let start = self.axle_of(state.pose.point, yaw0);
+        let mut b = Band { x: vec![start.x; n], y: vec![start.y; n], yaw: vec![yaw0; n], dt: vec![self.teb_config.dt_nominal; n - 1], tail_s: self.band.tail_s };
+        for i in 1..n {
+            let (p, h) = sample(waypoints, cum, (from + i as f64 * step).min(length));
+            let p = push_off_obstacles(p, h, i as f64 * self.teb_config.dt_nominal, checker, self.teb_config.obstacle_margin);
+            let p = self.axle_of(p, h);
+            (b.x[i], b.y[i], b.yaw[i]) = (p.x, p.y, h);
+        }
+        let tail = Point::new(b.x[n - 1] + self.axle * b.yaw[n - 1].cos(), b.y[n - 1] + self.axle * b.yaw[n - 1].sin(), 0.0);
+        b.tail_s = crate::core::path::project(&self.base.path.waypoints, &self.cursor.cum, tail, 0, 0, usize::MAX)?.arc_length;
+        (b.tail_s < cusp).then_some(b)
+    }
+}
 
-        let get = |b: &Band, k: usize| -> f64 {
-            if k < n_pose_vars {
-                let i = k / 3 + 1;
-                match k % 3 {
-                    0 => b.x[i],
-                    1 => b.y[i],
-                    _ => b.yaw[i],
-                }
-            } else {
-                b.dt[k - n_pose_vars]
-            }
-        };
-        let set = |b: &mut Band, k: usize, v: f64| {
-            if k < n_pose_vars {
-                let i = k / 3 + 1;
-                match k % 3 {
-                    0 => b.x[i] = v,
-                    1 => b.y[i] = v,
-                    _ => b.yaw[i] = normalize_angle(v),
-                }
-            } else {
-                b.dt[k - n_pose_vars] = v.clamp(cfg.dt_min, cfg.dt_max);
-            }
-        };
-        let block = |k: usize| -> usize {
-            if k < n_pose_vars {
-                if k % 3 == 2 { 1 } else { 0 }
-            } else {
-                2
-            }
-        };
+/// `band` descended on `problem`'s cost by central-difference gradients,
+/// `cfg.iterations` line-searched steps at most.
+fn optimise(problem: &Problem, cfg: &TebConfig, mut band: Band) -> Band {
+    let n = band.x.len();
+    let n_pose_vars = (n - 1) * 3;
+    let n_vars = n_pose_vars + (n - 1);
+    let eps = 1e-4;
+    let mut grad = vec![0.0; n_vars];
 
-        let mut current = problem.cost(&self.band);
-        for _ in 0..cfg.iterations {
-            let mut work = self.band.clone();
-            for (k, g) in grad.iter_mut().enumerate() {
-                let o = get(&work, k);
-                set(&mut work, k, o + eps);
-                let cp = problem.cost(&work);
-                set(&mut work, k, o - eps);
-                let cm = problem.cost(&work);
-                set(&mut work, k, o);
-                *g = (cp - cm) / (2.0 * eps);
+    let get = |b: &Band, k: usize| -> f64 {
+        if k < n_pose_vars {
+            let i = k / 3 + 1;
+            match k % 3 {
+                0 => b.x[i],
+                1 => b.y[i],
+                _ => b.yaw[i],
             }
-            let mut g_inf = [0.0_f64; 3];
+        } else {
+            b.dt[k - n_pose_vars]
+        }
+    };
+    let set = |b: &mut Band, k: usize, v: f64| {
+        if k < n_pose_vars {
+            let i = k / 3 + 1;
+            match k % 3 {
+                0 => b.x[i] = v,
+                1 => b.y[i] = v,
+                _ => b.yaw[i] = normalize_angle(v),
+            }
+        } else {
+            b.dt[k - n_pose_vars] = v.clamp(cfg.dt_min, cfg.dt_max);
+        }
+    };
+    let block = |k: usize| -> usize {
+        if k < n_pose_vars {
+            if k % 3 == 2 { 1 } else { 0 }
+        } else {
+            2
+        }
+    };
+
+    let mut current = problem.cost(&band);
+    for _ in 0..cfg.iterations {
+        let mut work = band.clone();
+        for (k, g) in grad.iter_mut().enumerate() {
+            let o = get(&work, k);
+            set(&mut work, k, o + eps);
+            let cp = problem.cost(&work);
+            set(&mut work, k, o - eps);
+            let cm = problem.cost(&work);
+            set(&mut work, k, o);
+            *g = (cp - cm) / (2.0 * eps);
+        }
+        let mut g_inf = [0.0_f64; 3];
+        for (k, g) in grad.iter().enumerate() {
+            let b = block(k);
+            g_inf[b] = g_inf[b].max(g.abs());
+        }
+        if g_inf.iter().all(|g| *g < 1e-9) {
+            break;
+        }
+        let mut scale = 1.0;
+        let mut improved = false;
+        for _ in 0..6 {
+            let mut cand = band.clone();
             for (k, g) in grad.iter().enumerate() {
-                let b = block(k);
-                g_inf[b] = g_inf[b].max(g.abs());
+                let step = scale * cfg.step_size / g_inf[block(k)].max(1.0);
+                let o = get(&band, k);
+                set(&mut cand, k, o - step * g);
             }
-            if g_inf.iter().all(|g| *g < 1e-9) {
+            let c = problem.cost(&cand);
+            if c < current {
+                let rel = (current - c) / current.abs().max(1e-12);
+                current = c;
+                band = cand;
+                improved = rel > 1e-4;
                 break;
             }
-            let mut scale = 1.0;
-            let mut improved = false;
-            for _ in 0..6 {
-                let mut cand = self.band.clone();
-                for (k, g) in grad.iter().enumerate() {
-                    let step = scale * cfg.step_size / g_inf[block(k)].max(1.0);
-                    let o = get(&self.band, k);
-                    set(&mut cand, k, o - step * g);
-                }
-                let c = problem.cost(&cand);
-                if c < current {
-                    let rel = (current - c) / current.abs().max(1e-12);
-                    current = c;
-                    self.band = cand;
-                    improved = rel > 1e-4;
-                    break;
-                }
-                scale *= 0.5;
-            }
-            if !improved {
-                break;
-            }
+            scale *= 0.5;
+        }
+        if !improved {
+            break;
         }
     }
+    band
 }
 
 impl Controller for TebFollower {
@@ -644,6 +675,7 @@ impl Controller for TebFollower {
         let mut start_segment = prep.proj.segment;
         let obstacles: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
         let (guide, pace) = self.detour_guide(state, prep.proj.arc_length, constraints, obstacles);
+        let guided = guide.is_some();
         if let Some(guide) = guide {
             cum = cumulative_lengths(&guide);
             target = guide.last().map(|p| (p.point, yaw_of(p))).unwrap_or(target);
@@ -674,24 +706,31 @@ impl Controller for TebFollower {
             start_segment,
             axle: self.axle,
         };
-        // The band as warm-started and the same band at `SLOWER` times its
-        // nominal timing, which meets the obstacles later (the time
-        // alternative of homotopy-class planning), are both optimised against
-        // every obstacle; the cheaper one that stays clear is driven.
-        let warm = self.band.clone();
-        self.optimise(&problem);
+        // Candidates, optimised side by side against every obstacle (homotopy-
+        // class planning): the band as warm-started; the same band at
+        // `SLOWER` times its nominal timing, which meets the obstacles later;
+        // and a band laid afresh along the shared planner's way, or the path
+        // without one, which goes round on the side that way takes and is
+        // never folded. The cheapest that stays clear is driven, the warm
+        // band if none does.
+        let mut candidates = vec![self.band.clone()];
         if checker.has_obstacles() {
-            let first = std::mem::replace(&mut self.band, warm);
-            for dt in self.band.dt.iter_mut() {
+            let mut slower = self.band.clone();
+            for dt in slower.dt.iter_mut() {
                 *dt = (cfg.dt_nominal * SLOWER).clamp(cfg.dt_min, cfg.dt_max);
             }
-            self.optimise(&problem);
-            let slower = std::mem::replace(&mut self.band, first);
-            let score = |b: &Band| if problem.feasible(b, FEASIBILITY_POSES) { problem.cost(b) } else { f64::INFINITY };
-            if score(&slower) < score(&self.band) {
-                self.band = slower;
+            candidates.push(slower);
+            let reversing = signed_speed_at(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length).is_some_and(|v| v < 0.0);
+            if !reversing {
+                let from = if guided { None } else { Some(prep.proj.arc_length) };
+                candidates.extend(self.laid_along(state, &waypoints, &cum, from, self.nominal_step(constraints), &checker, cusp));
             }
         }
+        let solved = crate::core::parallel::map_indexed(candidates.len(), |k| optimise(&problem, &cfg, candidates[k].clone()));
+        let score = |b: &Band| if problem.feasible(b, FEASIBILITY_POSES) { problem.cost(b) } else { f64::INFINITY };
+        let scores: Vec<f64> = solved.iter().map(score).collect();
+        let best = (1..solved.len()).filter(|&k| scores[k] < scores[0]).min_by(|&a, &b| scores[a].total_cmp(&scores[b])).unwrap_or(0);
+        self.band = solved.into_iter().nth(best).expect("the warm band is always a candidate");
         // A band running into an obstacle is dropped, to be laid afresh next
         // tick, and the robot brakes meanwhile.
         if !problem.feasible(&self.band, FEASIBILITY_POSES) {
