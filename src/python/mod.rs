@@ -1235,6 +1235,57 @@ fn available_steering_types() -> Vec<&'static str> {
 }
 
 // ---------------------------------------------------------------------------
+// Obstacle tracking.
+// ---------------------------------------------------------------------------
+
+/// Obstacles tracked over frames from their detected positions alone, each
+/// with a velocity and a spread a Kalman filter keeps up to date.
+#[pyclass(name = "ObstacleTracker")]
+pub struct PyObstacleTracker {
+    inner: crate::core::tracking::ObstacleTracker,
+}
+
+#[pymethods]
+impl PyObstacleTracker {
+    /// A tracker with the default settings, some replaced by `config`, e.g.
+    /// `ObstacleTracker({"position_noise": 0.1})`.
+    #[new]
+    #[pyo3(signature = (config = None))]
+    fn new(py: Python<'_>, config: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let mut cfg = crate::core::tracking::TrackingConfig::default();
+        if let Some(c) = config {
+            let text: String = py.import("json")?.call_method1("dumps", (c,))?.extract()?;
+            let given: serde_json::Value = serde_json::from_str(&text).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            cfg = crate::controller::merged(&cfg, &given).map_err(PyValueError::new_err)?;
+        }
+        Ok(Self { inner: crate::core::tracking::ObstacleTracker::new(cfg) })
+    }
+
+    /// Fold in the detections seen at `time` seconds, each
+    /// `(id or None, x, y, radius)`.
+    fn update(&mut self, time: f64, detections: Vec<(Option<u64>, f64, f64, f64)>) {
+        let d: Vec<crate::core::tracking::Detection> =
+            detections.into_iter().map(|(id, x, y, radius)| crate::core::tracking::Detection { id, x, y, radius }).collect();
+        self.inner.update(time, &d);
+    }
+
+    /// Put the tracked obstacles, with their predictions, into `world`,
+    /// replacing those it had.
+    fn fill(&self, mut world: PyRefMut<'_, PyWorld>) {
+        self.inner.fill(&mut world.inner);
+    }
+
+    /// Velocity `(vx, vy)` estimated for the obstacle `id`, or None.
+    fn velocity(&self, id: u64) -> Option<(f64, f64)> {
+        self.inner.velocity(id)
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Module registration.
 // ---------------------------------------------------------------------------
 
@@ -1250,6 +1301,7 @@ pub fn register_python_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyVelocityCommand>()?;
     m.add_class::<PyControllerStatus>()?;
     m.add_class::<PyTracker>()?;
+    m.add_class::<PyObstacleTracker>()?;
 
     m.add_function(wrap_pyfunction!(smoothen_path, m)?)?;
     m.add_function(wrap_pyfunction!(normalize_angle, m)?)?;

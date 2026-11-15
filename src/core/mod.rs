@@ -8,3 +8,4 @@ pub mod obstacles;
 pub mod parallel;
 pub mod path;
 pub mod safety;
+pub mod tracking;

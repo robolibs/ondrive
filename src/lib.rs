@@ -22,6 +22,7 @@ pub use crate::core::error::{Error, Result};
 pub use crate::core::math::{
     distance, distance_2d, heading_error, normalize_angle, yaw_error, yaw_of,
 };
+pub use crate::core::tracking::{Detection, ObstacleTracker, TrackingConfig};
 pub use crate::tracker::{Tracker, TrackerKind, smoothen_path};
 pub use crate::types::{
     ControllerConfig, ControllerStatus, DebugFrame, DebugLevel, GaussianMode, Goal, Obstacle, OutputUnits,
