@@ -844,11 +844,9 @@ impl Tracker {
         // Never nearer than the room, or than the machine already stands.
         let room = TURN_ROOM_M.min(checker.clearance(0, here.0, here.1, here.2) - TURN_STEP_M);
         let ahead = swept(&checker, here, turn.dir * (stopping + TURN_MARGIN_M), curvature, room);
-        // A reversing leg ends once it cannot finish the turn clear itself and
-        // the forward one, from where this one stops, would.
-        let rest = (left - TURN_FACING).max(0.0) * radius;
+        // A reversing leg ends once the forward one, from where this one
+        // stops, would finish the turn clear.
         let finishes = turn.dir < 0.0
-            && swept(&checker, here, turn.dir * rest, curvature, room).is_none()
             && swept(&checker, here, turn.dir * stopping, curvature, room).is_some_and(|stop| {
                 let rest = (left - stopping / radius - TURN_FACING).max(0.0) * radius;
                 swept(&checker, stop, -turn.dir * rest, -curvature, TURN_ROOM_M).is_some()
