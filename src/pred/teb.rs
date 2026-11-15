@@ -21,7 +21,7 @@ use crate::core::kinematics::{
 use crate::core::math::{normalize_angle, yaw_of};
 use crate::core::obstacles::{CollisionChecker, robot_radius};
 use crate::core::path::{PathCursor, cumulative_lengths, project, sample};
-use crate::pred::mppi::{Swerve, build_reference, current_lateral_speed, current_speed, give_way_share, pick_detour, prepare, signed_speed_at};
+use crate::pred::mppi::{Swerve, build_reference, current_lateral_speed, current_speed, pick_detour, prepare, signed_speed_at};
 use crate::types::{Goal, Obstacle, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::{Euler, Point, Pose, Quaternion};
 
@@ -83,6 +83,14 @@ fn default_turn_filter() -> f64 {
 /// Share of the distance covered during the steering delay added to the
 /// obstacle margin.
 const LAG_MARGIN_GAIN: f64 = 0.25;
+
+/// Poses of the band checked for collision before it is driven
+/// (teb_local_planner's `feasibility_check_no_poses`).
+const FEASIBILITY_POSES: usize = 5;
+/// Metres between the checks along each stretch of band checked.
+const FEASIBILITY_STEP: f64 = 0.1;
+/// Factor on every time interval of the slower alternative band.
+const SLOWER: f64 = 2.0;
 
 #[derive(Clone, Debug, Default)]
 pub struct TebFollower {
@@ -152,6 +160,33 @@ impl Problem<'_> {
 
     /// Penalty for coming within `margin` of an obstacle as it is predicted
     /// `t` seconds from now.
+    /// Whether the body driven along the first `poses` poses of `b`, and
+    /// every `FEASIBILITY_STEP` metres between them, stays clear of every
+    /// obstacle as predicted at that moment (teb_local_planner's
+    /// `isTrajectoryFeasible`).
+    fn feasible(&self, b: &Band, poses: usize) -> bool {
+        if !self.checker.has_obstacles() {
+            return true;
+        }
+        let mut t = 0.0;
+        for i in 0..poses.min(b.x.len().saturating_sub(1)) {
+            let dt = b.dt[i].max(1e-4);
+            let gap = (b.x[i + 1] - b.x[i]).hypot(b.y[i + 1] - b.y[i]);
+            let parts = ((gap / FEASIBILITY_STEP).ceil() as usize).max(1);
+            let turn = normalize_angle(b.yaw[i + 1] - b.yaw[i]);
+            for k in 0..parts {
+                let f = k as f64 / parts as f64;
+                let yaw = b.yaw[i] + f * turn;
+                let (x, y) = self.pose_of(b.x[i] + f * (b.x[i + 1] - b.x[i]), b.y[i] + f * (b.y[i + 1] - b.y[i]), yaw);
+                if self.checker.clearance_at(t + f * dt, x, y, yaw) < 0.0 {
+                    return false;
+                }
+            }
+            t += dt;
+        }
+        true
+    }
+
     fn obstacle_cost(&self, t: f64, x: f64, y: f64, yaw: f64) -> f64 {
         let (x, y) = self.pose_of(x, y, yaw);
         let c = self.cfg;
@@ -303,29 +338,6 @@ impl TebFollower {
     /// The way round the obstacles blocking the stretch of path ahead of
     /// arc length `from`, as poses for the band to follow, on the cheaper
     /// side with hysteresis; `None` when nothing blocks it.
-    /// Share of the command `(v, w)` from `state` that gives way to traffic
-    /// crossing the path ahead of arc length `from`: `give_way_share`.
-    fn give_way(
-        &self,
-        state: &RobotState,
-        from: f64,
-        constraints: &RobotConstraints,
-        world: Option<&WorldConstraints>,
-        command: (f64, f64),
-    ) -> f64 {
-        let Some(world) = world.filter(|w| !w.obstacles.is_empty()) else {
-            return 1.0;
-        };
-        let step = self.teb_config.dt_nominal.max(0.05);
-        let n = 2 * self.teb_config.n_poses.max(3);
-        let speed = (0.8 * constraints.max_linear_velocity).max(0.1);
-        let reference = build_reference(&self.base.path, &self.cursor.cum, from, n, step, speed, 0.0);
-        let pose = (state.pose.point.x, state.pose.point.y, state.pose.rotation.to_euler().yaw);
-        let (v, w) = command;
-        let course = crate::core::obstacles::arc_course(pose, if v.abs() > 1e-9 { w / v } else { 0.0 });
-        give_way_share(&reference, &world.obstacles, constraints, &course, v, v, step, crate::pred::mppi::GIVE_WAY_MARGIN)
-    }
-
     fn detour_guide(&mut self, from: f64, constraints: &RobotConstraints, obstacles: &[Obstacle]) -> Option<Vec<Pose>> {
         if obstacles.is_empty() {
             self.side = 0.0;
@@ -655,7 +667,36 @@ impl Controller for TebFollower {
             start_segment,
             axle: self.axle,
         };
+        // The band as warm-started, and the same band driven slower, which
+        // meets the obstacles later (the time alternative of homotopy-class
+        // planning), are both optimised against every obstacle; the cheaper
+        // one that stays clear is driven.
+        let warm = self.band.clone();
         self.optimise(&problem);
+        if checker.has_obstacles() {
+            let first = std::mem::replace(&mut self.band, warm);
+            for dt in self.band.dt.iter_mut() {
+                *dt = (*dt * SLOWER).clamp(cfg.dt_min, cfg.dt_max);
+            }
+            self.optimise(&problem);
+            let slower = std::mem::replace(&mut self.band, first);
+            let score = |b: &Band| if problem.feasible(b, FEASIBILITY_POSES) { problem.cost(b) } else { f64::INFINITY };
+            if score(&slower) < score(&self.band) {
+                self.band = slower;
+            }
+        }
+        // A band running into an obstacle is dropped, to be laid afresh next
+        // tick, and the robot brakes meanwhile.
+        if !problem.feasible(&self.band, FEASIBILITY_POSES) {
+            self.band_initialised = false;
+            let a_max = constraints.max_linear_acceleration.abs().max(1e-6);
+            let v = v_now.signum() * (v_now.abs() - a_max * dt).max(0.0);
+            self.base.status.mode = "teb_infeasible".into();
+            let cmd = finalize(v, 0.0, constraints, &self.base.config, prep.allow_reverse, "TEB infeasible band");
+            self.last_v = if cmd.valid { v } else { 0.0 };
+            self.last_w = 0.0;
+            return cmd;
+        }
 
         let dt0 = self.band.dt[0].max(1e-3);
         let dx = self.band.x[1] - self.band.x[0];
@@ -695,9 +736,6 @@ impl Controller for TebFollower {
         // lagging measurement.
         let base = if forward * v_now < 0.0 { self.last_v } else { v_now };
         let v = (forward * length / span).clamp(base - a_max * dt, base + a_max * dt).clamp(-stop, stop);
-        let share = self.give_way(state, prep.proj.arc_length, constraints, world, (v, w));
-        let (v, w) = (v * share, w * share);
-
         self.base.status.mode = "teb".into();
         let cmd = finalize(v, w, constraints, &self.base.config, prep.allow_reverse, "TEB tracking");
         self.last_v = if cmd.valid { v.clamp(v_lo, v_hi) } else { 0.0 };

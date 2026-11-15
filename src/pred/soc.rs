@@ -19,7 +19,7 @@ use crate::core::kinematics::planning;
 use crate::core::obstacles::{CollisionChecker, robot_radius};
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
-    Along, CostWeights, Model, Swerve, Track, plan_avoidance, command_from_controls, course_through, current_lateral_speed, give_way_ahead, give_way_share, GIVE_WAY_MARGIN,
+    Along, CostWeights, Model, Swerve, Track, plan_avoidance, command_from_controls, current_lateral_speed,
     correlated_noise, current_speed, detour_relax, effective_sample_size, guide_paths, left_by, pursue, savitzky_golay,
     importance_weights, integrated_noise, prepare, speed_at_arc_length, update_turn_in_place,
 };
@@ -477,13 +477,7 @@ impl Controller for SocFollower {
         };
         let pace = plan.as_ref().map_or(1.0, |p| p.pace);
         let detour: Vec<(f64, f64)> = plan.as_ref().and_then(|p| p.guide.as_ref()).map_or(Vec::new(), |g| (0..g.x.len()).map(|i| (g.x[i], g.y[i])).collect());
-        let paced = speed * pace;
-        let share = pace
-            * if detour.len() >= 2 {
-                give_way_share(&along.reference(n, cfg.dt, paced), obstacles, constraints, &course_through(&detour), paced, v_now, cfg.dt, GIVE_WAY_MARGIN)
-            } else {
-                give_way_ahead(&along, obstacles, constraints, n, cfg.dt, paced, v_now, GIVE_WAY_MARGIN)
-            };
+        let share = pace;
         let mut reference = Track::new(
             self.trajectory.as_ref(),
             self.clock,

@@ -192,14 +192,12 @@ impl Controller for DwaFollower {
         let x0 = state.pose.point.x;
         let y0 = state.pose.point.y;
         let yaw0 = state.pose.rotation.to_euler().yaw;
-        let course = normalize_angle(yaw0 + bearing);
         let (pos_tol, _) = effective_tolerances(goal, &cfg);
         let free_v = preferred
             .min(v_hi)
             .min(path_speed(v_hi, 0.0, dist_to_goal, pos_tol, cfg.kp_linear, constraints).max(passing));
-        let share = give_way(world, constraints, (x0, y0, course), free_v, v_now.abs());
         let v_min = (v_now - a_lin * dt).max(v_lo);
-        let v_max = (v_now + a_lin * dt).min(v_hi).min(cruise * share).max(v_min);
+        let v_max = (v_now + a_lin * dt).min(v_hi).min(cruise).max(v_min);
         let w_min = (w_now - a_ang * dt).max(-w_lim);
         let w_max = (w_now + a_ang * dt).min(w_lim);
         let (vy_min, vy_max) = if holonomic {
@@ -224,20 +222,15 @@ impl Controller for DwaFollower {
         let margin = dwa.obstacle_margin + LAG_MARGIN_GAIN * v_now.abs() * actuation_delay(constraints);
         // Driving ahead, the pose rides ahead of the axle the body turns about.
         let axle = axle_offset(constraints);
-        let target_v = free_v * share;
+        let target_v = free_v;
 
-        // Against obstacles standing or crossing the course to the goal, while
-        // braking from here keeps clear, arcs that would leave the robot unable
-        // to stop clear of them are refused, so the robot gives way.
-        let yield_to: Option<WorldConstraints> = world.map(|w| WorldConstraints {
-            obstacles: w.obstacles.iter().filter(|o| !along_heading(o, course)).cloned().collect(),
-            ..Default::default()
-        });
-        let tail = yield_to
-            .as_ref()
+        // Admissible velocities (Fox et al. 1997): while braking from here
+        // keeps clear of every obstacle as predicted, arcs that would leave
+        // the robot unable to stop clear of one are refused.
+        let tail = world
             .filter(|w| !w.obstacles.is_empty())
             .map(|w| CollisionChecker::new(Some(w), constraints, 0.0).with_step(sim_dt).with_spread(1.0));
-        let yielding = share < 1.0 && tail.as_ref().is_some_and(|c| !hit_while_braking(c, (x0, y0, yaw0), v_now.abs(), a_lin, 0, sim_dt));
+        let yielding = tail.as_ref().is_some_and(|c| !hit_while_braking(c, (x0, y0, yaw0), v_now.abs(), a_lin, 0, sim_dt));
         let mut samples: Vec<Sample> = Vec::with_capacity(v_samples * w_samples * vy_samples);
         for vi in 0..v_samples {
             let v = v_min + (v_max - v_min) * vi as f64 / (v_samples - 1) as f64;
@@ -385,7 +378,6 @@ impl Controller for DwaFollower {
         let mut mode = "dwa";
         if v.hypot(vy).abs() < 1e-9
             && dist_to_goal > cfg.goal_tolerance
-            && share > 0.0
             && let Some(turn) = recovery_turn(&checker, x0, y0, yaw0, dwa.obstacle_margin)
         {
             if can_turn_in_place(constraints.steering_type) {
@@ -466,51 +458,9 @@ fn hit_while_braking(
     false
 }
 
-/// Share of `speed` along `course` from `(x, y)`, setting off at `v_now`,
-/// that gives way to the obstacles moving across that course: `yield_share`
-/// against those alone.
-fn give_way(world: Option<&WorldConstraints>, constraints: &RobotConstraints, (x, y, course): (f64, f64, f64), speed: f64, v_now: f64) -> f64 {
-    let Some(w) = world else { return 1.0 };
-    let crossing = WorldConstraints {
-        obstacles: w.obstacles.iter().filter(|o| moving(o) && !along_heading(o, course)).cloned().collect(),
-        ..Default::default()
-    };
-    if crossing.obstacles.is_empty() {
-        return 1.0;
-    }
-    use crate::pred::mppi::{GIVE_WAY_LOOKOUT_S, GIVE_WAY_MARGIN, GIVE_WAY_SHARES};
-    let checker = CollisionChecker::new(Some(&crossing), constraints, GIVE_WAY_MARGIN).with_spread(1.0);
-    let decel = constraints.max_linear_acceleration.abs();
-    let line = crate::core::obstacles::arc_course((x, y, course), 0.0);
-    crate::core::obstacles::yield_share(&checker, &line, speed, v_now, GIVE_WAY_LOOKOUT_S, decel, &GIVE_WAY_SHARES)
-}
-
 /// Share of the distance covered during the steering delay added to the
 /// obstacle margin.
 const LAG_MARGIN_GAIN: f64 = 0.25;
-
-/// Whether `o` moves faster than a crawl over the first second of its
-/// prediction.
-fn moving(o: &crate::types::Obstacle) -> bool {
-    use crate::core::obstacles::modes_at;
-    let (Some(now), Some(soon)) = (modes_at(o, 0.0, 0.1).next(), modes_at(o, 1.0, 0.1).next()) else {
-        return false;
-    };
-    (soon.x - now.x).hypot(soon.y - now.y) > 0.1
-}
-
-/// Whether `o` moves along the line of a robot heading `yaw` (more along
-/// than across, faster than a crawl), towards it or ahead of it, rather
-/// than stands or crosses: traffic stopping does not get clear of.
-fn along_heading(o: &crate::types::Obstacle, yaw: f64) -> bool {
-    use crate::core::obstacles::modes_at;
-    let (Some(now), Some(soon)) = (modes_at(o, 0.0, 0.1).next(), modes_at(o, 1.0, 0.1).next()) else {
-        return false;
-    };
-    let (vx, vy) = (soon.x - now.x, soon.y - now.y);
-    let (s, c) = yaw.sin_cos();
-    vx.hypot(vy) > 0.1 && (vx * c + vy * s).abs() >= (vx * -s + vy * c).abs()
-}
 
 /// Seconds of standing, after braking to a stop at the end of an arc, that
 /// must stay clear.

@@ -9,8 +9,7 @@
 //! `robot_radius_margin` and, when the bare discs' probability passes
 //! `risk_threshold`, a hard term that is larger the sooner the collision
 //! would come, so a batch whose every rollout is at risk still prefers the
-//! one that brakes or turns away. The reference speed inside the rollouts
-//! drops as the plan's imminent risk from moving obstacles rises.
+//! one that brakes or turns away.
 //!
 //! Without obstacles this is exactly MPPI.
 
@@ -52,8 +51,6 @@ pub struct McaConfig {
     pub weight_hard_risk: f64,
     pub risk_threshold: f64,
 
-    pub min_velocity_scale: f64,
-    pub risk_slowdown_gain: f64,
     pub robot_radius_margin: f64,
 
     pub ref_velocity: f64,
@@ -82,8 +79,6 @@ impl Default for McaConfig {
             weight_soft_risk: 2000.0,
             weight_hard_risk: 2e4,
             risk_threshold: 0.05,
-            min_velocity_scale: 0.4,
-            risk_slowdown_gain: 2.0,
             robot_radius_margin: 0.6,
             ref_velocity: 1.0,
             turn_first_activation_deg: 60.0,
@@ -117,11 +112,6 @@ impl McaConfig {
     }
 }
 
-/// Horizon steps whose collision probability with moving obstacles drives
-/// the risk slowdown.
-const IMMINENT_STEPS: usize = 5;
-/// Metres per second above which an obstacle counts as moving.
-const MOVING_SPEED: f64 = 0.1;
 
 /// `m` standard-normal points from the Halton sequence (bases 2 and 3)
 /// through the Box–Muller transform.
@@ -287,15 +277,8 @@ impl Controller for McaFollower {
             .map(|i| obstacles.iter().map(|o| modes_at(o, (i + 1) as f64 * step, step).collect()).collect())
             .collect();
         let normals = &self.normals;
-        let moving: Vec<bool> = obstacles
-            .iter()
-            .map(|o| match (modes_at(o, 0.0, step).next(), modes_at(o, 1.0, step).next()) {
-                (Some(a), Some(b)) => (b.x - a.x).hypot(b.y - a.y) > MOVING_SPEED,
-                _ => false,
-            })
-            .collect();
         let near: Vec<Near> = modes.iter().map(|at| Near::new(at, &discs)).collect();
-        let probability_of = |i: usize, x: f64, y: f64, yaw: f64, only_moving: bool, footprint: &[(f64, f64)]| -> f64 {
+        let probability_of = |i: usize, x: f64, y: f64, yaw: f64, footprint: &[(f64, f64)]| -> f64 {
             let i = i.min(n - 1);
             let (s, c) = yaw.sin_cos();
             let near = &near[i];
@@ -303,9 +286,6 @@ impl Controller for McaFollower {
                 let mut survive = 1.0;
                 for &k in found {
                     let k = k as usize;
-                    if only_moving && !moving[k] {
-                        continue;
-                    }
                     let (mut p, mut total) = (0.0, 0.0);
                     for m in &modes[i][k] {
                         let hit = footprint
@@ -325,8 +305,8 @@ impl Controller for McaFollower {
         let checker = CollisionChecker::new(world, constraints, margin).with_step(step);
         let (soft, hard, threshold) = (cfg.weight_soft_risk, cfg.weight_hard_risk, cfg.risk_threshold);
         let extra = |i: usize, x: f64, y: f64, yaw: f64| -> f64 {
-            let mut p = probability_of(i, x, y, yaw, false, &discs);
-            let mut p_hit = probability_of(i, x, y, yaw, false, &bare);
+            let mut p = probability_of(i, x, y, yaw, &discs);
+            let mut p_hit = probability_of(i, x, y, yaw, &bare);
             if has_grid && checker.grid_clearance(x, y, yaw) < 0.0 {
                 (p, p_hit) = (1.0, 1.0);
             }
@@ -334,22 +314,12 @@ impl Controller for McaFollower {
             soft * p + if p_hit > threshold { hard * urgency } else { 0.0 }
         };
 
-        let plan = self.mppi.predicted_trajectory();
-        let risk = plan
-            .windows(2)
-            .take(IMMINENT_STEPS)
-            .enumerate()
-            .map(|(i, w)| probability_of(i, w[1].x, w[1].y, (w[1].y - w[0].y).atan2(w[1].x - w[0].x), true, &discs))
-            .fold(0.0_f64, f64::max);
-        let ref_scale = (1.0 - cfg.risk_slowdown_gain.max(0.0) * risk).clamp(cfg.min_velocity_scale.clamp(0.0, 1.0), 1.0);
-
         let reach = discs.iter().map(|d| d.1).fold(0.0_f64, f64::max);
         let speed = self.mppi.mppi_config.ref_velocity.min(constraints.max_linear_velocity);
         let all: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
         let (detoured, share) = self.mppi.avoidance(state, constraints, all, reach, n, step, speed);
         let relax = detour_relax(&detoured, (speed * step).max(0.3));
-        let ref_scale = ref_scale.min(share);
-        self.mppi.step_with(state, goal, constraints, dt, &extra, &relax, ref_scale, "MCA tracking", "mca_tracking")
+        self.mppi.step_with(state, goal, constraints, dt, &extra, &relax, share, "MCA tracking", "mca_tracking")
     }
 
     fn set_path(&mut self, path: Path) {

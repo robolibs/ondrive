@@ -536,12 +536,14 @@ impl Controller for IlqrFollower {
             let guided = Problem { model: &model, reference: &guide.reference, cfg: &cfg, field: &field };
             let (us, _, iterations) = guided.solve(&x0, warm.clone());
             let switch = *side != 0.0 && self.side != 0.0 && *side != self.side;
-            let scored = if guide.pace < 1.0 { &guided } else { &problem };
+            // Every solve is scored on the same objective: the reference at
+            // its own pace, against every obstacle.
+            let scored = &problem;
             let (xs, rolled) = scored.rollout(&x0, &us);
             if self.debug_level == DebugLevel::Full {
                 tried.push((xs.iter().map(|x| { let (ox, oy) = model.origin(x[0], x[1], x[2]); Point::new(ox, oy, 0.0) }).collect(), rolled));
             }
-            let c = rolled * if switch { SIDE_SWITCH_COST } else { 1.0 } + guide.pace_cost();
+            let c = rolled * if switch { SIDE_SWITCH_COST } else { 1.0 };
             if c.is_finite() && best.as_ref().is_none_or(|b| c < b.0) {
                 best = Some((c, *side, us, iterations));
             }

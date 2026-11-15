@@ -151,53 +151,42 @@ pub(crate) fn actuated_after(model: &Model, previous: Option<f64>, command: f64,
 
 /// The references to solve against, each with the side it passes
 /// obstacles on (0 none): `reference`; its detours round the obstacles on
-/// either side (behind crossing traffic), ramped as the machine of
-/// `constraints` can swerve, `reference` relaxed where they leave it
-/// (topology-guided MPC, de Groot et al. 2024); and, when something crosses
-/// the path, the reference at `GIVE_WAY_SHARES` of its pace, letting the
-/// crossing pass first (the same idea over time instead of space).
+/// either side, each met where it is predicted at the reference's own time,
+/// ramped as the machine of `constraints` can swerve, `reference` relaxed
+/// where they leave it (topology-guided MPC, de Groot et al. 2024); and,
+/// wherever it meets an obstacle, the reference at `PACES` of its pace (the
+/// same idea over time instead of space). Every one is solved against every
+/// obstacle and the cheapest is driven.
 pub(crate) fn guided(reference: &mut Reference, obstacles: &[Obstacle], reach: f64, dt: f64, constraints: &RobotConstraints) -> Vec<Guide> {
-    let crossing = obstacles.iter().any(|o| crate::pred::mppi::crosses(o, reference, dt, reach));
-    let behind = crate::pred::mppi::pass_behind(obstacles, reference, dt, reach);
     let speed = reference.v.iter().copied().fold(0.0_f64, |a, v| a.max(v.abs()));
     let swerve = crate::pred::mppi::Swerve::of(constraints, speed);
     let detours: Vec<Guide> = [1.0, -1.0]
         .into_iter()
-        .filter(|side| behind.is_none_or(|b| b == *side))
         .filter_map(|side| {
-            reference.detour(obstacles, reach + DETOUR_MARGIN, dt, side, DETOUR_RAMP, swerve).map(|r| Guide { reference: r, side, pace: 1.0 })
+            reference.detour(obstacles, reach + DETOUR_MARGIN, dt, side, DETOUR_RAMP, swerve).map(|r| Guide { reference: r, side })
         })
         .collect();
     reference.relax_where_detoured(detours.iter().map(|d| &d.reference), DETOURED_WEIGHT);
-    let give_way: Vec<Guide> = if crossing {
-        GIVE_WAY_SHARES.iter().map(|s| Guide { reference: reference.paced(*s), side: 0.0, pace: *s }).collect()
-    } else {
+    // Wherever the reference meets an obstacle, standing or moving, slower
+    // paces are solved too: the way past it before or after it is there.
+    let paced: Vec<Guide> = if detours.is_empty() {
         Vec::new()
+    } else {
+        PACES.iter().map(|s| Guide { reference: reference.paced(*s), side: 0.0 }).collect()
     };
-    std::iter::once(Guide { reference: reference.clone(), side: 0.0, pace: 1.0 }).chain(detours).chain(give_way).collect()
+    std::iter::once(Guide { reference: reference.clone(), side: 0.0 }).chain(detours).chain(paced).collect()
 }
 
 /// A reference to solve against: the side it passes obstacles on (+1 left,
-/// −1 right, 0 none) and the share of the path's pace it keeps.
+/// −1 right, 0 none).
 pub(crate) struct Guide {
     pub reference: Reference,
     pub side: f64,
-    pub pace: f64,
 }
 
-impl Guide {
-    /// Cost added to a solve for the pace it gives up: a give-way solve,
-    /// scored against its own slower reference, wins only while keeping
-    /// pace costs that much more, so the robot resumes once the way is clear.
-    pub fn pace_cost(&self) -> f64 {
-        GIVE_WAY_COST * (1.0 - self.pace)
-    }
-}
-
-/// Shares of the reference's pace offered to give way to crossing traffic.
-const GIVE_WAY_SHARES: [f64; 3] = [0.6, 0.3, 0.0];
-/// Cost of giving up the whole pace, in the units of the solves' costs.
-const GIVE_WAY_COST: f64 = 60.0;
+/// Shares of the reference's pace also solved for wherever it meets an
+/// obstacle.
+const PACES: [f64; 3] = [0.6, 0.3, 0.0];
 
 /// Control channel `k` of `controls`: steering, acceleration, lateral
 /// acceleration.
@@ -518,10 +507,9 @@ impl Controller for MpcFollower {
             }
             let side = &guide.side;
             let switch = *side != 0.0 && self.side != 0.0 && *side != self.side;
-            let scored = if guide.pace < 1.0 { &guide.reference } else { &reference };
-            let c = total_cost(&model, scored, &w, &cfg, &barrier, &steer, &accel, &accel_lat)
-                * if switch { SIDE_SWITCH_COST } else { 1.0 }
-                + guide.pace_cost();
+            // Every solve is scored on the same objective: the reference at
+            // its own pace, against every obstacle.
+            let c = total_cost(&model, &reference, &w, &cfg, &barrier, &steer, &accel, &accel_lat) * if switch { SIDE_SWITCH_COST } else { 1.0 };
             if self.debug_level == DebugLevel::Full {
                 let (_, path) = rollout(&model, &steer, &accel, &accel_lat, &reference, &w, &barrier, true);
                 tried.push((path, c));
