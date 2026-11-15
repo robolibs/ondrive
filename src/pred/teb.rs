@@ -87,7 +87,6 @@ const LAG_MARGIN_GAIN: f64 = 0.25;
 /// Poses of the band checked for collision before it is driven: all of
 /// it, so a band that would be in the way when the traffic comes is never
 /// begun (teb_local_planner checks `feasibility_check_no_poses`, 5).
-
 const FEASIBILITY_POSES: usize = usize::MAX;
 /// Metres between the checks along each stretch of band checked.
 const FEASIBILITY_STEP: f64 = 0.1;
@@ -160,8 +159,6 @@ impl Problem<'_> {
         (x + self.axle * yaw.cos(), y + self.axle * yaw.sin())
     }
 
-    /// Penalty for coming within `margin` of an obstacle as it is predicted
-    /// `t` seconds from now.
     /// Whether the body driven along the first `poses` poses of `b`, and
     /// every `FEASIBILITY_STEP` metres between them, stays clear of every
     /// obstacle as predicted at that moment (teb_local_planner's
@@ -189,6 +186,8 @@ impl Problem<'_> {
         true
     }
 
+    /// Penalty for coming within `margin` of an obstacle as it is predicted
+    /// `t` seconds from now.
     fn obstacle_cost(&self, t: f64, x: f64, y: f64, yaw: f64) -> f64 {
         let (x, y) = self.pose_of(x, y, yaw);
         let c = self.cfg;
