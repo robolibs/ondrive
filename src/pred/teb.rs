@@ -21,7 +21,7 @@ use crate::core::kinematics::{
 use crate::core::math::{normalize_angle, yaw_of};
 use crate::core::obstacles::{CollisionChecker, robot_radius};
 use crate::core::path::{PathCursor, cumulative_lengths, project, sample};
-use crate::pred::mppi::{Swerve, build_reference, current_lateral_speed, current_speed, pick_detour, prepare, signed_speed_at};
+use crate::pred::mppi::{Along, Choice, Swerve, current_lateral_speed, current_speed, plan_avoidance, prepare, signed_speed_at};
 use crate::types::{Goal, Obstacle, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::{Euler, Point, Pose, Quaternion};
 
@@ -104,8 +104,8 @@ pub struct TebFollower {
     last_v: f64,
     last_vy: f64,
     last_w: f64,
-    /// Side the band last went round obstacles on: +1 left, −1 right, 0 none.
-    side: f64,
+    /// The way past the obstacles last chosen, see `plan_avoidance`.
+    avoid: Choice,
     auto_path_goal: Option<(f64, f64, f64)>,
     /// Distance, metres, the pose rides ahead of the band's points, the axle the
     /// body turns about.
@@ -337,29 +337,33 @@ impl TebFollower {
         Self::default()
     }
 
-    /// The way round the obstacles blocking the stretch of path ahead of
-    /// arc length `from`, as poses for the band to follow, on the cheaper
-    /// side with hysteresis; `None` when nothing blocks it.
-    fn detour_guide(&mut self, from: f64, constraints: &RobotConstraints, obstacles: &[Obstacle]) -> Option<Vec<Pose>> {
+    /// The way past the obstacles ahead of arc length `from` that the
+    /// avoidance planner shared with MPPI picks over space and time
+    /// (`plan_avoidance`, committed across ticks): as poses for the band to
+    /// follow, `None` when it keeps to the path, and the share of the speed
+    /// it drives at.
+    fn detour_guide(&mut self, state: &RobotState, from: f64, constraints: &RobotConstraints, obstacles: &[Obstacle]) -> (Option<Vec<Pose>>, f64) {
         if obstacles.is_empty() {
-            self.side = 0.0;
-            return None;
+            self.avoid = Choice::default();
+            return (None, 1.0);
         }
         let step = self.teb_config.dt_nominal.max(0.05);
         let n = 2 * self.teb_config.n_poses.max(3);
         let speed = (0.8 * constraints.max_linear_velocity).max(0.1);
-        let reference = build_reference(&self.base.path, &self.cursor.cum, from, n, step, speed, 0.0);
-        let g = pick_detour(&reference, obstacles, robot_radius(constraints), step, &mut self.side, Swerve::of(constraints, speed))?;
-        let k = g.x.len();
-        Some(
+        let along = Along { path: &self.base.path, cum: &self.cursor.cum, trajectory: None, clock: 0.0, from };
+        let robot = (state.pose.point.x, state.pose.point.y, yaw_of(&state.pose));
+        let plan = plan_avoidance(&along, obstacles, robot_radius(constraints), Swerve::of(constraints, speed), n, step, speed, robot, &mut self.avoid);
+        let poses = plan.guide.map(|g| {
+            let k = g.x.len();
             (0..k)
                 .map(|i| {
                     let (a, b) = (i.saturating_sub(1), (i + 1).min(k - 1));
                     let yaw = (g.y[b] - g.y[a]).atan2(g.x[b] - g.x[a]);
                     Pose { point: Point::new(g.x[i], g.y[i], 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, yaw)) }
                 })
-                .collect(),
-        )
+                .collect()
+        });
+        (poses, plan.pace)
     }
 
     pub fn with_teb_config(cfg: TebConfig) -> Self {
@@ -640,12 +644,14 @@ impl Controller for TebFollower {
         let mut cum = self.cursor.cum.clone();
         let mut start_segment = prep.proj.segment;
         let obstacles: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
-        if let Some(guide) = self.detour_guide(prep.proj.arc_length, constraints, obstacles) {
+        let (guide, pace) = self.detour_guide(state, prep.proj.arc_length, constraints, obstacles);
+        if let Some(guide) = guide {
             cum = cumulative_lengths(&guide);
             target = guide.last().map(|p| (p.point, yaw_of(p))).unwrap_or(target);
             waypoints = guide;
             start_segment = 0;
         }
+        let v_hi_paced = v_hi * pace.clamp(0.0, 1.0);
         let cfg = self.teb_config.clone();
         let problem = Problem {
             cfg: &cfg,
@@ -656,7 +662,7 @@ impl Controller for TebFollower {
             target,
             kappa_max: max_curvature(constraints),
             v_lo,
-            v_hi,
+            v_hi: v_hi_paced,
             v_start: v_now,
             w_start: if state.velocity_valid { state.velocity.angular } else { self.last_w },
             steer_per_wheelbase: if is_ackermann(constraints.steering_type) && constraints.max_steering_rate > 0.0 {
