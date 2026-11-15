@@ -217,9 +217,9 @@ impl Swerve {
 /// Room, metres, beside the body that `Swerve::lookahead` swerves for: an
 /// obstacle's width and the margin past it.
 const SWERVE_ROOM: f64 = 1.5;
-/// Least room, metres, a detour keeps beside the body: past the margin the
-/// obstacle critics count as contact.
-const DETOUR_BODY_MARGIN: f64 = 0.45;
+/// Least room, metres, a detour keeps beside the body: past the MPPI safety
+/// margin, so a detour it is given never counts as contact.
+const DETOUR_BODY_MARGIN: f64 = 0.65;
 /// Least room, metres, a threaded guide keeps beside the body past a mode's
 /// radius and spread, tried in turn, each past the MPPI safety margin so a
 /// way it is given never counts as contact.
