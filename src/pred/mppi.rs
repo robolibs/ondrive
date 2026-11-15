@@ -221,9 +221,9 @@ const SWERVE_ROOM: f64 = 1.5;
 /// obstacle critics count as contact.
 const DETOUR_BODY_MARGIN: f64 = 0.45;
 /// Least room, metres, a threaded guide keeps beside the body past a mode's
-/// radius and spread, tried in turn: past the MPPI safety margin, then down
-/// to less where no way keeps more.
-const GUIDE_ROOMS: [f64; 3] = [0.8, 0.65, 0.5];
+/// radius and spread, tried in turn, each past the MPPI safety margin so a
+/// way it is given never counts as contact.
+const GUIDE_ROOMS: [f64; 2] = [0.8, 0.65];
 /// Clearance, metres, below which a candidate way meets an obstacle at its
 /// own timing and is not driven.
 const GUIDE_CONTACT: f64 = 0.15;
@@ -600,9 +600,11 @@ impl Reference {
             out.lateral.clear();
             Some(out)
         };
-        // The room a detour keeps first, then less, as `rooms` allow.
-        std::iter::once(keep)
-            .chain(rooms.iter().copied().filter(|r| *r < keep))
+        // The room a detour keeps, at least the first of `rooms`, then less,
+        // as `rooms` allow.
+        let first = keep.max(rooms.first().copied().unwrap_or(keep));
+        std::iter::once(first)
+            .chain(rooms.iter().copied().filter(|r| *r < first))
             .map(|room| [plan(0, centres[0], room), plan(1, centres[1], room)])
             .find(|ways| ways.iter().any(Option::is_some))
             .unwrap_or([None, None])
