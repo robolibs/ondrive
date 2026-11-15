@@ -766,12 +766,9 @@ impl Tracker {
 
     /// Once the run up to a turn tighter than the machine steers is driven,
     /// or the machine stands within the stop tolerance of its end or past it,
-    /// the turn itself, in legs at full lock: forward towards the far side
-    /// until the body, stopping, would come within `TURN_ROOM_M` of an
-    /// obstacle that stays put, then back at the other lock the same way,
-    /// every leg turning the machine the same way round, until it faces the
-    /// path past the turn, which it then drives on. `None` while the
-    /// controller drives.
+    /// the turn itself: the one `manoeuvre::plan_turn` picks from the
+    /// turners, where one keeps clear, else in legs at full lock
+    /// (`drive_legs`). `None` while the controller drives.
     fn drive_turn(&mut self, state: &RobotState, world: Option<&WorldConstraints>, dt: f64) -> Option<VelocityCommand> {
         let reach = self.stop_tolerance();
         let turn = self.turn.as_mut()?;
@@ -782,6 +779,141 @@ impl Tracker {
         if !turn.started {
             return None;
         }
+        if !turn.fallback {
+            let cmd = self.drive_planned(state, world, dt, reach);
+            if cmd.is_some() || self.turn.is_none() {
+                return cmd;
+            }
+        }
+        self.drive_legs(state, world, dt)
+    }
+
+    /// The path past the turn, from `along` metres on, handed back to the
+    /// controller.
+    fn finish_turn(&mut self, along: f64) -> Option<VelocityCommand> {
+        let rest = manoeuvre::path_from(&self.turn.take()?.rest, along);
+        self.drive(rest);
+        self.manoeuvred = false;
+        None
+    }
+
+    /// The turn as planned with the turners, piece by piece: the wheels
+    /// swung to each piece's curvature standing, the piece driven by the
+    /// axle the machine turns about to its length and stopped. Planned again
+    /// from where the machine stands where a piece is blocked. `None` once
+    /// it is done, or with `Turn::fallback` set where no clear turn is found
+    /// from the start or from a blocked piece.
+    fn drive_planned(&mut self, state: &RobotState, world: Option<&WorldConstraints>, dt: f64, reach: f64) -> Option<VelocityCommand> {
+        let c = &self.constraints;
+        let radius = manoeuvre::tightest(c)?;
+        let axle = crate::core::kinematics::axle_offset(c);
+        let speed = (TURN_SPEED_SHARE * c.max_linear_velocity.abs()).clamp(TURN_SPEED_MIN, TURN_SPEED_MAX);
+        let a = c.max_linear_acceleration.abs().max(0.1);
+        let rate = if c.max_steering_rate > 0.0 { c.max_steering_rate } else { TURN_STEER_RATE };
+        let units = match self.controller.get_config().output_units {
+            OutputUnits::Physical => (1.0, 1.0),
+            OutputUnits::Normalized => (c.max_linear_velocity.max(1e-6), c.max_angular_velocity.max(1e-6)),
+        };
+        let wheels = self.last_steering.unwrap_or(0.0);
+        let turn = self.turn.as_mut()?;
+        let rolling = if state.velocity_valid { state.velocity.linear } else { 0.0 };
+        let yaw = state.pose.rotation.to_euler().yaw;
+        let here = (state.pose.point.x, state.pose.point.y, yaw);
+        let standing = manoeuvre::standing(world);
+        let checker = CollisionChecker::new(Some(&standing), c, 0.0);
+        let clearance = checker.clearance(0, here.0, here.1, here.2);
+        if turn.braking || turn.plan.is_none() {
+            if rolling.abs() > STANDING_SPEED {
+                return Some(stop("Turning: stopping"));
+            }
+            turn.braking = false;
+            let blocked = turn.plan.is_some() && !turn.piece_done;
+            turn.piece += usize::from(turn.piece_done);
+            turn.piece_done = false;
+            turn.driven = 0.0;
+            turn.last = None;
+            let pieces = turn.plan.as_ref().map_or(0, |p| p.pieces.len());
+            let end = turn.plan.as_ref().map_or(turn.target, |p| p.end);
+            let off = crate::core::math::normalize_angle(crate::core::math::yaw_of(&end) - yaw).abs();
+            let arrived = state.pose.point.distance_to_2d(end.point) < reach && off < TURN_FACING;
+            if (turn.plan.is_some() && turn.piece >= pieces) || arrived {
+                let along = turn.plan.as_ref().map_or(0.0, |p| p.along);
+                return self.finish_turn(along);
+            }
+            if turn.stops >= TURN_MOST_STOPS {
+                return self.finish_turn(0.0);
+            }
+            turn.stops += 1;
+            if turn.plan.is_none() || blocked {
+                // Each piece ends standing: the drive, reversing dearer, its
+                // stop, the wheels swung to it at rest, and a turn of direction
+                // from the last, the machine arriving forward.
+                let cost = |pieces: &[manoeuvre::Piece]| {
+                    let (mut steer, mut dir) = (wheels, 1.0);
+                    pieces.iter().fold(0.0, |t, p| {
+                        let lock = curvature_to_steering(p.curvature, c);
+                        let swing = (lock - steer).abs() / rate * TURN_STEER_STANDING;
+                        let drive = p.length / speed * if p.dir < 0.0 { TURN_REVERSE_COST } else { 1.0 };
+                        let cusp = if p.dir == dir { 0.0 } else { TURN_CUSP_S };
+                        (steer, dir) = (lock, p.dir);
+                        t + swing + drive + speed / a + cusp
+                    })
+                };
+                let room = TURN_ROOM_M.min(clearance - TURN_STEP_M);
+                let body = (c.robot_length.max(0.1), c.robot_width.max(0.1));
+                let ends: Vec<(Pose, f64, f64)> = manoeuvre::poses_along(&turn.rest, &TURN_ENDS.map(|k| k * radius))
+                    .into_iter()
+                    .map(|(pose, along)| (pose, along, along / c.max_linear_velocity.abs().max(speed)))
+                    .collect();
+                let Some(plan) = manoeuvre::plan_turn(&state.pose, &ends, axle, radius, body, &checker, room, &cost) else {
+                    turn.fallback = true;
+                    turn.steered = None;
+                    return None;
+                };
+                turn.plan = Some(plan);
+                turn.piece = 0;
+            }
+        }
+        let plan = turn.plan.as_ref()?;
+        let piece = *plan.pieces.get(turn.piece)?;
+        let lock = curvature_to_steering(piece.curvature, c);
+        let label = format!("{} {}/{}", plan.name, turn.piece + 1, plan.pieces.len());
+        if let Some(cmd) = steer_standing(turn, lock, piece.curvature, wheels, rate, units.1, dt, &label) {
+            return Some(cmd);
+        }
+        let turning_axle = Point::new(here.0 - axle * yaw.cos(), here.1 - axle * yaw.sin(), state.pose.point.z);
+        turn.driven += turn.last.map_or(0.0, |p| p.distance_to_2d(turning_axle));
+        turn.last = Some(turning_axle);
+        let remaining = piece.length - turn.driven;
+        let cap = speed.min((a * piece.length).sqrt()).max(TURN_CREEP_MPS);
+        let stopping = rolling * rolling / (2.0 * a) + rolling.abs() * dt;
+        let guard = TURN_GUARD_M.min(clearance - TURN_STEP_M);
+        let look = (cap * cap / (2.0 * a) + TURN_MARGIN_M).min(remaining.max(TURN_STEP_M));
+        let blocked = swept(&checker, here, piece.dir * look, piece.curvature, guard, axle).is_none();
+        if remaining <= stopping || blocked {
+            turn.braking = true;
+            turn.piece_done = remaining <= stopping;
+            return Some(stop("Turning: end of piece"));
+        }
+        let v = piece.dir * cap;
+        Some(VelocityCommand {
+            valid: true,
+            linear_velocity: v / units.0,
+            angular_velocity: v * piece.curvature / units.1,
+            steering_angle: lock,
+            status_message: format!("Turning: {label} {}", if piece.dir > 0.0 { "forward" } else { "reversing" }),
+            ..Default::default()
+        })
+    }
+
+    /// The turn in legs at full lock, where no planned one keeps clear:
+    /// forward towards the far side until the body, stopping, would come
+    /// within `TURN_ROOM_M` of an obstacle that stays put, then back at the
+    /// other lock only until a forward leg would finish clear, every leg
+    /// turning the machine the same way round, until it faces the path past
+    /// the turn, which it then drives on.
+    fn drive_legs(&mut self, state: &RobotState, world: Option<&WorldConstraints>, dt: f64) -> Option<VelocityCommand> {
+        let turn = self.turn.as_mut()?;
         let yaw = state.pose.rotation.to_euler().yaw;
         let left = (turn.side * (turn.target.rotation.to_euler().yaw - yaw)).rem_euclid(std::f64::consts::TAU);
         let facing = !(TURN_FACING..=std::f64::consts::TAU - TURN_PAST).contains(&left);
@@ -814,6 +946,7 @@ impl Tracker {
         let speed = (TURN_SPEED_SHARE * c.max_linear_velocity.abs()).clamp(TURN_SPEED_MIN, TURN_SPEED_MAX);
         let a = c.max_linear_acceleration.abs().max(0.1);
         let curvature = turn.side * turn.dir / radius;
+        let axle = crate::core::kinematics::axle_offset(c);
         let (linear_unit, angular_unit) = match self.controller.get_config().output_units {
             OutputUnits::Physical => (1.0, 1.0),
             OutputUnits::Normalized => (c.max_linear_velocity.max(1e-6), c.max_angular_velocity.max(1e-6)),
@@ -843,13 +976,13 @@ impl Tracker {
         let here = (state.pose.point.x, state.pose.point.y, yaw);
         // Never nearer than the room, or than the machine already stands.
         let room = TURN_ROOM_M.min(checker.clearance(0, here.0, here.1, here.2) - TURN_STEP_M);
-        let ahead = swept(&checker, here, turn.dir * (stopping + TURN_MARGIN_M), curvature, room);
+        let ahead = swept(&checker, here, turn.dir * (stopping + TURN_MARGIN_M), curvature, room, axle);
         // A reversing leg ends once the forward one, from where this one
         // stops, would finish the turn clear.
         let finishes = turn.dir < 0.0
-            && swept(&checker, here, turn.dir * stopping, curvature, room).is_some_and(|stop| {
+            && swept(&checker, here, turn.dir * stopping, curvature, room, axle).is_some_and(|stop| {
                 let rest = (left - stopping / radius - TURN_FACING).max(0.0) * radius;
-                swept(&checker, stop, -turn.dir * rest, -curvature, TURN_ROOM_M).is_some()
+                swept(&checker, stop, -turn.dir * rest, -curvature, TURN_ROOM_M, axle).is_some()
             });
         // The machine turns on while it stops, so the last leg brakes that early.
         if left < TURN_FACING + stopping / radius {
@@ -1832,28 +1965,62 @@ const TURN_STEER_STANDING: f64 = 1.6;
 /// command of no speed and this times a curvature swings the wheels to it.
 const STEER_AT_REST_MPS: f64 = 0.05;
 
-/// The pose `(x, y, heading)` ends at after `length` metres (negative
-/// reversing) at `curvature`, in `TURN_STEP_M` steps, or `None` where the
+/// The pose `(x, y, heading)`, `ahead` metres in front of the axle the
+/// machine turns about, ends at after that axle drives `length` metres
+/// (negative reversing) at `curvature`, or `None` where the
 /// body on the way comes nearer than `room` to an obstacle of `checker`.
-fn swept(checker: &CollisionChecker, from: (f64, f64, f64), length: f64, curvature: f64, room: f64) -> Option<(f64, f64, f64)> {
-    let steps = (length.abs() / TURN_STEP_M).ceil().max(1.0) as usize;
-    let ds = length / steps as f64;
-    let (mut x, mut y, mut heading) = from;
-    for _ in 0..steps {
-        let mid = heading + 0.5 * curvature * ds;
-        x += ds * mid.cos();
-        y += ds * mid.sin();
-        heading += curvature * ds;
-        if checker.clearance(0, x, y, heading) < room {
-            return None;
-        }
-    }
-    Some((x, y, heading))
+fn swept(checker: &CollisionChecker, from: (f64, f64, f64), length: f64, curvature: f64, room: f64, ahead: f64) -> Option<(f64, f64, f64)> {
+    let piece = manoeuvre::Piece { curvature, dir: if length < 0.0 { -1.0 } else { 1.0 }, length: length.abs() };
+    manoeuvre::swept_pieces(checker, from, &[piece], room, ahead)
 }
 
-/// A turn tighter than the machine steers, driven in legs at full lock.
+/// While the wheels of `turn` swing to `lock` at `rate` slowed for
+/// standing, from where they last were or `wheels`, the command that holds
+/// the machine still with them swinging; `None` once they are there.
+#[allow(clippy::too_many_arguments)]
+fn steer_standing(turn: &mut Turn, lock: f64, curvature: f64, wheels: f64, rate: f64, angular_unit: f64, dt: f64, label: &str) -> Option<VelocityCommand> {
+    if turn.steered != Some(lock) {
+        turn.steer_wait = (lock - turn.steered.unwrap_or(wheels)).abs() / rate * TURN_STEER_STANDING;
+        turn.steered = Some(lock);
+    }
+    if turn.steer_wait <= 0.0 {
+        return None;
+    }
+    turn.steer_wait -= dt;
+    Some(VelocityCommand {
+        valid: true,
+        angular_velocity: STEER_AT_REST_MPS * curvature / angular_unit,
+        steering_angle: lock,
+        status_message: format!("Turning: steering for {label}"),
+        ..Default::default()
+    })
+}
+
+/// How much dearer reversing is than driving forward, and the seconds a
+/// turn of direction costs, in choosing a planned turn.
+const TURN_REVERSE_COST: f64 = 2.0;
+const TURN_CUSP_S: f64 = 2.0;
+/// Tightest radii past the turn along the path the turners aim at.
+const TURN_ENDS: [f64; 5] = [0.0, 0.5, 1.0, 2.0, 3.0];
+/// Most stops a planned turn makes before the controller takes over again.
+const TURN_MOST_STOPS: usize = 16;
+/// Slowest speed, m/s, a piece of a planned turn is driven at.
+const TURN_CREEP_MPS: f64 = 0.15;
+/// Room, metres, a piece of a planned turn is stopped short of.
+const TURN_GUARD_M: f64 = 0.15;
+
+/// A turn tighter than the machine steers, driven as planned with the
+/// turners or in legs at full lock.
 #[derive(Clone, Debug, Default)]
 struct Turn {
+    /// The turn planned, the piece of it being driven, whether that piece
+    /// was driven to its end, and the stops made.
+    plan: Option<manoeuvre::PlannedTurn>,
+    piece: usize,
+    piece_done: bool,
+    stops: usize,
+    /// Whether the turn is driven in legs, no planned one keeping clear.
+    fallback: bool,
     /// Where the run up to the turn ends.
     from: Pose,
     /// Pose past the turn, facing the path on.

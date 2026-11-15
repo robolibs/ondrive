@@ -8,6 +8,7 @@ use crate::core::curves::{CurvePath, reeds_shepp_all};
 use crate::core::math::{normalize_angle, yaw_of};
 use crate::core::obstacles::{CollisionChecker, stays_put};
 use crate::core::path::{cumulative_lengths, sample};
+use crate::turners::{Dubins, DubinsPath, DubinsSegmentType, Pose2D, ReedsShepp, ReedsSheppPath, ReedsSheppSegmentType, Sharper};
 use crate::types::{Path, RobotConstraints, WorldConstraints};
 use datapod::{Euler, Point, Pose, Quaternion};
 
@@ -120,6 +121,208 @@ pub fn split_at_tight(path: &Path, radius: f64) -> Option<(Path, Pose, Path)> {
     let before = part(&|s| s < from - 1e-6, pose(from), true);
     let after = part(&|s| s > to + 1e-6, pose(to), false);
     Some((before, pose(to), after))
+}
+
+/// One stretch of a planned turn: `length` metres at `curvature`, forward
+/// (`dir` 1) or reversing (`dir` −1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Piece {
+    pub curvature: f64,
+    pub dir: f64,
+    pub length: f64,
+}
+
+/// A turn planned with the turners: which one, its pieces, the pose it
+/// ends at, and how far along the path past the turn that lies.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlannedTurn {
+    pub name: String,
+    pub pieces: Vec<Piece>,
+    pub end: Pose,
+    pub along: f64,
+}
+
+/// Shares of the tightest turning radius turns are planned at.
+const TURN_RADII: [f64; 4] = [1.0, 1.05, 1.25, 1.5];
+/// Sharp-turn patterns tried, their corners joined by Reeds–Shepp curves.
+const PATTERNS: [&str; 3] = ["three_point", "bulb", "fishtail"];
+/// Metres between the poses a planned turn is checked for room at.
+const CHECK_STEP: f64 = 0.05;
+
+
+/// The pieces of a Reeds–Shepp curve of `radius`.
+fn rs_pieces(path: &ReedsSheppPath, radius: f64) -> Vec<Piece> {
+    path.segments
+        .iter()
+        .map(|s| {
+            let turn = match s.r#type {
+                ReedsSheppSegmentType::LeftForward | ReedsSheppSegmentType::LeftBackward => 1.0,
+                ReedsSheppSegmentType::RightForward | ReedsSheppSegmentType::RightBackward => -1.0,
+                _ => 0.0,
+            };
+            Piece { curvature: turn / radius, dir: if s.forward { 1.0 } else { -1.0 }, length: s.length * radius }
+        })
+        .collect()
+}
+
+/// The pieces of a Dubins curve of `radius`, all forward.
+fn dubins_pieces(path: &DubinsPath, radius: f64) -> Vec<Piece> {
+    path.segments
+        .iter()
+        .map(|s| {
+            let turn = match s.r#type {
+                DubinsSegmentType::Left => 1.0,
+                DubinsSegmentType::Right => -1.0,
+                DubinsSegmentType::Straight => 0.0,
+            };
+            Piece { curvature: turn / radius, dir: 1.0, length: s.length * radius }
+        })
+        .collect()
+}
+
+/// `pieces` with the empty ones dropped and runs at one curvature and
+/// direction joined.
+fn tidied(pieces: Vec<Piece>) -> Vec<Piece> {
+    let mut out: Vec<Piece> = Vec::with_capacity(pieces.len());
+    for p in pieces.into_iter().filter(|p| p.length > 1e-3) {
+        match out.last_mut() {
+            Some(q) if q.dir == p.dir && (q.curvature - p.curvature).abs() < 1e-9 => q.length += p.length,
+            _ => out.push(p),
+        }
+    }
+    out
+}
+
+/// `pose` moved `ahead` metres along its heading.
+fn shifted(pose: (f64, f64, f64), ahead: f64) -> (f64, f64, f64) {
+    (pose.0 + ahead * pose.2.cos(), pose.1 + ahead * pose.2.sin(), pose.2)
+}
+
+/// The pose `(x, y, heading)`, `ahead` metres in front of the axle the
+/// machine turns about, that `pieces` driven by that axle end at from
+/// `from`, or `None` where the body on the way comes nearer than `room` to
+/// an obstacle of `checker`.
+pub fn swept_pieces(checker: &CollisionChecker, from: (f64, f64, f64), pieces: &[Piece], room: f64, ahead: f64) -> Option<(f64, f64, f64)> {
+    let (mut x, mut y, mut heading) = shifted(from, -ahead);
+    for p in pieces {
+        let steps = (p.length / CHECK_STEP).ceil().max(1.0) as usize;
+        let ds = p.dir * p.length / steps as f64;
+        for _ in 0..steps {
+            let mid = heading + 0.5 * p.curvature * ds;
+            x += ds * mid.cos();
+            y += ds * mid.sin();
+            heading += p.curvature * ds;
+            let (px, py, _) = shifted((x, y, heading), ahead);
+            if checker.clearance(0, px, py, heading) < room {
+                return None;
+            }
+        }
+    }
+    Some(shifted((x, y, heading), ahead))
+}
+
+/// Every turn the turners give from `start` to one of `ends`, each a pose,
+/// how far along the path past the turn it lies, and the seconds reaching
+/// it saves, all poses `ahead`
+/// metres in front of the axle the machine turns about, that axle turning
+/// no tighter than `radius` times each of `TURN_RADII`: the Dubins and
+/// Reeds–Shepp curves, and the sharp-turn patterns of a `body` (length,
+/// width) with their corners joined by the cheapest clear Reeds–Shepp
+/// curve; of those whose body keeps `room` from the obstacles of
+/// `checker`, the cheapest by `cost` less the credit of its end.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_turn(
+    start: &Pose,
+    ends: &[(Pose, f64, f64)],
+    ahead: f64,
+    radius: f64,
+    body: (f64, f64),
+    checker: &CollisionChecker,
+    room: f64,
+    cost: &dyn Fn(&[Piece]) -> f64,
+) -> Option<PlannedTurn> {
+    let axle = |p: &Pose| {
+        let (x, y, h) = shifted((p.point.x, p.point.y, yaw_of(p)), -ahead);
+        Pose2D::new(x, y, h)
+    };
+    let a = axle(start);
+    let origin = |p: &Pose2D| shifted((p.point.x, p.point.y, p.yaw), ahead);
+    let clear = |from: &Pose2D, pieces: &[Piece]| swept_pieces(checker, origin(from), pieces, room, ahead).is_some();
+    let joined = |from: &Pose2D, to: &Pose2D, r: f64| {
+        ReedsShepp::new(r)
+            .get_all_paths(*from, *to, f64::MAX)
+            .iter()
+            .map(|p| tidied(rs_pieces(p, r)))
+            .filter(|p| clear(from, p))
+            .min_by(|x, y| cost(x).total_cmp(&cost(y)))
+    };
+    let mut candidates: Vec<(PlannedTurn, f64)> = Vec::new();
+    for (end, along, credit) in ends {
+        let b = axle(end);
+        let mut add = |name: String, pieces: Vec<Piece>| candidates.push((PlannedTurn { name, pieces, end: *end, along: *along }, *credit));
+        for k in TURN_RADII {
+            let r = k * radius;
+            for p in ReedsShepp::new(r).get_all_paths(a, b, f64::MAX) {
+                add(format!("reeds-shepp {}", p.name), tidied(rs_pieces(&p, r)));
+            }
+            for p in Dubins::new(r).get_all_paths(a, b, f64::MAX) {
+                add(format!("dubins {}", p.name), tidied(dubins_pieces(&p, r)));
+            }
+            for pattern in PATTERNS {
+                let corners = Sharper::new(r, body.0, body.1).plan_sharp_turn(a, b, pattern).waypoints;
+                let legs: Option<Vec<Vec<Piece>>> = corners.windows(2).map(|w| joined(&w[0], &w[1], r)).collect();
+                if let Some(legs) = legs {
+                    add(pattern.to_string(), tidied(legs.concat()));
+                }
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .filter(|(t, _)| !t.pieces.is_empty() && clear(&a, &t.pieces))
+        .map(|(t, credit)| {
+            let net = cost(&t.pieces) - credit;
+            (t, net)
+        })
+        .min_by(|x, y| x.1.total_cmp(&y.1))
+        .map(|(t, _)| t)
+}
+
+/// The poses of `path` at each of `at` metres along it that it reaches,
+/// with how far along each lies.
+pub fn poses_along(path: &Path, at: &[f64]) -> Vec<(Pose, f64)> {
+    let w = &path.waypoints;
+    if w.len() < 2 {
+        return Vec::new();
+    }
+    let cum = cumulative_lengths(w);
+    let total = cum.last().copied().unwrap_or(0.0);
+    at.iter()
+        .filter(|s| **s <= total)
+        .map(|&s| {
+            let (p, h) = sample(w, &cum, s);
+            (Pose { point: Point::new(p.x, p.y, w[0].point.z), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, h)) }, s)
+        })
+        .collect()
+}
+
+/// `path` from `s` metres along it on, starting at its pose there.
+pub fn path_from(path: &Path, s: f64) -> Path {
+    let w = &path.waypoints;
+    if w.len() < 2 || s <= 0.0 {
+        return path.clone();
+    }
+    let cum = cumulative_lengths(w);
+    let kept: Vec<usize> = (0..w.len()).filter(|&i| cum[i] > s + 1e-6).collect();
+    let Some((start, _)) = poses_along(path, &[s]).into_iter().next() else {
+        return path.clone();
+    };
+    let speed = |i: usize| path.speeds.get(i).copied().unwrap_or(0.0);
+    let mut waypoints = vec![start];
+    let mut speeds = vec![kept.first().map_or(0.0, |&i| speed(i))];
+    waypoints.extend(kept.iter().map(|&i| w[i]));
+    speeds.extend(kept.iter().map(|&i| speed(i)));
+    Path { waypoints, speeds, is_closed: false }
 }
 
 /// The tightest radius an Ackermann `constraints` turns at, if it has one.
