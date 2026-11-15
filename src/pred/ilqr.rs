@@ -543,10 +543,21 @@ impl Controller for IlqrFollower {
         if self.debug_level >= DebugLevel::Basic {
             self.debug.guides = guides.iter().skip(1).map(|g| crate::pred::mpc::reference_path(&g.reference)).collect();
         }
-        for guide in &guides {
+        for (k, guide) in guides.iter().enumerate() {
             let side = &guide.side;
             let guided = Problem { model: &model, reference: &guide.reference, cfg: &cfg, field: &field };
-            let (us, _, iterations) = guided.solve(&x0, warm.clone());
+            // A way past the obstacles is solved from a drive along it, not
+            // from the last solve (topology-guided MPC's initial guess).
+            let start = if k > 0 {
+                let way: Vec<(f64, f64)> = (0..guide.reference.x.len()).map(|i| (guide.reference.x[i], guide.reference.y[i])).collect();
+                let pace = guide.reference.v.iter().copied().fold(0.0_f64, |a, v| a.max(v.abs()));
+                let (mut s, mut a, mut l) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+                crate::pred::mppi::pursue(&model, &way, pace, &mut s, &mut a, &mut l);
+                (0..n).map(|i| Control::new(s[i], a[i], l[i])).collect()
+            } else {
+                warm.clone()
+            };
+            let (us, _, iterations) = guided.solve(&x0, start);
             let switch = *side != 0.0 && self.side != 0.0 && *side != self.side;
             // Every solve is scored on the same objective: the reference at
             // its own pace, against every obstacle.
