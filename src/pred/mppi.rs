@@ -2607,7 +2607,6 @@ pub(crate) fn pursue(
     let l = wheelbase(model.constraints);
     let near = if model.ackermann { l } else { 0.5 };
     let (mut x, mut y, mut yaw, mut v, mut vy) = (model.x0, model.y0, model.yaw0, model.v0, model.vy0);
-    let mut actual = model.steer0.clamp(-sb, sb);
     let mut from = 0;
     for t in 0..steer.len().min(accel.len()).min(accel_lat.len()) {
         let d = |p: &(f64, f64)| (p.0 - x).hypot(p.1 - y);
@@ -2620,8 +2619,7 @@ pub(crate) fn pursue(
         steer[t] = if model.ackermann { (kappa * l).atan() } else { speed.max(v.abs()) * kappa }.clamp(-sb, sb);
         accel[t] = ((speed - v) / model.dt).clamp(-ab, ab);
         accel_lat[t] = 0.0;
-        actual = model.steered(actual, steer[t], v, accel[t]);
-        model.step(&mut x, &mut y, &mut yaw, &mut v, &mut vy, actual, accel[t], 0.0);
+        model.step(&mut x, &mut y, &mut yaw, &mut v, &mut vy, steer[t], accel[t], 0.0);
     }
 }
 
