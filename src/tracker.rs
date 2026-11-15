@@ -456,7 +456,7 @@ impl Tracker {
         }
 
         self.manoeuvre(state, world);
-        if let Some(cmd) = self.drive_turn(state, world) {
+        if let Some(cmd) = self.drive_turn(state, world, dt) {
             return self.limit(cmd, state, dt, world);
         }
 
@@ -675,6 +675,8 @@ impl Tracker {
                 }
                 self.last_steering = Some(delta);
                 cmd.steering_angle = delta;
+            } else if cmd.steering_angle.abs() > 1e-9 {
+                self.last_steering = Some(cmd.steering_angle);
             } else if let Some(prev) = self.last_steering {
                 cmd.steering_angle = prev;
             }
@@ -770,7 +772,7 @@ impl Tracker {
     /// every leg turning the machine the same way round, until it faces the
     /// path past the turn, which it then drives on. `None` while the
     /// controller drives.
-    fn drive_turn(&mut self, state: &RobotState, world: Option<&WorldConstraints>) -> Option<VelocityCommand> {
+    fn drive_turn(&mut self, state: &RobotState, world: Option<&WorldConstraints>, dt: f64) -> Option<VelocityCommand> {
         let reach = self.stop_tolerance();
         let turn = self.turn.as_mut()?;
         let end = turn.from.point;
@@ -812,31 +814,53 @@ impl Tracker {
         let speed = (TURN_SPEED_SHARE * c.max_linear_velocity.abs()).clamp(TURN_SPEED_MIN, TURN_SPEED_MAX);
         let a = c.max_linear_acceleration.abs().max(0.1);
         let curvature = turn.side * turn.dir / radius;
-        let standing = manoeuvre::standing(world);
-        let checker = CollisionChecker::new(Some(&standing), c, 0.0);
-        let ahead = speed * speed / (2.0 * a) + TURN_MARGIN_M;
-        let steps = (ahead / TURN_STEP_M).ceil() as usize;
-        let (mut x, mut y, mut heading) = (state.pose.point.x, state.pose.point.y, yaw);
-        let blocked = (0..steps).any(|_| {
-            let ds = turn.dir * TURN_STEP_M;
-            let mid = heading + 0.5 * curvature * ds;
-            x += ds * mid.cos();
-            y += ds * mid.sin();
-            heading += curvature * ds;
-            checker.clearance(0, x, y, heading) < TURN_ROOM_M
-        });
-        // The machine turns on while it stops, so the last leg brakes that early.
-        if left < TURN_FACING + speed * speed / (2.0 * a) / radius {
-            turn.last_leg = true;
-        }
-        if blocked || turn.last_leg || turn.driven > std::f64::consts::PI * radius {
-            turn.braking = true;
-            return Some(stop("Turning: end of leg"));
-        }
         let (linear_unit, angular_unit) = match self.controller.get_config().output_units {
             OutputUnits::Physical => (1.0, 1.0),
             OutputUnits::Normalized => (c.max_linear_velocity.max(1e-6), c.max_angular_velocity.max(1e-6)),
         };
+        // The wheels swing to the leg's lock while the machine stands, at its
+        // steering rate slowed for standing, before it drives.
+        let lock = curvature_to_steering(curvature, c);
+        if turn.steered != Some(lock) {
+            let from = turn.steered.or(self.last_steering).unwrap_or(0.0);
+            let rate = if c.max_steering_rate > 0.0 { c.max_steering_rate } else { TURN_STEER_RATE };
+            turn.steer_wait = (lock - from).abs() / rate * TURN_STEER_STANDING;
+            turn.steered = Some(lock);
+        }
+        if turn.steer_wait > 0.0 {
+            turn.steer_wait -= dt;
+            return Some(VelocityCommand {
+                valid: true,
+                angular_velocity: STEER_AT_REST_MPS * curvature / angular_unit,
+                steering_angle: lock,
+                status_message: format!("Turning: steering for leg {}", turn.legs + 1),
+                ..Default::default()
+            });
+        }
+        let standing = manoeuvre::standing(world);
+        let checker = CollisionChecker::new(Some(&standing), c, 0.0);
+        let stopping = speed * speed / (2.0 * a);
+        let here = (state.pose.point.x, state.pose.point.y, yaw);
+        // Never nearer than the room, or than the machine already stands.
+        let room = TURN_ROOM_M.min(checker.clearance(0, here.0, here.1, here.2) - TURN_STEP_M);
+        let ahead = swept(&checker, here, turn.dir * (stopping + TURN_MARGIN_M), curvature, room);
+        // A reversing leg ends once it cannot finish the turn clear itself and
+        // the forward one, from where this one stops, would.
+        let rest = (left - TURN_FACING).max(0.0) * radius;
+        let finishes = turn.dir < 0.0
+            && swept(&checker, here, turn.dir * rest, curvature, room).is_none()
+            && swept(&checker, here, turn.dir * stopping, curvature, room).is_some_and(|stop| {
+                let rest = (left - stopping / radius - TURN_FACING).max(0.0) * radius;
+                swept(&checker, stop, -turn.dir * rest, -curvature, TURN_ROOM_M).is_some()
+            });
+        // The machine turns on while it stops, so the last leg brakes that early.
+        if left < TURN_FACING + stopping / radius {
+            turn.last_leg = true;
+        }
+        if ahead.is_none() || finishes || turn.last_leg || turn.driven > std::f64::consts::PI * radius {
+            turn.braking = true;
+            return Some(stop("Turning: end of leg"));
+        }
         let v = turn.dir * speed;
         Some(VelocityCommand {
             valid: true,
@@ -1802,6 +1826,32 @@ const TURN_SPEED_MAX: f64 = 0.5;
 const TURN_ROOM_M: f64 = 0.3;
 const TURN_MARGIN_M: f64 = 0.3;
 const TURN_STEP_M: f64 = 0.05;
+/// Steering rate, rad/s, assumed where the machine gives none, and how much
+/// slower a standing machine swings its wheels than a rolling one.
+const TURN_STEER_RATE: f64 = 0.5;
+const TURN_STEER_STANDING: f64 = 1.6;
+/// Speed, m/s, a (v, w) interface reads a turn rate at while standing: a
+/// command of no speed and this times a curvature swings the wheels to it.
+const STEER_AT_REST_MPS: f64 = 0.05;
+
+/// The pose `(x, y, heading)` ends at after `length` metres (negative
+/// reversing) at `curvature`, in `TURN_STEP_M` steps, or `None` where the
+/// body on the way comes nearer than `room` to an obstacle of `checker`.
+fn swept(checker: &CollisionChecker, from: (f64, f64, f64), length: f64, curvature: f64, room: f64) -> Option<(f64, f64, f64)> {
+    let steps = (length.abs() / TURN_STEP_M).ceil().max(1.0) as usize;
+    let ds = length / steps as f64;
+    let (mut x, mut y, mut heading) = from;
+    for _ in 0..steps {
+        let mid = heading + 0.5 * curvature * ds;
+        x += ds * mid.cos();
+        y += ds * mid.sin();
+        heading += curvature * ds;
+        if checker.clearance(0, x, y, heading) < room {
+            return None;
+        }
+    }
+    Some((x, y, heading))
+}
 
 /// A turn tighter than the machine steers, driven in legs at full lock.
 #[derive(Clone, Debug, Default)]
@@ -1823,6 +1873,10 @@ struct Turn {
     /// Metres driven on this leg, and where the machine last stood.
     driven: f64,
     last: Option<Point>,
+    /// The lock the wheels were last swung to, and the seconds left standing
+    /// for them to get there.
+    steered: Option<f64>,
+    steer_wait: f64,
     /// Legs driven, and whether the one ending is the last.
     legs: usize,
     last_leg: bool,
