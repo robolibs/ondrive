@@ -11,7 +11,7 @@ use crate::core::obstacles::{BarrierField, CollisionChecker, footprint_discs, ro
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
     Along, Choice, CostWeights, Model, Reference, Resume, Swerve, build_reference, build_timed_reference, command_from_controls,
-    current_lateral_speed, current_speed, plan_avoidance, prepare, rollout, rollout_resumed, speed_at_arc_length,
+    current_lateral_speed, current_speed, plan_avoidance, prepare, pursue, rollout, rollout_resumed, speed_at_arc_length,
     update_turn_in_place,
 };
 use crate::types::{
@@ -517,10 +517,17 @@ impl Controller for MpcFollower {
         if self.debug_level >= DebugLevel::Basic {
             self.debug.guides = guides.iter().skip(1).map(|g| reference_path(&g.reference)).collect();
         }
-        for guide in &guides {
+        for (k, guide) in guides.iter().enumerate() {
             let mut steer = self.previous_steering.clone();
             let mut accel = self.previous_acceleration.clone();
             let mut accel_lat = self.previous_accel_lateral.clone();
+            // A way past the obstacles is solved from a drive along it, not
+            // from the last solve (topology-guided MPC's initial guess).
+            if k > 0 {
+                let way: Vec<(f64, f64)> = (0..guide.reference.x.len()).map(|i| (guide.reference.x[i], guide.reference.y[i])).collect();
+                let pace = guide.reference.v.iter().copied().fold(0.0_f64, |a, v| a.max(v.abs()));
+                pursue(&model, &way, pace, &mut steer, &mut accel, &mut accel_lat);
+            }
             if !self.solve(&model, &guide.reference, &w, &cfg, &barrier, &mut steer, &mut accel, &mut accel_lat) {
                 continue;
             }
