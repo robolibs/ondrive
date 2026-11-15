@@ -2469,8 +2469,9 @@ pub(crate) fn plan_avoidance(
                     options.push((s, wide + late + near, Some(g), threads, false));
                 }
             }
-            // The way chosen last tick, carried on where it still stays clear.
-            if (pace - last.pace).abs() < 1e-9 && last.side != 0.0 {
+            // The way chosen last tick, carried on at every pace where it
+            // still stays clear: the same way, slower, waits for what moves.
+            if last.side != 0.0 {
                 let carried = reference.laid_along(&last.way).and_then(|g| near_cost(&g, obstacles, room_kept, step, swerve).map(|c| (g, c)));
                 if let Some((g, near)) = carried {
                     let widest = (0..g.x.len()).map(|i| (g.x[i] - reference.x[i]).hypot(g.y[i] - reference.y[i])).fold(0.0_f64, f64::max);
