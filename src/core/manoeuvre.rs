@@ -229,7 +229,9 @@ pub fn swept_pieces(checker: &CollisionChecker, from: (f64, f64, f64), pieces: &
 /// Reeds–Shepp curves, and the sharp-turn patterns of a `body` (length,
 /// width) with their corners joined by the cheapest clear Reeds–Shepp
 /// curve; of those whose body keeps `room` from the obstacles of
-/// `checker`, the cheapest by `cost` less the credit of its end.
+/// `checker`, the cheapest by `cost` less the credit of its end. Where it
+/// may not `reverse`, only the Dubins curves, and the patterns joined by
+/// them.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_turn(
     start: &Pose,
@@ -240,6 +242,7 @@ pub fn plan_turn(
     checker: &CollisionChecker,
     room: f64,
     cost: &dyn Fn(&[Piece]) -> f64,
+    reverse: bool,
 ) -> Option<PlannedTurn> {
     let axle = |p: &Pose| {
         let (x, y, h) = shifted((p.point.x, p.point.y, yaw_of(p)), -ahead);
@@ -248,13 +251,16 @@ pub fn plan_turn(
     let a = axle(start);
     let origin = |p: &Pose2D| shifted((p.point.x, p.point.y, p.yaw), ahead);
     let clear = |from: &Pose2D, pieces: &[Piece]| swept_pieces(checker, origin(from), pieces, room, ahead).is_some();
+    let curves = |from: &Pose2D, to: &Pose2D, r: f64| -> Vec<(String, Vec<Piece>)> {
+        let forward = Dubins::new(r).get_all_paths(*from, *to, f64::MAX).into_iter().map(|p| (format!("dubins {}", p.name), tidied(dubins_pieces(&p, r))));
+        let mut all: Vec<(String, Vec<Piece>)> = forward.collect();
+        if reverse {
+            all.extend(ReedsShepp::new(r).get_all_paths(*from, *to, f64::MAX).into_iter().map(|p| (format!("reeds-shepp {}", p.name), tidied(rs_pieces(&p, r)))));
+        }
+        all
+    };
     let joined = |from: &Pose2D, to: &Pose2D, r: f64| {
-        ReedsShepp::new(r)
-            .get_all_paths(*from, *to, f64::MAX)
-            .iter()
-            .map(|p| tidied(rs_pieces(p, r)))
-            .filter(|p| clear(from, p))
-            .min_by(|x, y| cost(x).total_cmp(&cost(y)))
+        curves(from, to, r).into_iter().map(|(_, p)| p).filter(|p| clear(from, p)).min_by(|x, y| cost(x).total_cmp(&cost(y)))
     };
     let mut candidates: Vec<(PlannedTurn, f64)> = Vec::new();
     for (end, along, credit) in ends {
@@ -262,11 +268,8 @@ pub fn plan_turn(
         let mut add = |name: String, pieces: Vec<Piece>| candidates.push((PlannedTurn { name, pieces, end: *end, along: *along }, *credit));
         for k in TURN_RADII {
             let r = k * radius;
-            for p in ReedsShepp::new(r).get_all_paths(a, b, f64::MAX) {
-                add(format!("reeds-shepp {}", p.name), tidied(rs_pieces(&p, r)));
-            }
-            for p in Dubins::new(r).get_all_paths(a, b, f64::MAX) {
-                add(format!("dubins {}", p.name), tidied(dubins_pieces(&p, r)));
+            for (name, pieces) in curves(&a, &b, r) {
+                add(name, pieces);
             }
             for pattern in PATTERNS {
                 let corners = Sharper::new(r, body.0, body.1).plan_sharp_turn(a, b, pattern).waypoints;

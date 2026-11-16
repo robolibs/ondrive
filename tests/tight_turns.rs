@@ -60,6 +60,64 @@ fn step(state: &mut RobotState, cmd: &VelocityCommand, c: &RobotConstraints, dt:
     state.velocity_valid = true;
 }
 
+/// A Hunter that may not reverse driving the U-turn among `walls`: whether
+/// it got round, whether it ever reversed, the nearest it came to a post,
+/// and its last status.
+fn forward_only_run(kind: TrackerKind, walls: &[Obstacle]) -> (bool, bool, f64, String) {
+    let c = RobotConstraints { min_linear_velocity: 0.0, ..hunter() };
+    let world = WorldConstraints { obstacles: walls.to_vec(), ..Default::default() };
+    let mut t = Tracker::new(kind);
+    t.set_config(ControllerConfig {
+        allow_reverse: false,
+        goal_tolerance: 0.4,
+        angular_tolerance: std::f64::consts::PI,
+        output_units: OutputUnits::Physical,
+        ..Default::default()
+    });
+    t.init(c.clone());
+    t.set_seed(7);
+    t.set_path(u_turn());
+    let mut state = RobotState { pose: pose(0.0, 0.0, 0.0), allow_move: true, allow_reverse: false, velocity_valid: true, ..Default::default() };
+    let (mut reversed, mut closest, mut status) = (false, f64::INFINITY, String::new());
+    for _ in 0..2400 {
+        let cmd = t.tick(&state, 0.05, Some(&world));
+        status = cmd.status_message.clone();
+        if t.is_path_completed() {
+            return (true, reversed, closest, status);
+        }
+        reversed |= cmd.linear_velocity < -1e-6;
+        step(&mut state, &cmd, &c, 0.05);
+        let (s, co) = state.pose.rotation.to_euler().yaw.sin_cos();
+        for o in walls {
+            let (dx, dy) = (o.modes[0].mean_x[0] - state.pose.point.x, o.modes[0].mean_y[0] - state.pose.point.y);
+            let (fx, fy) = (dx * co + dy * s, -dx * s + dy * co);
+            closest = closest.min((fx - fx.clamp(-0.485, 0.575)).hypot(fy - fy.clamp(-0.375, 0.375)) - o.radius);
+        }
+    }
+    (false, reversed, closest, status)
+}
+
+#[test]
+fn a_machine_that_may_not_reverse_gets_round_forward_in_the_open() {
+    for kind in [TrackerKind::Mppi, TrackerKind::Mpc] {
+        let (round, reversed, _, status) = forward_only_run(kind, &[]);
+        assert!(round, "{kind:?}: not round, {status}");
+        assert!(!reversed, "{kind:?}: reversed");
+    }
+}
+
+#[test]
+fn a_machine_that_may_not_reverse_holds_short_of_a_turn_it_cannot_make() {
+    let walls: Vec<Obstacle> = (0..60).flat_map(|i| [post(2 * i, 0.4 * i as f64 - 6.0, -1.4), post(2 * i + 1, 0.4 * i as f64 - 6.0, 2.3)]).collect();
+    for kind in [TrackerKind::Mppi, TrackerKind::Mpc] {
+        let (round, reversed, closest, status) = forward_only_run(kind, &walls);
+        assert!(!round, "{kind:?}: claims to have got round");
+        assert!(!reversed, "{kind:?}: reversed");
+        assert!(closest > 0.1, "{kind:?}: came {closest:.2} m from a post");
+        assert!(status.contains("without reversing"), "{kind:?}: {status}");
+    }
+}
+
 #[test]
 fn a_u_turn_tighter_than_the_lock_is_driven_in_legs_clear_of_the_street() {
     let c = hunter();
