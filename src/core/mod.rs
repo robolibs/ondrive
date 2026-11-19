@@ -1,6 +1,12 @@
+pub mod buckets;
 pub mod curves;
+pub mod dubins;
 pub mod error;
 pub mod kinematics;
+pub mod manoeuvre;
 pub mod math;
 pub mod obstacles;
+pub mod parallel;
 pub mod path;
+pub mod safety;
+pub mod tracking;

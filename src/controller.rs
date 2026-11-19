@@ -1,13 +1,14 @@
 use crate::core::kinematics::{can_turn_in_place, finalize, stop};
 use crate::core::math::{distance_2d, normalize_angle, yaw_of};
+use crate::core::path::PathProjection;
 use crate::types::{
-    ControllerConfig, ControllerStatus, Goal, Path, RobotConstraints, RobotState, Trajectory,
+    ControllerConfig, ControllerStatus, DebugFrame, DebugLevel, Goal, Path, RobotConstraints, RobotState, Trajectory,
     VelocityCommand, WorldConstraints,
 };
 use datapod::{Point, Pose};
 use std::f64::consts::PI;
 
-pub trait Controller {
+pub trait Controller: Send + Sync {
     fn compute_control(
         &mut self,
         state: &RobotState,
@@ -64,8 +65,52 @@ pub trait Controller {
         Vec::new()
     }
 
+    /// The controller's own parameters (its `*Config`) as a JSON object;
+    /// empty for a controller that has none.
+    fn params(&self) -> serde_json::Value {
+        serde_json::Value::Object(serde_json::Map::new())
+    }
+
+    /// Update some of the controller's own parameters from a JSON object.
+    /// An unknown name or a wrong type is an error and changes nothing.
+    fn set_params(&mut self, params: &serde_json::Value) -> Result<(), String> {
+        merged(&serde_json::Map::new(), params).map(|_| ())
+    }
+
+    /// Seed the random sampling of a sampling controller; others ignore it.
+    fn set_seed(&mut self, _seed: u64) {}
+
+    /// How much of its internals the controller records each tick.
+    fn set_debug(&mut self, _level: DebugLevel) {}
+
+    /// Internals recorded on the last tick; empty unless `set_debug` asked.
+    fn debug_frame(&self) -> DebugFrame {
+        DebugFrame::default()
+    }
+
     fn base(&self) -> &ControllerBase;
     fn base_mut(&mut self) -> &mut ControllerBase;
+}
+
+/// `current` with the fields named in the JSON object `params` replaced.
+pub fn merged<T: serde::Serialize + serde::de::DeserializeOwned>(
+    current: &T,
+    params: &serde_json::Value,
+) -> Result<T, String> {
+    let serde_json::Value::Object(updates) = params else {
+        return Err("parameters must be a JSON object".into());
+    };
+    let mut value = serde_json::to_value(current).map_err(|e| e.to_string())?;
+    let serde_json::Value::Object(fields) = &mut value else {
+        return Err("parameters are not a JSON object".into());
+    };
+    for (name, v) in updates {
+        if !fields.contains_key(name) {
+            return Err(format!("unknown parameter `{name}`"));
+        }
+        fields.insert(name.clone(), v.clone());
+    }
+    serde_json::from_value(value).map_err(|e| e.to_string())
 }
 
 #[derive(Clone, Debug, Default)]
@@ -87,6 +132,31 @@ pub struct GoalCheck {
     pub yaw_error: f64,
     pub position_tolerance: f64,
     pub orientation_tolerance: f64,
+}
+
+/// Share of the position tolerance within which a robot has arrived; between
+/// it and the tolerance, it has once it stops closing in.
+const ARRIVED_SHARE: f64 = 0.25;
+/// Metres a tick the distance to the goal must shrink by, or m/s the robot
+/// must head for it at, to count as closing in.
+const CLOSING_STEP: f64 = 1e-3;
+const CLOSING_SPEED: f64 = 0.02;
+
+/// Speed, m/s, under which a robot counts as stopped at a cusp.
+const STOPPED_AT_CUSP: f64 = 0.05;
+
+/// Distance from a cusp within which the robot counts as there:
+/// `ARRIVED_SHARE` of the position tolerance while it moves, all of it once
+/// stopped or when its speed is not reported.
+pub fn cusp_reach(pos_tol: f64, state: &RobotState, _constraints: &RobotConstraints) -> f64 {
+    let moving = state.velocity_valid && state.velocity.linear.abs() >= STOPPED_AT_CUSP;
+    (if moving { ARRIVED_SHARE * pos_tol } else { pos_tol }).max(0.1)
+}
+
+/// Speed, m/s, to pass `goal` at: that of its `target_velocity`, or 0 for
+/// a goal to stop at.
+pub fn pass_through(goal: &Goal) -> f64 {
+    goal.target_velocity.map_or(0.0, |v| v.linear.abs())
 }
 
 /// Goal tolerances override config tolerances when set (> 0). An
@@ -124,6 +194,26 @@ pub fn check_goal(current: &Pose, goal: &Goal, cfg: &ControllerConfig) -> GoalCh
     }
 }
 
+/// Whether a robot at `state`, `check`ed against `goal` and `previous`
+/// metres from it a tick before, is there: inside the position tolerance,
+/// and within `ARRIVED_SHARE` of it or no longer closing in.
+pub fn settled(check: &GoalCheck, state: &RobotState, goal: &Goal, previous: f64) -> bool {
+    check.position_ok && (check.distance < ARRIVED_SHARE * check.position_tolerance || !closing_in(state, goal, previous, check.distance))
+}
+
+/// Whether the robot at `state` still nears `goal`: by its measured
+/// velocity, or without one, by its distance shrinking from `previous`.
+fn closing_in(state: &RobotState, goal: &Goal, previous: f64, distance: f64) -> bool {
+    if !state.velocity_valid {
+        return distance < previous - CLOSING_STEP;
+    }
+    let yaw = yaw_of(&state.pose);
+    let (dx, dy) = (goal.target_pose.point.x - state.pose.point.x, goal.target_pose.point.y - state.pose.point.y);
+    let (v, vy) = (state.velocity.linear, state.velocity.lateral);
+    let (vx, vy) = (v * yaw.cos() - vy * yaw.sin(), v * yaw.sin() + vy * yaw.cos());
+    (vx * dx + vy * dy) > CLOSING_SPEED * distance.max(1e-9)
+}
+
 /// Kept for API compatibility: `(reached, distance, |yaw error|)` using the
 /// given tolerances directly.
 pub fn is_goal_reached(
@@ -156,12 +246,67 @@ impl ControllerBase {
         constraints: &RobotConstraints,
         extra_position_ok: bool,
     ) -> Option<VelocityCommand> {
+        self.gated_arrival(state, goal, constraints, extra_position_ok, true)
+    }
+
+    /// Distance, metres, left to slow down over for a path follower at
+    /// `proj` on its path of `path_length` metres: the rest of the path, or
+    /// the way straight to the goal when that is longer.
+    pub fn distance_left(&self, proj: &PathProjection, path_length: f64) -> f64 {
+        self.status.distance_to_goal.max(path_length - proj.arc_length)
+    }
+
+    /// `arrival` for a path follower projected at `proj` on its path of
+    /// `path_length` metres. A goal at the path end counts as reached only
+    /// once the rest of the path is about as short as the way to the goal,
+    /// or within twice the tolerance past the path's end; further than a
+    /// lookahead past an open path's end, the robot stops there.
+    pub fn arrival_on_path(
+        &mut self,
+        state: &RobotState,
+        goal: &Goal,
+        constraints: &RobotConstraints,
+        proj: &PathProjection,
+        path_length: f64,
+    ) -> Option<VelocityCommand> {
+        let (pos_tol, _) = effective_tolerances(goal, &self.config);
+        let passed_end = proj.beyond_end && proj.distance < 2.0 * pos_tol;
+        let overshoot = (proj.distance.powi(2) - proj.lateral_error.powi(2)).max(0.0).sqrt();
+        let far_past_end = proj.beyond_end
+            && !self.path.is_closed
+            && overshoot > self.config.lookahead_distance.max(2.0 * pos_tol);
+        if far_past_end && !passed_end {
+            self.status.goal_reached = false;
+            self.status.mode = "past_end".into();
+            return Some(stop("Past the end of the path"));
+        }
+        let goal_at_end = self
+            .path
+            .waypoints
+            .last()
+            .is_some_and(|w| w.point.distance_to_2d(goal.target_pose.point) < 1e-6);
+        let to_goal = distance_2d(state.pose.point, goal.target_pose.point);
+        let to_path = distance_2d(state.pose.point, proj.point);
+        let early =
+            goal_at_end && path_length - proj.arc_length > to_goal + to_path + 2.0 * pos_tol;
+        self.gated_arrival(state, goal, constraints, passed_end, !early)
+    }
+
+    fn gated_arrival(
+        &mut self,
+        state: &RobotState,
+        goal: &Goal,
+        constraints: &RobotConstraints,
+        extra_position_ok: bool,
+        position_allowed: bool,
+    ) -> Option<VelocityCommand> {
         let check = check_goal(&state.pose, goal, &self.config);
+        let previous = self.status.distance_to_goal;
         self.status.distance_to_goal = check.distance;
         self.status.heading_error = check.yaw_error;
 
-        let position_ok = check.position_ok || extra_position_ok;
-        if !position_ok {
+        let position_ok = (position_allowed && settled(&check, state, goal, previous)) || extra_position_ok;
+        if !position_ok || pass_through(goal) > 0.0 {
             self.status.goal_reached = false;
             return None;
         }

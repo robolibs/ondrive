@@ -3,17 +3,18 @@
 //! pairs that cannot stop before an obstacle, and maximises a weighted sum
 //! of heading, clearance, velocity and goal-distance scores.
 
-use crate::controller::{Controller, ControllerBase, effective_tolerances};
+use crate::controller::{Controller, ControllerBase, effective_tolerances, pass_through};
 use crate::core::kinematics::{
-    can_turn_in_place, finalize, finalize_holonomic, is_holonomic, max_curvature, reverse_allowed,
-    speed_bounds,
+    actuation_delay, axle_offset, can_turn_in_place, finalize, finalize_holonomic, is_holonomic, max_curvature, path_speed,
+    reverse_allowed, speed_bounds,
 };
-use crate::core::math::{heading_error, normalize_angle};
+use crate::core::math::{heading_error, normalize_angle, yaw_of};
 use crate::core::obstacles::CollisionChecker;
-use crate::types::{Goal, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
+use crate::types::{DebugFrame, DebugLevel, Goal, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
+use datapod::Point;
 use std::f64::consts::PI;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DwaConfig {
     pub predict_time: f64,
     pub dt: f64,
@@ -36,7 +37,7 @@ pub struct DwaConfig {
 impl Default for DwaConfig {
     fn default() -> Self {
         Self {
-            predict_time: 1.0,
+            predict_time: 1.5,
             dt: 0.1,
             v_samples: 10,
             w_samples: 21,
@@ -46,7 +47,7 @@ impl Default for DwaConfig {
             weight_velocity: 0.5,
             weight_clearance: 2.0,
             target_velocity: 1.0,
-            obstacle_margin: 0.2,
+            obstacle_margin: 0.3,
             clearance_cap: 1.5,
         }
     }
@@ -59,6 +60,8 @@ pub struct DwaFollower {
     last_v: f64,
     last_w: f64,
     last_vy: f64,
+    debug_level: DebugLevel,
+    debug: DebugFrame,
 }
 
 struct Sample {
@@ -84,6 +87,8 @@ impl DwaFollower {
             last_v: 0.0,
             last_w: 0.0,
             last_vy: 0.0,
+            debug_level: DebugLevel::Off,
+            debug: DebugFrame::default(),
         }
     }
 
@@ -93,6 +98,25 @@ impl DwaFollower {
 }
 
 impl Controller for DwaFollower {
+    fn params(&self) -> serde_json::Value {
+        serde_json::to_value(&self.dwa_config).unwrap_or_default()
+    }
+
+    fn set_params(&mut self, params: &serde_json::Value) -> Result<(), String> {
+        let cfg = crate::controller::merged(&self.dwa_config, params)?;
+        self.set_dwa_config(cfg);
+        Ok(())
+    }
+
+    fn set_debug(&mut self, level: DebugLevel) {
+        self.debug_level = level;
+        self.debug = DebugFrame::default();
+    }
+
+    fn debug_frame(&self) -> DebugFrame {
+        self.debug.clone()
+    }
+
     fn compute_control(
         &mut self,
         state: &RobotState,
@@ -134,14 +158,18 @@ impl Controller for DwaFollower {
         }
 
         let (v_lo, v_hi) = speed_bounds(constraints, allow_reverse);
+        let passing = pass_through(goal);
+        let preferred = if passing > 0.0 { passing } else { dwa.target_velocity.abs() };
+        let cruise = crate::pred::mpc::REF_SPEED_HEADROOM * preferred.max(0.1);
+        let (v_lo, v_hi) = (v_lo.max(-cruise), v_hi.min(cruise));
         let w_lim = constraints.max_angular_velocity.abs();
-        let v_now = if state.velocity.linear.abs() > 1e-9 {
+        let v_now = if state.velocity_valid {
             state.velocity.linear
         } else {
             self.last_v
         }
         .clamp(v_lo, v_hi);
-        let w_now = if state.velocity.angular.abs() > 1e-9 {
+        let w_now = if state.velocity_valid {
             state.velocity.angular
         } else {
             self.last_w
@@ -149,7 +177,7 @@ impl Controller for DwaFollower {
         .clamp(-w_lim, w_lim);
         let vy_lim = constraints.max_linear_velocity.abs();
         let vy_now = if holonomic {
-            if state.velocity.lateral.abs() > 1e-9 {
+            if state.velocity_valid {
                 state.velocity.lateral
             } else {
                 self.last_vy
@@ -161,8 +189,15 @@ impl Controller for DwaFollower {
 
         let a_lin = constraints.max_linear_acceleration.abs().max(1e-6);
         let a_ang = constraints.max_angular_acceleration.abs().max(1e-6);
+        let x0 = state.pose.point.x;
+        let y0 = state.pose.point.y;
+        let yaw0 = state.pose.rotation.to_euler().yaw;
+        let (pos_tol, _) = effective_tolerances(goal, &cfg);
+        let free_v = preferred
+            .min(v_hi)
+            .min(path_speed(v_hi, 0.0, dist_to_goal, pos_tol, cfg.kp_linear, constraints).max(passing));
         let v_min = (v_now - a_lin * dt).max(v_lo);
-        let v_max = (v_now + a_lin * dt).min(v_hi);
+        let v_max = (v_now + a_lin * dt).min(v_hi).min(cruise).max(v_min);
         let w_min = (w_now - a_ang * dt).max(-w_lim);
         let w_max = (w_now + a_ang * dt).min(w_lim);
         let (vy_min, vy_max) = if holonomic {
@@ -177,17 +212,25 @@ impl Controller for DwaFollower {
         let sim_dt = dwa.dt.max(1e-3);
         let steps = (dwa.predict_time / sim_dt).ceil().max(1.0) as usize;
         let kappa_max = max_curvature(constraints);
-        let checker = CollisionChecker::new(world, constraints, 0.0);
-        let goal_p = goal.target_pose.point;
-        let target_v = dwa
-            .target_velocity
-            .min(v_hi)
-            .min((cfg.kp_linear.max(0.1) * dist_to_goal).max(0.15 * v_hi));
+        let checker = CollisionChecker::new(world, constraints, 0.0).with_step(sim_dt).with_spread(2.0);
+        // A carrot to pass is scored one arc's length on along its heading, so
+        // arcs that reach it do not count as overshooting it.
+        let run_on = if passing > 0.0 { passing * dwa.predict_time } else { 0.0 };
+        let (gs, gc) = yaw_of(&goal.target_pose).sin_cos();
+        let goal_p = Point::new(goal.target_pose.point.x + run_on * gc, goal.target_pose.point.y + run_on * gs, 0.0);
+        let reach_goal = dist_to_goal + run_on;
+        let margin = dwa.obstacle_margin + LAG_MARGIN_GAIN * v_now.abs() * actuation_delay(constraints);
+        // Driving ahead, the pose rides ahead of the axle the body turns about.
+        let axle = axle_offset(constraints);
+        let target_v = free_v;
 
-        let x0 = state.pose.point.x;
-        let y0 = state.pose.point.y;
-        let yaw0 = state.pose.rotation.to_euler().yaw;
-
+        // Admissible velocities (Fox et al. 1997): while braking from here
+        // keeps clear of every obstacle as predicted, arcs that would leave
+        // the robot unable to stop clear of one are refused.
+        let tail = world
+            .filter(|w| !w.obstacles.is_empty())
+            .map(|w| CollisionChecker::new(Some(w), constraints, 0.0).with_step(sim_dt).with_spread(1.0));
+        let yielding = tail.as_ref().is_some_and(|c| !hit_while_braking(c, (x0, y0, yaw0), v_now.abs(), a_lin, 0, sim_dt));
         let mut samples: Vec<Sample> = Vec::with_capacity(v_samples * w_samples * vy_samples);
         for vi in 0..v_samples {
             let v = v_min + (v_max - v_min) * vi as f64 / (v_samples - 1) as f64;
@@ -211,33 +254,45 @@ impl Controller for DwaFollower {
                     let start_clearance = prev_clearance;
                     let mut min_clearance = prev_clearance;
                     let mut free_distance: Option<f64> = None;
+                    let mut stop_at = ((x, y, yaw), 0);
                     for step in 1..=steps {
+                        let before = ((x, y, yaw), step - 1);
                         if holonomic {
                             let (s, c) = yaw.sin_cos();
                             x += (v * c - vy * s) * sim_dt;
                             y += (v * s + vy * c) * sim_dt;
                         } else {
-                            x += v * yaw.cos() * sim_dt;
-                            y += v * yaw.sin() * sim_dt;
+                            let ((s, c), side) = (yaw.sin_cos(), if v > 0.0 { axle * w } else { 0.0 });
+                            x += (v * c - side * s) * sim_dt;
+                            y += (v * s + side * c) * sim_dt;
                         }
                         yaw = normalize_angle(yaw + w * sim_dt);
                         let c = checker.clearance(step, x, y, yaw);
                         min_clearance = min_clearance.min(c);
-                        let entering = c < dwa.obstacle_margin
+                        let entering = c < margin
                             && c < prev_clearance - 1e-9
                             && c < start_clearance;
-                        if c < 0.0 || entering {
-                            let boundary = if c < 0.0 { 0.0 } else { dwa.obstacle_margin };
+                        let deeper = c < 0.0 && c < prev_clearance - 1e-9;
+                        if deeper || entering {
+                            let boundary = if c < 0.0 { 0.0 } else { margin };
                             let remaining = (prev_clearance - boundary).clamp(0.0, step_len);
                             free_distance = Some(travelled + remaining);
+                            stop_at = before;
                             break;
                         }
                         travelled += step_len;
                         prev_clearance = c;
                         horizon += step_len;
-                        if horizon >= dist_to_goal {
+                        if horizon >= reach_goal {
                             break;
                         }
+                    }
+                    let ((end, end_step), end_speed) = match free_distance {
+                        Some(_) => (stop_at, 0.0),
+                        None => (((x, y, yaw), steps), speed_mag),
+                    };
+                    if yielding && tail.as_ref().is_some_and(|c| hit_while_braking(c, end, end_speed, a_lin, end_step, sim_dt)) {
+                        continue;
                     }
                     let clearance = match free_distance {
                         Some(s_free) => {
@@ -248,7 +303,7 @@ impl Controller for DwaFollower {
                         }
                         None => {
                             speed_mag * dwa.predict_time
-                                + (min_clearance - dwa.obstacle_margin).clamp(0.0, dwa.clearance_cap)
+                                + (min_clearance - margin).clamp(0.0, dwa.clearance_cap)
                         }
                     };
                     let dx = goal_p.x - x;
@@ -270,6 +325,16 @@ impl Controller for DwaFollower {
             }
         }
 
+        if samples.is_empty()
+            && let Some((v, w)) = evade(&checker, (x0, y0, yaw0), (v_min, v_max, v_samples), (w_min, w_max, w_samples), steps, sim_dt, kappa_max)
+        {
+            self.base.status.mode = "dwa_evade".into();
+            let cmd = finalize(v, w, constraints, &cfg, allow_reverse, "DWA: evading");
+            self.last_v = v;
+            self.last_w = w;
+            self.last_vy = 0.0;
+            return cmd;
+        }
         if samples.is_empty() {
             self.base.status.mode = "dwa_blocked".into();
             let cmd = finalize(0.0, 0.0, constraints, &cfg, allow_reverse, "DWA: no admissible velocity");
@@ -283,6 +348,7 @@ impl Controller for DwaFollower {
         let d_min = samples.iter().map(|s| s.distance).fold(f64::INFINITY, f64::min);
         let c_max = samples.iter().map(|s| s.clearance).fold(0.0, f64::max).max(1e-9);
         let mut best: Option<(f64, f64, f64, f64)> = None;
+        let mut scores = Vec::with_capacity(samples.len());
         for s in &samples {
             let distance_score = if d_max - d_min > 1e-9 {
                 (d_max - s.distance) / (d_max - d_min)
@@ -296,6 +362,16 @@ impl Controller for DwaFollower {
             if best.is_none_or(|b| score > b.0) {
                 best = Some((score, s.v, s.vy, s.w));
             }
+            scores.push(score);
+        }
+        if self.debug_level == DebugLevel::Full {
+            let stride = (samples.len() / SHOWN_ARCS).max(1);
+            (self.debug.rollouts, self.debug.costs) = samples
+                .iter()
+                .zip(&scores)
+                .step_by(stride)
+                .map(|(s, score)| (arc((x0, y0, yaw0), (s.v, s.vy, s.w), steps, sim_dt, holonomic), -score))
+                .unzip();
         }
         let (_, mut v, mut vy, mut w) = best.unwrap();
 
@@ -304,10 +380,19 @@ impl Controller for DwaFollower {
             && dist_to_goal > cfg.goal_tolerance
             && let Some(turn) = recovery_turn(&checker, x0, y0, yaw0, dwa.obstacle_margin)
         {
-            v = 0.0;
-            vy = 0.0;
-            w = turn * (w_now.abs() + a_ang * dt).min(w_lim).max(0.2 * w_lim);
-            mode = "dwa_recovery";
+            if can_turn_in_place(constraints.steering_type) {
+                v = 0.0;
+                vy = 0.0;
+                w = turn * (w_now.abs() + a_ang * dt).min(w_lim).max(0.2 * w_lim);
+                mode = "dwa_recovery";
+            } else if allow_reverse
+                && let Some((rv, rw)) = reverse_arc(&checker, x0, y0, yaw0, turn, constraints, dwa.obstacle_margin)
+            {
+                v = rv;
+                vy = 0.0;
+                w = rw;
+                mode = "dwa_recovery_reverse";
+            }
         }
 
         self.base.status.mode = mode.into();
@@ -342,6 +427,112 @@ impl Controller for DwaFollower {
     fn base_mut(&mut self) -> &mut ControllerBase {
         &mut self.base
     }
+}
+
+/// Whether the robot, braking straight from `(x, y, yaw)` at `speed` with
+/// `decel` after `steps` of `dt`, is hit by an obstacle moving in on it
+/// before it stops or within `BRAKING_TAIL_S` of standing after: an arc
+/// ending there leads to a collision
+/// it can no longer avoid (an inevitable collision state, Fraichard 2004).
+fn hit_while_braking(
+    checker: &CollisionChecker,
+    (mut x, mut y, yaw): (f64, f64, f64),
+    mut speed: f64,
+    decel: f64,
+    steps: usize,
+    dt: f64,
+) -> bool {
+    if !checker.has_obstacles() {
+        return false;
+    }
+    let tail = ((speed / decel.max(1e-3) + BRAKING_TAIL_S) / dt).ceil() as usize;
+    let (s, c) = yaw.sin_cos();
+    for k in 1..=tail {
+        speed = (speed - decel * dt).max(0.0);
+        x += speed * c * dt;
+        y += speed * s * dt;
+        if checker.clearance(steps + k, x, y, yaw) < 0.0 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Share of the distance covered during the steering delay added to the
+/// obstacle margin.
+const LAG_MARGIN_GAIN: f64 = 0.25;
+
+/// Seconds of standing, after braking to a stop at the end of an arc, that
+/// must stay clear.
+const BRAKING_TAIL_S: f64 = 2.0;
+
+/// Arcs shown at most when the controller records everything.
+const SHOWN_ARCS: usize = 48;
+
+/// The arc `(v, vy, w)` held from `(x, y, yaw)` for `steps` of `dt`.
+fn arc((x0, y0, yaw0): (f64, f64, f64), (v, vy, w): (f64, f64, f64), steps: usize, dt: f64, holonomic: bool) -> Vec<Point> {
+    let (mut x, mut y, mut yaw) = (x0, y0, yaw0);
+    let mut out = vec![Point::new(x, y, 0.0)];
+    for _ in 0..steps {
+        let (s, c) = yaw.sin_cos();
+        if holonomic {
+            x += (v * c - vy * s) * dt;
+            y += (v * s + vy * c) * dt;
+        } else {
+            x += v * c * dt;
+            y += v * s * dt;
+        }
+        yaw = normalize_angle(yaw + w * dt);
+        out.push(Point::new(x, y, 0.0));
+    }
+    out
+}
+
+/// The `(v, w)` of the window whose arc keeps the largest clearance from
+/// the obstacles as they move over `steps` of `dt`: the way out when no
+/// velocity is admissible and an obstacle closes on the robot where it
+/// stands, as one coming head on does. `None` when standing still stays
+/// clear over the steps and `BRAKING_TAIL_S` more, so stopping is safe.
+fn evade(
+    checker: &CollisionChecker,
+    (x0, y0, yaw0): (f64, f64, f64),
+    (v_min, v_max, v_n): (f64, f64, usize),
+    (w_min, w_max, w_n): (f64, f64, usize),
+    steps: usize,
+    dt: f64,
+    kappa_max: f64,
+) -> Option<(f64, f64)> {
+    if !checker.has_obstacles() {
+        return None;
+    }
+    let hold = steps + (BRAKING_TAIL_S / dt).ceil() as usize;
+    if (1..=hold).all(|k| checker.clearance(k, x0, y0, yaw0) > 0.0) {
+        return None;
+    }
+    let staying = (1..=steps).map(|k| checker.clearance(k, x0, y0, yaw0)).fold(f64::INFINITY, f64::min);
+    let (v_n, w_n) = (v_n.max(2), w_n.max(2));
+    let mut best: Option<(f64, f64, f64)> = Some((staying, 0.0, 0.0));
+    for vi in 0..v_n {
+        let v = v_min + (v_max - v_min) * vi as f64 / (v_n - 1) as f64;
+        for wi in 0..w_n {
+            let w = w_min + (w_max - w_min) * wi as f64 / (w_n - 1) as f64;
+            if kappa_max.is_finite() && w.abs() > v.abs() * kappa_max + 1e-9 {
+                continue;
+            }
+            let (mut x, mut y, mut yaw) = (x0, y0, yaw0);
+            let mut worst = f64::INFINITY;
+            for step in 1..=steps {
+                x += v * yaw.cos() * dt;
+                y += v * yaw.sin() * dt;
+                yaw = normalize_angle(yaw + w * dt);
+                worst = worst.min(checker.clearance(step, x, y, yaw));
+            }
+            if best.is_none_or(|b| worst > b.0) {
+                best = Some((worst, v, w));
+            }
+        }
+    }
+    best.map(|(_, v, w)| (v, w))
 }
 
 /// Free straight-line distance from `(x, y)` along `heading` before contact
@@ -392,4 +583,43 @@ fn recovery_turn(
         }
     }
     best.map(|b| b.1)
+}
+
+/// A car's way out when nothing ahead is admissible: back up along an arc
+/// that swings the nose toward `turn` (+1 left, -1 right), at full lock,
+/// half lock or straight, whichever stays clear for `REVERSE_PROBE_S`.
+/// Returns the `(v, omega)` to command.
+fn reverse_arc(
+    checker: &CollisionChecker,
+    x: f64,
+    y: f64,
+    yaw: f64,
+    turn: f64,
+    constraints: &RobotConstraints,
+    margin: f64,
+) -> Option<(f64, f64)> {
+    const REVERSE_PROBE_S: f64 = 1.5;
+    const STEP: f64 = 0.1;
+    let (lo, _) = speed_bounds(constraints, true);
+    let v = lo.max(-0.5 * constraints.max_linear_velocity.abs()).min(-0.05);
+    let kmax = max_curvature(constraints).min(10.0);
+    for k in [-turn * kmax, -turn * 0.5 * kmax, 0.0] {
+        let (mut px, mut py, mut th) = (x, y, yaw);
+        let mut clear = true;
+        let mut t = 0.0;
+        while t < REVERSE_PROBE_S {
+            px += v * th.cos() * STEP;
+            py += v * th.sin() * STEP;
+            th += v * k * STEP;
+            t += STEP;
+            if checker.clearance_at(t, px, py, th) < margin {
+                clear = false;
+                break;
+            }
+        }
+        if clear {
+            return Some((v, v * k));
+        }
+    }
+    None
 }

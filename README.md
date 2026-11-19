@@ -13,20 +13,20 @@ and all emitting the same body-frame twist.
 |                     | **Carrot**               | Proportional bearing control with distance / heading speed scaling    |
 |                     | **PoseRegulator**        | Astolfi polar law `(rho, alpha, beta)`; converges to position and yaw |
 |                     | **PoseReach**            | Reeds-Shepp / Dubins curve to a goal pose, tracked run by run         |
-|                     | **APF**                  | Potential field fallback; reports local minima instead of hiding them |
+|                     | **APF**                  | Potential field, circulation round obstacles, predicted repulsion     |
 | Path following      | **Pure Pursuit**         | Rear-axle arc-length lookahead, `κ = 2 sin α / L_d`, reverse, cusps   |
-|                     | **RegulatedPursuit**     | Nav2-style: curvature / proximity speed regulation, arc collision check|
+|                     | **RegulatedPursuit**     | Nav2-style regulation; goes round blocks, slows to give way to traffic|
 |                     | **VectorPursuit**        | Screw-theory pursuit using the lookahead point's orientation          |
 |                     | **Stanley**              | Front-axle segment projection, `δ = θ_e + atan(k e / (k_soft + v))`   |
 |                     | **LQR**                  | Kinematic `[e, θ_e]` error model, DARE solved every tick, curvature FF|
 |                     | **Kanayama**             | Robot-frame error law against a moving (timed or previewed) reference |
 |                     | **ILC**                  | Wraps any follower; shifts the reference to cancel learned error      |
-| Predictive / optimal| **MPC**                  | Projected gradient descent with line search, warm start, decel taper  |
-|                     | **iLQR**                 | Analytic-Jacobian iterative LQR with regularised backward pass        |
-|                     | **MPPI**                 | Williams-style weights incl. control cost term, warm start            |
+| Predictive / optimal| **MPC**                  | Projected gradient descent, obstacle barrier, left/right guided solves|
+|                     | **iLQR**                 | Box-DDP, rate-limited steering state, constrained-iLQR barrier        |
+|                     | **MPPI**                 | Contouring corridor, correlated noise, adaptive λ, Nav2-style critics |
 |                     | **MCA** (DRA-MPPI)       | MPPI + Monte Carlo collision probability over Gaussian-mixture modes  |
 |                     | **SOC** (SVG-MPPI)       | Stein Variational Gradient Descent guides + adaptive-variance MPPI    |
-|                     | **DWA**                  | Fox 1997 window, braking admissibility, recovery rotation            |
+|                     | **DWA**                  | Fox 1997 window, inevitable-collision check, evasion, recovery       |
 |                     | **TEB**                  | Timed Elastic Band, common-arc residual (skipped if holonomic), GD on Δt_i|
 | Fuzzy               | **FLC**                  | Mamdani, 7 triangular terms, 49-rule additive base, curvature FF      |
 
@@ -36,10 +36,12 @@ Three families of motion model back them:
 - **Ackermann** — the true bicycle model. A single virtual front wheel,
   curvature `= tan(steer) / wheelbase`, integrated at the rear axle
   (offset by `rear_wheelbase`), steering and turning-radius limits enforced
-  by `finalize`.
+  by `finalize`. Through `Tracker`, `max_steering_rate` (rad/s, 0 = off)
+  limits how fast the commanded steering angle changes.
 - **Differential / SkidSteer** — the unicycle model. `v` and `omega` are
   commanded independently with no wheelbase constraint; the platform can
-  turn in place.
+  turn in place. With `track_width` set (0 = off), `finalize` scales `v`
+  and `omega` together so neither wheel exceeds `max_linear_velocity`.
 - **Holonomic** — full `(vx, vy, omega)` body-frame control, translation and
   rotation fully decoupled, output through `finalize_holonomic` /
   `VelocityCommand::lateral_velocity`. Supported end to end by every
@@ -50,9 +52,26 @@ Three families of motion model back them:
   PoseReach, which bypasses its Reeds-Shepp/Dubins planner entirely on a
   holonomic platform and translates/rotates straight to the goal.
 
-Obstacle-aware controllers (MCA, SOC, DWA, TEB, RegulatedPursuit, PoseReach,
-APF) consume `WorldConstraints`: Gaussian-mode obstacle predictions and/or
-an occupancy grid, through one footprint-aware collision checker.
+Obstacle-aware controllers (MPC, iLQR, MPPI, MCA, SOC, DWA, TEB,
+RegulatedPursuit, PoseReach, APF) consume `WorldConstraints`: Gaussian-mode
+obstacle predictions, each step read at its own time, and/or an occupancy
+grid, through one footprint-aware collision checker. The predictive ones
+go round an obstacle on the path instead of stopping before it: a detour
+of the reference round each side guides the solve (topology-guided MPC),
+and the path's lateral and heading weights ease where a detour leaves it,
+only as far as the detour goes.
+`Tracker` also caps the speed to `Zone::max_speed` while the robot is
+inside a zone's boundary (the slowest zone wins when they overlap).
+
+On an Ackermann machine with `max_steering_rate` set, the steering takes
+time to act. MPC, iLQR, MPPI, MCA and SOC model it in their rollouts; for
+every other controller `Tracker` hands over the state predicted through
+that delay (half a lock-to-lock swing) and caps the speed where the path's
+curvature changes faster than the steering can follow. The predictive
+controllers also lengthen their horizon on such a machine to span two of
+its tightest turning radii plus two half swings of its steering (at most
+12 s, in steps of at most 0.25 s), so a tractor sees an obstacle soon
+enough to get round it.
 
 ## Command contract
 
@@ -73,8 +92,13 @@ regardless of algorithm or steering type:
   divides by `max_linear_velocity` and `max_angular_velocity`.
 - Reverse motion is only commanded when `ControllerConfig::allow_reverse`
   or `RobotState::allow_reverse` is set.
-- A non-positive or non-finite `dt` yields an invalid command; the tracker
-  also returns a valid zero command when `RobotState::allow_move` is false.
+- A non-positive or non-finite `dt` yields an invalid command. Through
+  `Tracker`, so does a NaN or infinite state, goal, path or trajectory
+  time, a trajectory whose times are missing or out of order, and NaN or
+  negative limits in the constraints or config. The tracker also returns
+  a valid zero command when `RobotState::allow_move` is false. The C API
+  turns a panic into a `false` return with the message in
+  `ondrive_last_error_message()`.
 
 Errors use one convention: lateral error is positive when the robot is to
 the left of the path, heading error is positive when the path heading is
@@ -110,6 +134,14 @@ negative speed marks a segment driven in reverse; pursuit followers never
 look ahead across such a cusp and taper speed into it. `smoothen_path`
 densifies a path (linear + slerp, speeds interpolated).
 
+Progress along a path is continuous: where two parts of a path are
+equally near (a reversing cusp, a self-crossing), the projection stays on
+the part progress is on, and it moves at most 2 m past its last segment
+per tick. A path counts as finished only once that progress has reached
+its end, so a path that passes near its own end earlier is driven to the
+end. Through `Tracker`, a path with `is_closed` is driven lap after lap,
+closed from its last waypoint back to its first, and never completes.
+
 `Trajectory` adds a time per pose. `Tracker::set_trajectory` installs it,
 restarts the tracker clock (advanced by `dt`, or by `RobotState::timestamp`
 when provided) and hands the time to controllers that track it: Kanayama,
@@ -121,7 +153,7 @@ at constant speed.
 
 ```toml
 [dependencies]
-ondrive = { git = "https://codeberg.org/robolibs/ondrive.git" }
+ondrive = { git = "https://github.com/robolibs/ondrive" }
 ```
 
 The crate depends on the sibling `datapod` crate for geometry types.
@@ -196,8 +228,14 @@ Tracker semantics when no explicit goal is set:
   aimed at the waypoint one `lookahead_distance` ahead of the robot's
   projection on the path (passed waypoints are skipped, and waypoints whose
   footprint collides with `WorldConstraints` are skipped too); only the last
-  waypoint uses `goal_tolerance`. `is_path_completed()` turns true after it
-  and further ticks return a zero command.
+  waypoint uses `goal_tolerance`. They drive to a cusp (where the path
+  turns back on itself) before taking the leg that leaves it.
+  `is_path_completed()` turns true after the last waypoint and further
+  ticks return a zero command.
+
+`reset()` clears the controller's internal state (integrators, warm
+starts) and restarts progress on the installed path or trajectory, which
+stays installed.
 
 Specialised configs (`MpcConfig`, `IlqrConfig`, `MppiConfig`, `McaConfig`,
 `SocConfig`, `DwaConfig`, `TebConfig`, `FlcConfig`,
@@ -225,6 +263,7 @@ let world = WorldConstraints {
     obstacles: vec![Obstacle {
         id: 0,
         radius: 0.3,
+        dt: 0.2,
         modes: vec![GaussianMode {
             weight: 1.0,
             mean_x: vec![6.0; 10],
@@ -239,9 +278,27 @@ let world = WorldConstraints {
 let cmd = tracker.tick(&state, 0.05, Some(&world));
 ```
 
-Mode vectors are indexed by horizon step; a prediction shorter than the
-horizon holds its last entry. `OccupancyGrid::new` precomputes a
-continuous distance-to-occupied field. `RobotConstraints::footprint` is a
+Mode vectors hold one mean and spread per prediction step, `dt` seconds
+apart (0 takes each controller's own planning step); controllers read
+them at the time each of their steps is reached, interpolated, and past
+the end carry on at the last velocity with the spread still growing.
+`OccupancyGrid::new` precomputes an exact distance-to-occupied field.
+
+How the obstacle-aware controllers treat what they meet:
+
+- **Standing, or moving along the path** (blocked lane, slower traffic
+  ahead, a robot coming the other way): gone round. A detour of the path
+  round each side, timed against the obstacle's prediction, guides the
+  solve, and the side is kept unless the other becomes clearly cheaper.
+- **Crossing the path**: given way to. No detour is offered; the
+  controller slows or stops until it has passed.
+- **Approaching a robot that cannot get clear by stopping**: DWA picks the
+  arc that keeps the most clearance instead of stopping.
+
+`Tracker::set_debug(DebugLevel::Full)` makes MPPI, MCA, SOC, MPC, iLQR
+and DWA record what they sampled or solved, with costs, and the detours
+they steered by; `Tracker::debug_frame()` returns them (`debug_frame()`
+in Python). `RobotConstraints::footprint` is a
 disc by default (radius `hypot(width, length) / 2`, 0.3 m when unset) or a
 `Footprint::Polygon`; the shared `CollisionChecker` in `core::obstacles`
 evaluates clearance for both against both obstacle kinds.
@@ -254,7 +311,7 @@ handles, `#[repr(C)]` POD structs, `ondrive_tracker_set_trajectory`,
 `ondrive_world_set_grid`, and one `ONDRIVE_KIND_*` value per controller.
 
 ```bash
-make -C examples/c_abi run
+make -C examples/c run
 ```
 
 Boolean-returning functions signal failure with `false`, and
@@ -269,25 +326,25 @@ Built with `pyo3` + `maturin` (`python` feature). Wrappers cover `Tracker`
 `ControllerStatus`; `tracker_kinds()` lists the kind names.
 
 ```bash
-make -C examples/python_binding basic     # PID point-goal demo
-make -C examples/python_binding main      # Pure Pursuit sine-path demo
+make -C examples/python basic     # PID point-goal demo
+make -C examples/python main      # Pure Pursuit sine-path demo
 ```
 
 ## Examples and verification
 
 Every controller has a demo under `examples/` built on the shared scaffold
-in `examples/common/demo.rs` (rerun is a dev-dependency only). Each one
+in `examples/rust/common/demo.rs` (rerun is a dev-dependency only). Each one
 streams the path, current target, robot, predicted plan, obstacles and
 status to a running rerun viewer at real-time speed.
 
 ```bash
-make run EXAMPLE=pid      # pid, carrot, pure, rpp, vector, stan, lqr,
+make run --example pid    # pid, carrot, pure, rpp, vector, stan, lqr,
                           # kanayama, flc, mpc, ilqr, mppi, mca, soc, dwa,
                           # teb, ilc, pose_reach, pose_regulator, apf
 ONDRIVE_NO_VIZ=1 cargo run --release --example teb   # headless
 ```
 
-`examples/verify.rs` is a headless check of every controller on both
+`examples/rust/verify.rs` is a headless check of every controller on both
 steering models across straight, offset, heading-offset, sine, 90-degree
 corner, circle, hairpin, reverse and obstacle scenarios, plus pose-goal
 manoeuvres (parallel park, 90-degree offset, goal behind) and timed
@@ -313,6 +370,7 @@ nix develop             # provisions rustc, cargo, maturin, python3
 make build              # cargo build --lib
 make test               # cargo test --all-targets
 make bind               # regenerate the C header + build the Python wheel
+make test-py            # Python binding tests against a fresh wheel
 ```
 
 ## Status

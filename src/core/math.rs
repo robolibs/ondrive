@@ -3,14 +3,12 @@ use std::f64::consts::PI;
 
 pub const TAU: f64 = 2.0 * PI;
 
-pub fn normalize_angle(mut a: f64) -> f64 {
-    while a > PI {
-        a -= TAU;
+/// Angle wrapped to `[-π, π]`; a non-finite angle comes back as NaN.
+pub fn normalize_angle(a: f64) -> f64 {
+    if (-PI..=PI).contains(&a) {
+        return a;
     }
-    while a < -PI {
-        a += TAU;
-    }
-    a
+    (a + PI).rem_euclid(TAU) - PI
 }
 
 pub fn distance(a: Point, b: Point) -> f64 {

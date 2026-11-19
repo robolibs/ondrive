@@ -1,6 +1,6 @@
 //! ondrive — motion-control / path-tracking library for mobile robots.
 //!
-//! See `PLAN.md` at the crate root for the design overview. The public
+//! See `README.md` at the crate root for the design overview. The public
 //! surface is kept flat at `ondrive::*` via re-exports below.
 
 pub mod core;
@@ -12,6 +12,7 @@ pub mod path;
 pub mod point;
 pub mod pred;
 pub mod tracker;
+pub mod turners;
 pub mod types;
 
 #[cfg(feature = "python")]
@@ -22,9 +23,10 @@ pub use crate::core::error::{Error, Result};
 pub use crate::core::math::{
     distance, distance_2d, heading_error, normalize_angle, yaw_error, yaw_of,
 };
+pub use crate::core::tracking::{Detection, ObstacleTracker, TrackingConfig};
 pub use crate::tracker::{Tracker, TrackerKind, smoothen_path};
 pub use crate::types::{
-    ControllerConfig, ControllerStatus, GaussianMode, Goal, Obstacle, OutputType, OutputUnits,
+    ControllerConfig, ControllerStatus, DebugFrame, DebugLevel, GaussianMode, Goal, Obstacle, OutputUnits,
     Footprint, OccupancyGrid, Path, RobotConstraints, RobotState, SteeringType, Trajectory,
     TrajectorySample, Velocity, VelocityCommand, WorldConstraints, Zone,
 };
@@ -32,7 +34,8 @@ pub use crate::types::{
 pub use crate::fuzzy::{FlcConfig, FlcFollower, Term};
 pub use crate::path::{
     IlcConfig, IlcFollower, KanayamaFollower, LqrFollower, PurePursuitFollower,
-    RegulatedPursuitConfig, RegulatedPursuitFollower, StanleyFollower, VectorPursuitConfig,
+    RegulatedPursuitConfig, RegulatedPursuitFollower, SlipAdaptiveConfig, SlipAdaptiveFollower, StanleyConfig,
+    StanleyFollower, VectorPursuitConfig,
     VectorPursuitFollower,
 };
 pub use crate::point::{
@@ -40,6 +43,7 @@ pub use crate::point::{
     PoseRegulatorFollower,
 };
 pub use crate::pred::{
-    DwaConfig, DwaFollower, IlqrConfig, IlqrFollower, McaConfig, McaFollower, MpcConfig,
-    MpcFollower, MppiConfig, MppiFollower, SocConfig, SocFollower, TebConfig, TebFollower,
+    DwaConfig, DwaFollower, FrenetConfig, FrenetFollower, IlqrConfig, IlqrFollower, McaConfig, McaFollower, MpcConfig,
+    MpcFollower, MppiConfig, MppiFollower, SocConfig, SocFollower, TebConfig, TebFollower, VelocityObstacleConfig,
+    VelocityObstacleFollower,
 };

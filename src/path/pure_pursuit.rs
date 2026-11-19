@@ -5,27 +5,28 @@
 use crate::controller::{Controller, ControllerBase, effective_tolerances};
 use crate::core::kinematics::{
     can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, holonomic_point_command,
-    is_ackermann, is_holonomic, path_speed, reverse_allowed, world_to_body,
+    body_heading_on_path, braked_for_bends, followable, is_ackermann, is_holonomic, max_curvature, path_speed,
+    reverse_allowed,
+    world_to_body,
 };
 use crate::core::math::{heading_error, normalize_angle};
 use crate::core::path::{
-    cumulative_lengths, curvature_at_projection, cusp_after, project, sample, speed_cap,
+    PathCursor, curvature_at_arc_length, curvature_toward, cusp_after, direction_at, sample_past, sharpest_ahead, speed_cap,
 };
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
 use datapod::Point;
 use std::f64::consts::PI;
 
 /// Lookahead shrink per unit of path curvature (metres of lookahead per
-/// unit curvature), keeping tight bends from being cut.
-const CURVATURE_LOOKAHEAD_GAIN: f64 = 0.5;
-const SEARCH_WINDOW: usize = 64;
+/// unit curvature of the sharpest bend within reach), keeping bends from being cut.
+const CURVATURE_LOOKAHEAD_GAIN: f64 = 1.0;
 
 #[derive(Clone, Debug, Default)]
 pub struct PurePursuitFollower {
     pub base: ControllerBase,
-    cum: Vec<f64>,
-    started: bool,
+    cursor: PathCursor,
     lookahead_point: Option<Point>,
+    last_speed: f64,
 }
 
 impl PurePursuitFollower {
@@ -95,9 +96,8 @@ impl Controller for PurePursuitFollower {
         if !(dt.is_finite() && dt > 0.0) {
             return VelocityCommand::invalid("dt must be positive and finite");
         }
-        if self.cum.len() != self.base.path.waypoints.len() {
-            self.cum = cumulative_lengths(&self.base.path.waypoints);
-            self.started = false;
+        if self.cursor.cum.len() != self.base.path.waypoints.len() {
+            self.cursor.set_path(&self.base.path.waypoints);
             self.base.path_index = 0;
         }
         let cfg = self.base.config.clone();
@@ -122,43 +122,50 @@ impl Controller for PurePursuitFollower {
             0.0,
         );
 
-        let window = if self.started {
-            SEARCH_WINDOW
-        } else {
-            usize::MAX
-        };
-        let Some(proj) = project(
-            &self.base.path.waypoints,
-            &self.cum,
-            rear,
-            self.base.path_index,
-            2,
-            window,
-        ) else {
+        // Progress, cusps and arrival go by the robot's pose; the rear axle
+        // chases the lookahead point.
+        let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
+        let Some(at_robot) = self.cursor.project(&self.base.path.waypoints, state.pose.point, self.base.path_index) else {
             return VelocityCommand::invalid("no path");
         };
-        self.started = true;
-        self.base.path_index = proj.segment;
+        let at_robot =
+            self.cursor.past_cusp(&self.base.path.waypoints, &self.base.path.speeds, state.pose.point, at_robot, crate::controller::cusp_reach(pos_tol, state, constraints));
+        self.base.path_index = at_robot.segment;
 
-        let (pos_tol, ang_tol) = effective_tolerances(goal, &cfg);
-        let passed_end = proj.beyond_end && proj.distance < 2.0 * pos_tol;
-        if let Some(cmd) = self.base.arrival(state, goal, constraints, passed_end) {
+        let length = self.cursor.cum.last().copied().unwrap_or(0.0);
+        if let Some(cmd) = self.base.arrival_on_path(state, goal, constraints, &at_robot, length) {
             self.lookahead_point = None;
             return cmd;
         }
+        let proj = if axle_offset > 0.0 {
+            self.cursor
+                .project_on_leg(&self.base.path.waypoints, &self.base.path.speeds, rear, at_robot.segment, at_robot.arc_length)
+                .unwrap_or(at_robot)
+        } else {
+            at_robot
+        };
 
         let base_lookahead = cfg.lookahead_distance.max(1e-3);
-        let kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cum, &proj).abs();
+        let kappa_path = sharpest_ahead(&self.base.path.waypoints, &self.cursor.cum, proj.arc_length, base_lookahead, max_curvature(constraints));
         let lookahead = ((base_lookahead + cfg.lookahead_time.max(0.0) * state.velocity.linear.abs())
             / (1.0 + CURVATURE_LOOKAHEAD_GAIN * kappa_path * base_lookahead))
             .clamp(0.5 * base_lookahead, 3.0 * base_lookahead);
-        let mut s_target = proj.arc_length + lookahead;
-        let mut stop_distance = self.base.status.distance_to_goal;
-        if let Some(cusp) = cusp_after(&self.base.path.speeds, &self.cum, proj.arc_length) {
-            s_target = s_target.min(cusp);
-            stop_distance = stop_distance.min((cusp - proj.arc_length).max(0.0));
+        let mut stop_distance = self.base.distance_left(&at_robot, length);
+        let mut cap = length;
+        if let Some(cusp) = cusp_after(&self.base.path.speeds, &self.cursor.cum, at_robot.arc_length) {
+            cap = cusp;
+            stop_distance = stop_distance.min((cusp - at_robot.arc_length).max(0.0));
         }
-        let (target, _) = sample(&self.base.path.waypoints, &self.cum, s_target);
+        // The rear axle aims where it stands when the pose is on the path at
+        // the lookahead point, facing along it; past an open end, the path runs
+        // straight on along its last heading.
+        let back = direction_at(&self.base.path.speeds, &at_robot) == Some(-1);
+        let open_end = cap >= length && !self.base.path.is_closed;
+        let s_target = if open_end { at_robot.arc_length + lookahead } else { (at_robot.arc_length + lookahead).min(cap) };
+        let (on_path, heading) = sample_past(&self.base.path.waypoints, &self.cursor.cum, s_target, cap);
+        let bend = curvature_toward(&self.base.path.waypoints, &self.cursor.cum, s_target, cap);
+        let body = body_heading_on_path(heading, followable(bend, constraints), axle_offset, back);
+        let target = Point::new(on_path.x - axle_offset * body.cos(), on_path.y - axle_offset * body.sin(), on_path.z);
         self.lookahead_point = Some(target);
 
         let dx = target.x - rear.x;
@@ -214,9 +221,12 @@ impl Controller for PurePursuitFollower {
                 s.min(constraints.max_linear_velocity)
             });
         let scale = heading_speed_scale(alpha_eff, constraints);
-        let v = direction
-            * path_speed(nominal, kappa, stop_distance, pos_tol, cfg.kp_linear, constraints)
-            * scale;
+        let v = path_speed(nominal, kappa, stop_distance, pos_tol, cfg.kp_linear, constraints) * scale;
+        let v_now = if state.velocity_valid { state.velocity.linear } else { self.last_speed };
+        let (waypoints, cum, s) = (&self.base.path.waypoints, &self.cursor.cum, at_robot.arc_length);
+        let v = braked_for_bends(v, v_now, nominal, stop_distance, |d| curvature_at_arc_length(waypoints, cum, s + d), constraints);
+        self.last_speed = v;
+        let v = direction * v;
 
         let mut omega = v * kappa;
         if can_turn_in_place(constraints.steering_type) {
@@ -232,11 +242,10 @@ impl Controller for PurePursuitFollower {
     }
 
     fn set_path(&mut self, path: Path) {
-        self.cum = cumulative_lengths(&path.waypoints);
+        self.cursor.set_path(&path.waypoints);
         self.base.path = path;
         self.base.path_index = 0;
         self.base.status = Default::default();
-        self.started = false;
         self.lookahead_point = None;
     }
 

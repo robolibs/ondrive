@@ -190,20 +190,7 @@ fn full_tracker_lifecycle_runs_to_goal() {
         allow_reverse: false,
         turn_first: false,
         allow_move: true,
-        has_trailer: false,
-        trailer_pose: OndrivePose {
-            position: OndriveVec3 {
-                x: 0.0,
-                y: 0.0,
-                z: 0.0,
-            },
-            rotation: OndriveQuat {
-                x: 0.0,
-                y: 0.0,
-                z: 0.0,
-                w: 1.0,
-            },
-        },
+        velocity_valid: false,
     };
 
     let dt = 0.05;
@@ -215,7 +202,6 @@ fn full_tracker_lifecycle_runs_to_goal() {
             angular_velocity: 0.0,
             lateral_velocity: 0.0,
             steering_angle: 0.0,
-            output_type: 0,
         };
         assert!(ondrive_tracker_tick(t, state, dt, ptr::null(), &mut cmd));
         assert!(cmd.valid);
@@ -264,7 +250,6 @@ fn full_tracker_lifecycle_runs_to_goal() {
         angular_velocity: 99.0,
         lateral_velocity: 99.0,
         steering_angle: 99.0,
-        output_type: 0,
     };
     assert!(ondrive_tracker_emergency_stop(t, &mut stop));
     assert!(stop.valid);
@@ -313,6 +298,7 @@ fn world_obstacles_round_trip() {
         0.1,
         0.1,
         xs.len(),
+        0.2,
     ));
     assert_eq!(ondrive_world_obstacle_count(w), 3);
 
@@ -326,6 +312,7 @@ fn world_obstacles_round_trip() {
         0.1,
         0.1,
         4,
+        0.2,
     ));
     assert!(err_message().is_some());
 
@@ -339,6 +326,7 @@ fn world_obstacles_round_trip() {
         0.1,
         0.1,
         0,
+        0.2,
     ));
 
     assert!(ondrive_world_clear(w));
@@ -388,4 +376,58 @@ fn all_tracker_kinds_construct() {
         assert_eq!(ondrive_tracker_kind(t), k);
         ondrive_tracker_free(t);
     }
+}
+
+#[test]
+fn ffi_reaches_controller_parameters_seed_footprint_and_plan() {
+    let t = ondrive_tracker_new(ONDRIVE_KIND_MPPI);
+    let params = unsafe { CStr::from_ptr(ondrive_tracker_params(t)) }
+        .to_string_lossy()
+        .into_owned();
+    assert!(params.contains("\"horizon_steps\""), "{params}");
+    let update = std::ffi::CString::new(r#"{"horizon_steps": 12, "num_samples": 64}"#).unwrap();
+    assert!(ondrive_tracker_set_params(t, update.as_ptr()));
+    let params = unsafe { CStr::from_ptr(ondrive_tracker_params(t)) }
+        .to_string_lossy()
+        .into_owned();
+    assert!(params.contains("\"horizon_steps\":12"), "{params}");
+    let bad = std::ffi::CString::new(r#"{"no_such_thing": 1}"#).unwrap();
+    assert!(!ondrive_tracker_set_params(t, bad.as_ptr()));
+    assert!(err_message().unwrap().contains("no_such_thing"));
+    assert!(ondrive_tracker_set_seed(t, 7));
+    let square = [0.4, 0.3, -0.4, 0.3, -0.4, -0.3, 0.4, -0.3];
+    assert!(ondrive_tracker_set_footprint_polygon(t, square.as_ptr(), 4));
+    assert!(!ondrive_tracker_set_footprint_polygon(
+        t,
+        square.as_ptr(),
+        2
+    ));
+    assert!(ondrive_tracker_set_footprint_disc(t, 0.5));
+
+    let path = ondrive_path_new();
+    for i in 0..20 {
+        ondrive_path_add_waypoint_xy(path, i as f64 * 0.25, 0.0, 0.0, 1.0);
+    }
+    assert!(ondrive_tracker_set_path(t, path));
+    let mut s: OndriveRobotState = unsafe { std::mem::zeroed() };
+    s.pose.rotation.w = 1.0;
+    s.allow_move = true;
+    let mut cmd: OndriveVelocityCommand = unsafe { std::mem::zeroed() };
+    assert!(ondrive_tracker_tick(t, s, 0.05, ptr::null(), &mut cmd));
+    let n = ondrive_tracker_predicted_trajectory(t, ptr::null_mut(), 0);
+    assert!(n >= 13, "a plan of at least the 12 configured steps has 13 points or more, got {n}");
+    let mut plan = vec![
+        OndriveVec3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0
+        };
+        n
+    ];
+    assert_eq!(
+        ondrive_tracker_predicted_trajectory(t, plan.as_mut_ptr(), n),
+        n
+    );
+    ondrive_path_free(path);
+    ondrive_tracker_free(t);
 }

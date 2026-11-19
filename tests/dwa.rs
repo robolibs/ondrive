@@ -104,6 +104,7 @@ fn dwa_avoids_obstacle() {
         obstacles: vec![Obstacle {
             id: 0,
             radius: 0.3,
+            dt: 0.0,
             modes: vec![GaussianMode {
                 weight: 1.0,
                 mean_x: vec![5.0],

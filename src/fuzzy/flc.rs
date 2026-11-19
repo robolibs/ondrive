@@ -6,12 +6,15 @@
 
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::{
+    path_to_body, axle_offset, axle_point_offset, bend_heading, braked_for_bends, followable,
     can_turn_in_place, finalize, finalize_holonomic, heading_speed_scale, is_ackermann,
     is_holonomic, path_speed, steering_to_curvature,
 };
-use crate::core::path::{PathCursor, curvature_at_projection, speed_cap};
+use crate::core::math::normalize_angle;
+use crate::core::path::{PathCursor, curvature_at_arc_length, curvature_at_projection, cusp_after, direction_at, speed_cap};
 use crate::pred::mppi::prepare;
 use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
+use datapod::Point;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Term {
@@ -38,7 +41,7 @@ impl Term {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FlcConfig {
     /// Cross-track error mapped onto the full `[-1, 1]` input range.
     pub cte_range: f64,
@@ -53,7 +56,7 @@ pub struct FlcConfig {
 impl Default for FlcConfig {
     fn default() -> Self {
         Self {
-            cte_range: 2.0,
+            cte_range: 0.6,
             heading_range: 1.57,
             max_steering: 0.7,
             base_velocity: 0.6,
@@ -67,6 +70,7 @@ pub struct FlcFollower {
     pub base: ControllerBase,
     pub flc_config: FlcConfig,
     cursor: PathCursor,
+    last_speed: f64,
 }
 
 const CENTERS: [f64; 7] = [-1.0, -2.0 / 3.0, -1.0 / 3.0, 0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0];
@@ -146,6 +150,16 @@ impl FlcFollower {
 }
 
 impl Controller for FlcFollower {
+    fn params(&self) -> serde_json::Value {
+        serde_json::to_value(&self.flc_config).unwrap_or_default()
+    }
+
+    fn set_params(&mut self, params: &serde_json::Value) -> Result<(), String> {
+        let cfg = crate::controller::merged(&self.flc_config, params)?;
+        self.set_flc_config(cfg);
+        Ok(())
+    }
+
     fn compute_control(
         &mut self,
         state: &RobotState,
@@ -160,8 +174,33 @@ impl Controller for FlcFollower {
         };
         let cfg = self.base.config.clone();
         let flc = self.flc_config.clone();
-        let e_lat = prep.proj.lateral_error;
-        let theta_e = prep.epsi;
+        let mut e_lat = prep.proj.lateral_error;
+        let mut kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &prep.proj);
+        // A reversing leg is driven as a vehicle facing the other way,
+        // forward; the body trails the bend by its pose's lead either way.
+        let reverse = match direction_at(&self.base.path.speeds, &prep.proj) {
+            Some(d) => prep.allow_reverse && d < 0,
+            None => prep.allow_reverse && prep.epsi.abs() > std::f64::consts::FRAC_PI_2,
+        };
+        let sign = if reverse { -1.0 } else { 1.0 };
+        let mut epsi = prep.epsi;
+        let trail = bend_heading(followable(kappa_path, constraints), sign * axle_offset(constraints));
+        let mut heading_trail = trail;
+        // Reversing, the errors are read at the leading axle the body turns
+        // about, which runs inside the bend.
+        let axle = axle_offset(constraints);
+        if reverse && axle > 0.0 {
+            let yaw = state.pose.rotation.to_euler().yaw;
+            let rear = Point::new(state.pose.point.x - axle * yaw.cos(), state.pose.point.y - axle * yaw.sin(), 0.0);
+            if let Some(at_rear) = self.cursor.project_on_leg(&self.base.path.waypoints, &self.base.path.speeds, rear, prep.proj.segment, prep.proj.arc_length) {
+                kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &at_rear);
+                e_lat = at_rear.lateral_error - axle_point_offset(followable(kappa_path, constraints), axle, 0.0);
+                epsi = normalize_angle(at_rear.heading - yaw);
+                heading_trail = 0.0;
+            }
+        }
+        let facing = if reverse { normalize_angle(epsi - std::f64::consts::PI) } else { epsi };
+        let theta_e = normalize_angle(facing - heading_trail);
 
         if state.turn_first && can_turn_in_place(constraints.steering_type) && theta_e.abs() > prep.ang_tol
         {
@@ -174,22 +213,31 @@ impl Controller for FlcFollower {
             -e_lat / flc.cte_range.max(1e-6),
             theta_e / flc.heading_range.max(1e-6),
         );
-        let kappa_path = curvature_at_projection(&self.base.path.waypoints, &self.cursor.cum, &prep.proj);
 
         let steer_ratio = u.abs().min(1.0);
         let nominal = speed_cap(&self.base.path.speeds, &prep.proj)
             .map_or(flc.base_velocity, |s| s.min(flc.base_velocity))
             .min(constraints.max_linear_velocity);
-        let v = path_speed(
-            nominal * (1.0 - 0.5 * steer_ratio),
-            kappa_path,
-            self.base.status.distance_to_goal,
-            prep.pos_tol,
-            cfg.kp_linear,
-            constraints,
-        )
-        .max(flc.min_velocity.min(nominal))
-            * heading_speed_scale(theta_e, constraints);
+        let s0 = prep.proj.arc_length;
+        let cusp = cusp_after(&self.base.path.speeds, &self.cursor.cum, s0).map_or(f64::INFINITY, |c| c - s0);
+        let left = self.base.distance_left(&prep.proj, self.cursor.total_length()).min(cusp);
+        let v_path = path_speed(nominal * (1.0 - 0.5 * steer_ratio), kappa_path, left, prep.pos_tol, cfg.kp_linear, constraints)
+            .max(flc.min_velocity.min(nominal).min(path_speed(nominal, 0.0, left, prep.pos_tol, cfg.kp_linear, constraints)));
+        let v_now = if state.velocity_valid { state.velocity.linear } else { self.last_speed };
+        let (waypoints, cum) = (&self.base.path.waypoints, &self.cursor.cum);
+        let v_path = braked_for_bends(v_path, v_now, nominal, left, |d| curvature_at_arc_length(waypoints, cum, s0 + d), constraints);
+        self.last_speed = v_path;
+        let kappa_path = kappa_path / trail.cos();
+
+        if is_holonomic(constraints.steering_type) {
+            self.base.status.mode = "flc_holonomic".into();
+            let yaw = state.pose.rotation.to_euler().yaw;
+            let (vx, vy) = path_to_body(v_path, -cfg.k_cross_track.max(1e-6) * e_lat, prep.proj.heading, yaw);
+            let omega = cfg.kp_angular.max(0.1) * theta_e;
+            return finalize_holonomic(vx, vy, omega, constraints, &cfg, "FLC tracking");
+        }
+
+        let v = v_path * heading_speed_scale(theta_e, constraints);
 
         let omega = if is_ackermann(constraints.steering_type) {
             let delta_fb = (u * flc.max_steering).clamp(
@@ -202,14 +250,8 @@ impl Controller for FlcFollower {
             u * flc.max_steering + v * kappa_path
         };
 
-        if is_holonomic(constraints.steering_type) {
-            self.base.status.mode = "flc_holonomic".into();
-            let lateral = -cfg.k_cross_track.max(1e-6) * e_lat;
-            return finalize_holonomic(v, lateral, omega, constraints, &cfg, "FLC tracking");
-        }
-
-        self.base.status.mode = "flc".into();
-        finalize(v, omega, constraints, &cfg, prep.allow_reverse, "FLC tracking")
+        self.base.status.mode = if reverse { "flc_reverse".into() } else { "flc".into() };
+        finalize(sign * v, omega, constraints, &cfg, prep.allow_reverse, "FLC tracking")
     }
 
     fn set_path(&mut self, path: Path) {

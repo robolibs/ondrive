@@ -1,6 +1,6 @@
 [package]
 name = "ondrive"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 description = "Rust motion-control / path-tracking library for mobile robots (PID, pure pursuit, Stanley, LQR, MPC, MPPI, ...)"
 license = "MIT"
@@ -26,11 +26,11 @@ python = ["dep:pyo3"]
 python-extension = ["python"]
 
 [dependencies]
-datapod = { git = "https://github.com/robolibs/datapod", tag = "0.4.0" }
-stateup = { git = "https://github.com/robolibs/stateup" }
+datapod = { git = "https://github.com/robolibs/datapod", tag = "0.6.2" }
 nalgebra = "0.33"
 rand = "0.8"
 rand_distr = "0.4"
+rayon = "1.10"
 pyo3 = { version = "0.23", optional = true, features = [
     "abi3-py39",
     "extension-module",
@@ -59,6 +59,10 @@ path = "examples/rust/carrot.rs"
 [[example]]
 name = "dwa"
 path = "examples/rust/dwa.rs"
+
+[[example]]
+name = "tick_profile"
+path = "examples/rust/tick_profile.rs"
 
 [[example]]
 name = "flc"
@@ -131,3 +135,7 @@ path = "examples/rust/vector.rs"
 [[example]]
 name = "verify"
 path = "examples/rust/verify.rs"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

@@ -14,17 +14,18 @@
 
 use crate::controller::{Controller, ControllerBase};
 use crate::core::kinematics::{
-    finalize, finalize_holonomic, is_ackermann, is_holonomic, max_curvature, speed_bounds,
+    actuation_delay, axle_offset, finalize, finalize_holonomic, is_ackermann, is_holonomic, max_curvature, speed_bounds,
+    wheelbase,
     world_to_body,
 };
 use crate::core::math::{normalize_angle, yaw_of};
-use crate::core::obstacles::CollisionChecker;
-use crate::core::path::{PathCursor, project, sample};
-use crate::pred::mppi::{current_lateral_speed, current_speed, prepare};
-use crate::types::{Goal, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
-use datapod::{Point, Pose};
+use crate::core::obstacles::{CollisionChecker, robot_radius};
+use crate::core::path::{PathCursor, cumulative_lengths, project, sample};
+use crate::pred::mppi::{Along, Choice, Swerve, current_lateral_speed, current_speed, plan_avoidance, prepare, signed_speed_at};
+use crate::types::{Goal, Obstacle, Path, RobotConstraints, RobotState, VelocityCommand, WorldConstraints};
+use datapod::{Euler, Point, Pose, Quaternion};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TebConfig {
     pub n_poses: usize,
     pub dt_nominal: f64,
@@ -43,12 +44,18 @@ pub struct TebConfig {
     pub obstacle_margin: f64,
     pub dt_min: f64,
     pub dt_max: f64,
+    /// Seconds of band the command is read over.
+    pub control_lookahead: f64,
+    /// Time constant, seconds, of the low-pass filter on the commanded
+    /// turn rate; 0 passes it straight through.
+    #[serde(default = "default_turn_filter")]
+    pub turn_filter: f64,
 }
 
 impl Default for TebConfig {
     fn default() -> Self {
         Self {
-            n_poses: 6,
+            n_poses: 12,
             dt_nominal: 0.3,
             iterations: 30,
             step_size: 0.05,
@@ -56,16 +63,35 @@ impl Default for TebConfig {
             weight_velocity_limit: 50.0,
             weight_angular_limit: 50.0,
             weight_acceleration_limit: 10.0,
-            weight_path_deviation: 1.0,
+            weight_path_deviation: 3.0,
             weight_obstacle: 100.0,
             weight_kinematic: 50.0,
             weight_goal: 5.0,
-            obstacle_margin: 0.3,
+            obstacle_margin: 0.8,
             dt_min: 0.05,
             dt_max: 1.0,
+            control_lookahead: 0.4,
+            turn_filter: default_turn_filter(),
         }
     }
 }
+
+fn default_turn_filter() -> f64 {
+    0.15
+}
+
+/// Share of the distance covered during the steering delay added to the
+/// obstacle margin.
+const LAG_MARGIN_GAIN: f64 = 0.25;
+
+/// Poses of the band checked for collision before it is driven: all of
+/// it, so a band that would be in the way when the traffic comes is never
+/// begun (teb_local_planner checks `feasibility_check_no_poses`, 5).
+const FEASIBILITY_POSES: usize = usize::MAX;
+/// Metres between the checks along each stretch of band checked.
+const FEASIBILITY_STEP: f64 = 0.1;
+/// Factor on the nominal time interval of the slower alternative band.
+const SLOWER: f64 = 2.0;
 
 #[derive(Clone, Debug, Default)]
 pub struct TebFollower {
@@ -76,7 +102,13 @@ pub struct TebFollower {
     band_initialised: bool,
     last_v: f64,
     last_vy: f64,
+    last_w: f64,
+    /// The way past the obstacles last chosen, see `plan_avoidance`.
+    avoid: Choice,
     auto_path_goal: Option<(f64, f64, f64)>,
+    /// Distance, metres, the pose rides ahead of the band's points, the axle the
+    /// body turns about.
+    axle: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -87,6 +119,23 @@ struct Band {
     dt: Vec<f64>,
     /// Arc length on the reference path where the band tail was sampled.
     tail_s: f64,
+}
+
+/// A band's cost in parts: the smooth terms, the obstacle penalty at each
+/// pose and segment middle, each pose's path deviation, and the segment
+/// each pose lies off, which the next pose's search starts from.
+struct Parts {
+    smooth: f64,
+    poses: Vec<f64>,
+    middles: Vec<f64>,
+    path: Vec<f64>,
+    segments: Vec<usize>,
+}
+
+impl Parts {
+    fn total(&self) -> f64 {
+        self.smooth + self.poses.iter().sum::<f64>() + self.middles.iter().sum::<f64>() + self.path.iter().sum::<f64>()
+    }
 }
 
 struct Problem<'a> {
@@ -100,31 +149,164 @@ struct Problem<'a> {
     v_lo: f64,
     v_hi: f64,
     v_start: f64,
+    /// Measured turn rate the band sets off from.
+    w_start: f64,
+    /// Steering rate over wheelbase, for an Ackermann machine's turn-rate
+    /// change limit `|v| · steer_per_wheelbase`; infinite when unlimited.
+    steer_per_wheelbase: f64,
     ackermann: bool,
     holonomic: bool,
+    /// Distance, metres, the pose rides ahead of the band's points, the axle the
+    /// body turns about.
+    axle: f64,
+    /// Path segment the robot projects onto, where projections start.
+    start_segment: usize,
 }
 
 impl Problem<'_> {
-    fn obstacle_cost(&self, step: usize, x: f64, y: f64, yaw: f64) -> f64 {
+    /// Room kept from obstacles: `obstacle_margin`, plus `LAG_MARGIN_GAIN`
+    /// of the distance the band's top speed covers while the steering
+    /// takes effect.
+    fn margin(&self) -> f64 {
+        self.cfg.obstacle_margin + LAG_MARGIN_GAIN * self.v_hi.abs() * actuation_delay(self.constraints)
+    }
+
+    /// The pose of a body whose band point, its turning axle, is `(x, y)`.
+    fn pose_of(&self, x: f64, y: f64, yaw: f64) -> (f64, f64) {
+        (x + self.axle * yaw.cos(), y + self.axle * yaw.sin())
+    }
+
+    /// Whether the body driven along the first `poses` poses of `b`, and
+    /// every `FEASIBILITY_STEP` metres between them, stays clear of every
+    /// obstacle as predicted at that moment (teb_local_planner's
+    /// `isTrajectoryFeasible`).
+    fn feasible(&self, b: &Band, poses: usize) -> bool {
+        if !self.checker.has_obstacles() {
+            return true;
+        }
+        let mut t = 0.0;
+        for i in 0..poses.min(b.x.len().saturating_sub(1)) {
+            let dt = b.dt[i].max(1e-4);
+            let gap = (b.x[i + 1] - b.x[i]).hypot(b.y[i + 1] - b.y[i]);
+            let parts = ((gap / FEASIBILITY_STEP).ceil() as usize).max(1);
+            let turn = normalize_angle(b.yaw[i + 1] - b.yaw[i]);
+            for k in 0..parts {
+                let f = k as f64 / parts as f64;
+                let yaw = b.yaw[i] + f * turn;
+                let (x, y) = self.pose_of(b.x[i] + f * (b.x[i + 1] - b.x[i]), b.y[i] + f * (b.y[i + 1] - b.y[i]), yaw);
+                if self.checker.clearance_at(t + f * dt, x, y, yaw) < 0.0 {
+                    return false;
+                }
+            }
+            t += dt;
+        }
+        true
+    }
+
+    /// Penalty for coming within `margin` of an obstacle as it is predicted
+    /// `t` seconds from now.
+    fn obstacle_cost(&self, t: f64, x: f64, y: f64, yaw: f64) -> f64 {
+        let (x, y) = self.pose_of(x, y, yaw);
         let c = self.cfg;
         if !self.checker.has_obstacles() {
             return 0.0;
         }
-        let d = self.checker.clearance(step, x, y, yaw);
-        if d < c.obstacle_margin {
-            let s = c.obstacle_margin - d;
+        let margin = self.margin();
+        let d = self.checker.clearance_at_within(t, x, y, yaw, margin);
+        if d < margin {
+            let s = margin - d;
             c.weight_obstacle * s * s
         } else {
             0.0
         }
     }
 
+    /// Seconds from now at which `b` reaches each pose.
+    fn times(b: &Band) -> Vec<f64> {
+        let mut times = vec![0.0; b.x.len()];
+        for i in 0..b.dt.len() {
+            times[i + 1] = times[i] + b.dt[i].max(1e-4);
+        }
+        times
+    }
+
+    /// The obstacle penalty at pose `i` of `b`, reached at `times[i]`.
+    fn at_pose(&self, b: &Band, times: &[f64], i: usize) -> f64 {
+        self.obstacle_cost(times[i], b.x[i], b.y[i], b.yaw[i])
+    }
+
+    /// The obstacle penalty halfway along segment `i` of `b`.
+    fn at_middle(&self, b: &Band, times: &[f64], i: usize) -> f64 {
+        self.obstacle_cost(times[i] + 0.5 * b.dt[i].max(1e-4), 0.5 * (b.x[i] + b.x[i + 1]), 0.5 * (b.y[i] + b.y[i + 1]), b.yaw[i])
+    }
+
+    /// The deviation penalty of pose `i` of `b` from the waypoints, searched
+    /// from segment `hint`, and the segment it lies off.
+    fn off_path(&self, b: &Band, i: usize, hint: usize) -> (f64, usize) {
+        let (px, py) = self.pose_of(b.x[i], b.y[i], b.yaw[i]);
+        match project(self.waypoints, self.cum, Point::new(px, py, 0.0), hint, 2, 64) {
+            Some(p) => (self.cfg.weight_path_deviation * p.distance * p.distance, p.segment),
+            None => (0.0, hint),
+        }
+    }
+
+    /// `b`'s cost in parts: the smooth terms, and the obstacle penalty at
+    /// each pose and segment middle and the deviation of each pose.
+    fn parts(&self, b: &Band) -> Parts {
+        let n = b.x.len();
+        let times = Self::times(b);
+        let poses: Vec<f64> = (0..n).map(|i| self.at_pose(b, &times, i)).collect();
+        let middles: Vec<f64> = (0..n - 1).map(|i| self.at_middle(b, &times, i)).collect();
+        let (mut path, mut segments) = (vec![0.0; n], vec![self.start_segment; n]);
+        if !self.waypoints.is_empty() {
+            for i in 1..n {
+                (path[i], segments[i]) = self.off_path(b, i, segments[i - 1]);
+            }
+        }
+        Parts { smooth: self.smooth(b), poses, middles, path, segments }
+    }
+
     fn cost(&self, b: &Band) -> f64 {
+        self.parts(b).total()
+    }
+
+    /// The cost of `b`, which differs from the band costed in `base` only
+    /// in optimiser variable `k`: the parts it moves costed afresh.
+    fn varied(&self, b: &Band, base: &Parts, k: usize) -> f64 {
+        let n = b.x.len();
+        let n_pose_vars = (n - 1) * 3;
+        let times = Self::times(b);
+        let (mut poses, mut middles, mut path) = (base.poses.clone(), base.middles.clone(), base.path.clone());
+        if k < n_pose_vars {
+            let i = k / 3 + 1;
+            poses[i] = self.at_pose(b, &times, i);
+            for j in [i - 1, i].into_iter().filter(|&j| j < n - 1) {
+                middles[j] = self.at_middle(b, &times, j);
+            }
+            if !self.waypoints.is_empty() {
+                path[i] = self.off_path(b, i, base.segments[i - 1]).0;
+            }
+        } else {
+            let j = k - n_pose_vars;
+            for (i, p) in poses.iter_mut().enumerate().skip(j + 1) {
+                *p = self.at_pose(b, &times, i);
+            }
+            for (i, m) in middles.iter_mut().enumerate().skip(j) {
+                *m = self.at_middle(b, &times, i);
+            }
+        }
+        Parts { smooth: self.smooth(b), poses, middles, path, segments: Vec::new() }.total()
+    }
+
+    /// The terms of `b`'s cost other than obstacles and path deviation:
+    /// time, speed, turn rate and their changes, kinematics and the goal.
+    fn smooth(&self, b: &Band) -> f64 {
         let n = b.x.len();
         let c = self.cfg;
         let a_max = self.constraints.max_linear_acceleration.abs();
         let mut cost = 0.0;
         let mut prev_v: Option<(f64, f64)> = None;
+        let mut prev_w: Option<(f64, f64)> = None;
         let mut last_v = 0.0;
 
         for i in 0..n - 1 {
@@ -146,6 +328,21 @@ impl Problem<'_> {
             let w_over = (w.abs() - self.constraints.max_angular_velocity.abs()).max(0.0);
             cost += c.weight_angular_limit * w_over * w_over;
 
+            let (pw, pwdt) = prev_w.unwrap_or((self.w_start, dt));
+            let alpha = (w - pw) / (0.5 * (pwdt + dt));
+            let speed = v.abs().max(TURN_CHANGE_SPEED_FLOOR);
+            let alpha_max = self.constraints.max_angular_acceleration.abs();
+            let steering = if self.steer_per_wheelbase.is_finite() {
+                speed * self.steer_per_wheelbase + (w.abs() / speed) * a_max
+            } else if alpha_max > 0.0 {
+                alpha_max
+            } else {
+                f64::INFINITY
+            };
+            let alpha_over = (alpha.abs() - steering).max(0.0);
+            cost += c.weight_acceleration_limit * alpha_over * alpha_over;
+            prev_w = Some((w, dt));
+
             let (pv, pdt) = prev_v.unwrap_or((self.v_start, dt));
             let a = (v - pv) / (0.5 * (pdt + dt));
             let a_over = (a.abs() - a_max).max(0.0);
@@ -165,7 +362,6 @@ impl Problem<'_> {
                 cost += c.weight_kinematic * r * r;
             }
 
-            cost += self.obstacle_cost(i, 0.5 * (b.x[i] + b.x[i + 1]), 0.5 * (b.y[i] + b.y[i + 1]), b.yaw[i]);
         }
         if let Some((_, pdt)) = prev_v {
             let a_goal = last_v / pdt.max(1e-4);
@@ -173,49 +369,32 @@ impl Problem<'_> {
             cost += 0.25 * c.weight_acceleration_limit * a_over * a_over;
         }
 
-        if !self.waypoints.is_empty() {
-            let mut hint = 0;
-            for i in 1..n {
-                if let Some(p) = project(
-                    self.waypoints,
-                    self.cum,
-                    Point::new(b.x[i], b.y[i], 0.0),
-                    hint,
-                    2,
-                    usize::MAX,
-                ) {
-                    cost += c.weight_path_deviation * p.distance * p.distance;
-                    hint = p.segment;
-                }
-            }
-        }
-
-        for i in 0..n {
-            cost += self.obstacle_cost(i, b.x[i], b.y[i], b.yaw[i]);
-        }
-
         let (tp, th) = self.target;
-        let dx = b.x[n - 1] - tp.x;
-        let dy = b.y[n - 1] - tp.y;
+        let (ex, ey) = self.pose_of(b.x[n - 1], b.y[n - 1], b.yaw[n - 1]);
+        let dx = ex - tp.x;
+        let dy = ey - tp.y;
         let dh = normalize_angle(b.yaw[n - 1] - th);
         cost += c.weight_goal * (dx * dx + dy * dy + 0.5 * dh * dh);
         cost
     }
 }
 
+/// Speed, m/s, below which the turn-rate change limit is taken at this speed.
+const TURN_CHANGE_SPEED_FLOOR: f64 = 0.2;
+
 /// Move a sampled band pose sideways off any obstacle it would sit on, so
 /// the optimiser sees a lateral gradient instead of a symmetric saddle.
 fn push_off_obstacles(
     p: Point,
     heading: f64,
-    step: usize,
+    t: f64,
     checker: &CollisionChecker,
     margin: f64,
 ) -> Point {
     if !checker.has_obstacles() {
         return p;
     }
-    let c = checker.clearance(step, p.x, p.y, heading);
+    let c = checker.clearance_at(t, p.x, p.y, heading);
     if c >= margin {
         return p;
     }
@@ -223,14 +402,43 @@ fn push_off_obstacles(
     let shift = margin - c;
     let left = Point::new(p.x - shift * s, p.y + shift * co, 0.0);
     let right = Point::new(p.x + shift * s, p.y - shift * co, 0.0);
-    let cl = checker.clearance(step, left.x, left.y, heading);
-    let cr = checker.clearance(step, right.x, right.y, heading);
+    let cl = checker.clearance_at(t, left.x, left.y, heading);
+    let cr = checker.clearance_at(t, right.x, right.y, heading);
     if cr > cl { right } else { left }
 }
 
 impl TebFollower {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The way past the obstacles ahead of arc length `from` that the
+    /// avoidance planner shared with MPPI picks over space and time
+    /// (`plan_avoidance`, committed across ticks): as poses for the band to
+    /// follow, `None` when it keeps to the path, and the share of the speed
+    /// it drives at.
+    fn detour_guide(&mut self, state: &RobotState, from: f64, constraints: &RobotConstraints, obstacles: &[Obstacle]) -> (Option<Vec<Pose>>, f64) {
+        if obstacles.is_empty() {
+            self.avoid = Choice::default();
+            return (None, 1.0);
+        }
+        let step = self.teb_config.dt_nominal.max(0.05);
+        let n = 2 * self.teb_config.n_poses.max(3);
+        let speed = (0.8 * constraints.max_linear_velocity).max(0.1);
+        let along = Along { path: &self.base.path, cum: &self.cursor.cum, trajectory: None, clock: 0.0, from };
+        let robot = (state.pose.point.x, state.pose.point.y, yaw_of(&state.pose));
+        let plan = plan_avoidance(&along, obstacles, robot_radius(constraints), Swerve::of(constraints, speed), n, step, speed, robot, &mut self.avoid);
+        let poses = plan.guide.map(|g| {
+            let k = g.x.len();
+            (0..k)
+                .map(|i| {
+                    let (a, b) = (i.saturating_sub(1), (i + 1).min(k - 1));
+                    let yaw = (g.y[b] - g.y[a]).atan2(g.x[b] - g.x[a]);
+                    Pose { point: Point::new(g.x[i], g.y[i], 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, yaw)) }
+                })
+                .collect()
+        });
+        (poses, plan.pace)
     }
 
     pub fn with_teb_config(cfg: TebConfig) -> Self {
@@ -246,12 +454,18 @@ impl TebFollower {
     }
 
     pub fn band_poses(&self) -> Vec<Point> {
-        self.band
-            .x
-            .iter()
-            .zip(self.band.y.iter())
-            .map(|(&x, &y)| Point::new(x, y, 0.0))
+        (0..self.band.x.len())
+            .map(|i| {
+                let yaw = self.band.yaw[i];
+                Point::new(self.band.x[i] + self.axle * yaw.cos(), self.band.y[i] + self.axle * yaw.sin(), 0.0)
+            })
             .collect()
+    }
+
+    /// The turning axle of a body whose pose is `p`, heading `yaw`: the point
+    /// the band follows.
+    fn axle_of(&self, p: Point, yaw: f64) -> Point {
+        Point::new(p.x - self.axle * yaw.cos(), p.y - self.axle * yaw.sin(), 0.0)
     }
 
     fn nominal_step(&self, constraints: &RobotConstraints) -> f64 {
@@ -259,9 +473,18 @@ impl TebFollower {
     }
 
     fn sample_band_pose(&self, s: f64, step: usize, checker: &CollisionChecker) -> (Point, f64) {
-        let (p, h) = sample(&self.base.path.waypoints, &self.cursor.cum, s);
-        let p = push_off_obstacles(p, h, step, checker, self.teb_config.obstacle_margin);
+        let (p, h) = self.path_pose(s);
+        let t = step as f64 * self.teb_config.dt_nominal;
+        let p = push_off_obstacles(p, h, t, checker, self.teb_config.obstacle_margin);
         (p, h)
+    }
+
+    /// The path at arc length `s` and the body heading there: the direction
+    /// of travel, turned round on stretches the path drives in reverse.
+    fn path_pose(&self, s: f64) -> (Point, f64) {
+        let (p, h) = sample(&self.base.path.waypoints, &self.cursor.cum, s);
+        let reverse = signed_speed_at(&self.base.path.speeds, &self.cursor.cum, s).is_some_and(|v| v < 0.0);
+        (p, if reverse { normalize_angle(h + std::f64::consts::PI) } else { h })
     }
 
     fn initialise_band(
@@ -270,6 +493,7 @@ impl TebFollower {
         s0: f64,
         constraints: &RobotConstraints,
         checker: &CollisionChecker,
+        cusp: f64,
     ) {
         let n = self.teb_config.n_poses.max(3);
         let step = self.nominal_step(constraints);
@@ -280,12 +504,15 @@ impl TebFollower {
             dt: vec![self.teb_config.dt_nominal; n - 1],
             tail_s: s0,
         };
-        b.x[0] = state.pose.point.x;
-        b.y[0] = state.pose.point.y;
-        b.yaw[0] = state.pose.rotation.to_euler().yaw;
+        let yaw0 = state.pose.rotation.to_euler().yaw;
+        let start = self.axle_of(state.pose.point, yaw0);
+        b.x[0] = start.x;
+        b.y[0] = start.y;
+        b.yaw[0] = yaw0;
         for i in 1..n {
-            let s = s0 + i as f64 * step;
+            let s = (s0 + i as f64 * step).min(cusp);
             let (p, h) = self.sample_band_pose(s, i, checker);
+            let p = self.axle_of(p, h);
             b.x[i] = p.x;
             b.y[i] = p.y;
             b.yaw[i] = h;
@@ -295,19 +522,22 @@ impl TebFollower {
         self.band_initialised = true;
     }
 
-    /// Re-anchor pose 0 to the robot, drop every pose the robot has passed
-    /// and keep the first interval consistent with the current speed.
+    /// Re-anchor pose 0 to the robot, drop every pose the robot has passed,
+    /// add new ones no further than arc length `cusp`, and keep the first
+    /// interval consistent with the current speed.
     fn advance_band(
         &mut self,
         state: &RobotState,
         constraints: &RobotConstraints,
         checker: &CollisionChecker,
         v_now: f64,
+        cusp: f64,
     ) {
         let n = self.band.x.len();
         let step = self.nominal_step(constraints);
-        let px = state.pose.point.x;
-        let py = state.pose.point.y;
+        let yaw0 = state.pose.rotation.to_euler().yaw;
+        let start = self.axle_of(state.pose.point, yaw0);
+        let (px, py) = (start.x, start.y);
         for _ in 0..n {
             let dx = self.band.x[1] - px;
             let dy = self.band.y[1] - py;
@@ -321,8 +551,9 @@ impl TebFollower {
             self.band.y.remove(1);
             self.band.yaw.remove(1);
             self.band.dt.remove(0);
-            self.band.tail_s += step;
+            self.band.tail_s = (self.band.tail_s + step).min(cusp);
             let (p, h) = self.sample_band_pose(self.band.tail_s, n - 1, checker);
+            let p = self.axle_of(p, h);
             self.band.x.push(p.x);
             self.band.y.push(p.y);
             self.band.yaw.push(h);
@@ -330,7 +561,7 @@ impl TebFollower {
         }
         self.band.x[0] = px;
         self.band.y[0] = py;
-        self.band.yaw[0] = state.pose.rotation.to_euler().yaw;
+        self.band.yaw[0] = yaw0;
         let ds = (self.band.x[1] - px).hypot(self.band.y[1] - py);
         if v_now.abs() > 1e-3 {
             self.band.dt[0] =
@@ -338,93 +569,135 @@ impl TebFollower {
         }
     }
 
-    fn optimise(&mut self, problem: &Problem) {
-        let cfg = self.teb_config.clone();
+    /// A band laid along `waypoints` from arc length `from`, or from where
+    /// the robot stands on them, pose 0 at the robot, the rest `step` apart
+    /// pushed off obstacles, with its tail placed on the path. `None` where
+    /// the waypoints end before the band or it runs past a cusp.
+    #[allow(clippy::too_many_arguments)]
+    fn laid_along(&self, state: &RobotState, waypoints: &[Pose], cum: &[f64], from: Option<f64>, step: f64, checker: &CollisionChecker, cusp: f64) -> Option<Band> {
         let n = self.band.x.len();
-        let n_pose_vars = (n - 1) * 3;
-        let n_vars = n_pose_vars + (n - 1);
-        let eps = 1e-4;
-        let mut grad = vec![0.0; n_vars];
-
-        let get = |b: &Band, k: usize| -> f64 {
-            if k < n_pose_vars {
-                let i = k / 3 + 1;
-                match k % 3 {
-                    0 => b.x[i],
-                    1 => b.y[i],
-                    _ => b.yaw[i],
-                }
-            } else {
-                b.dt[k - n_pose_vars]
-            }
+        let length = cum.last().copied().unwrap_or(0.0);
+        let from = match from {
+            Some(s) => s,
+            None => crate::core::path::project(waypoints, cum, state.pose.point, 0, 0, usize::MAX)?.arc_length,
         };
-        let set = |b: &mut Band, k: usize, v: f64| {
-            if k < n_pose_vars {
-                let i = k / 3 + 1;
-                match k % 3 {
-                    0 => b.x[i] = v,
-                    1 => b.y[i] = v,
-                    _ => b.yaw[i] = normalize_angle(v),
-                }
-            } else {
-                b.dt[k - n_pose_vars] = v.clamp(cfg.dt_min, cfg.dt_max);
-            }
-        };
-        let block = |k: usize| -> usize {
-            if k < n_pose_vars {
-                if k % 3 == 2 { 1 } else { 0 }
-            } else {
-                2
-            }
-        };
-
-        let mut current = problem.cost(&self.band);
-        for _ in 0..cfg.iterations {
-            let mut work = self.band.clone();
-            for (k, g) in grad.iter_mut().enumerate() {
-                let o = get(&work, k);
-                set(&mut work, k, o + eps);
-                let cp = problem.cost(&work);
-                set(&mut work, k, o - eps);
-                let cm = problem.cost(&work);
-                set(&mut work, k, o);
-                *g = (cp - cm) / (2.0 * eps);
-            }
-            let mut g_inf = [0.0_f64; 3];
-            for (k, g) in grad.iter().enumerate() {
-                let b = block(k);
-                g_inf[b] = g_inf[b].max(g.abs());
-            }
-            if g_inf.iter().all(|g| *g < 1e-9) {
-                break;
-            }
-            let mut scale = 1.0;
-            let mut improved = false;
-            for _ in 0..6 {
-                let mut cand = self.band.clone();
-                for (k, g) in grad.iter().enumerate() {
-                    let step = scale * cfg.step_size / g_inf[block(k)].max(1.0);
-                    let o = get(&self.band, k);
-                    set(&mut cand, k, o - step * g);
-                }
-                let c = problem.cost(&cand);
-                if c < current {
-                    let rel = (current - c) / current.abs().max(1e-12);
-                    current = c;
-                    self.band = cand;
-                    improved = rel > 1e-4;
-                    break;
-                }
-                scale *= 0.5;
-            }
-            if !improved {
-                break;
-            }
+        if from + (n - 1) as f64 * step > length {
+            return None;
         }
+        let yaw0 = yaw_of(&state.pose);
+        let start = self.axle_of(state.pose.point, yaw0);
+        let mut b = Band { x: vec![start.x; n], y: vec![start.y; n], yaw: vec![yaw0; n], dt: vec![self.teb_config.dt_nominal; n - 1], tail_s: self.band.tail_s };
+        for i in 1..n {
+            let (p, h) = sample(waypoints, cum, (from + i as f64 * step).min(length));
+            let p = push_off_obstacles(p, h, i as f64 * self.teb_config.dt_nominal, checker, self.teb_config.obstacle_margin);
+            let p = self.axle_of(p, h);
+            (b.x[i], b.y[i], b.yaw[i]) = (p.x, p.y, h);
+        }
+        let tail = Point::new(b.x[n - 1] + self.axle * b.yaw[n - 1].cos(), b.y[n - 1] + self.axle * b.yaw[n - 1].sin(), 0.0);
+        b.tail_s = crate::core::path::project(&self.base.path.waypoints, &self.cursor.cum, tail, 0, 0, usize::MAX)?.arc_length;
+        (b.tail_s < cusp).then_some(b)
     }
 }
 
+/// `band` descended on `problem`'s cost by central-difference gradients,
+/// `cfg.iterations` line-searched steps at most.
+fn optimise(problem: &Problem, cfg: &TebConfig, mut band: Band) -> Band {
+    let n = band.x.len();
+    let n_pose_vars = (n - 1) * 3;
+    let n_vars = n_pose_vars + (n - 1);
+    let eps = 1e-4;
+    let mut grad = vec![0.0; n_vars];
+
+    let get = |b: &Band, k: usize| -> f64 {
+        if k < n_pose_vars {
+            let i = k / 3 + 1;
+            match k % 3 {
+                0 => b.x[i],
+                1 => b.y[i],
+                _ => b.yaw[i],
+            }
+        } else {
+            b.dt[k - n_pose_vars]
+        }
+    };
+    let set = |b: &mut Band, k: usize, v: f64| {
+        if k < n_pose_vars {
+            let i = k / 3 + 1;
+            match k % 3 {
+                0 => b.x[i] = v,
+                1 => b.y[i] = v,
+                _ => b.yaw[i] = normalize_angle(v),
+            }
+        } else {
+            b.dt[k - n_pose_vars] = v.clamp(cfg.dt_min, cfg.dt_max);
+        }
+    };
+    let block = |k: usize| -> usize {
+        if k < n_pose_vars {
+            if k % 3 == 2 { 1 } else { 0 }
+        } else {
+            2
+        }
+    };
+
+    let mut current = problem.cost(&band);
+    for _ in 0..cfg.iterations {
+        let mut work = band.clone();
+        let base = problem.parts(&band);
+        for (k, g) in grad.iter_mut().enumerate() {
+            let o = get(&work, k);
+            set(&mut work, k, o + eps);
+            let cp = problem.varied(&work, &base, k);
+            set(&mut work, k, o - eps);
+            let cm = problem.varied(&work, &base, k);
+            set(&mut work, k, o);
+            *g = (cp - cm) / (2.0 * eps);
+        }
+        let mut g_inf = [0.0_f64; 3];
+        for (k, g) in grad.iter().enumerate() {
+            let b = block(k);
+            g_inf[b] = g_inf[b].max(g.abs());
+        }
+        if g_inf.iter().all(|g| *g < 1e-9) {
+            break;
+        }
+        let mut scale = 1.0;
+        let mut improved = false;
+        for _ in 0..6 {
+            let mut cand = band.clone();
+            for (k, g) in grad.iter().enumerate() {
+                let step = scale * cfg.step_size / g_inf[block(k)].max(1.0);
+                let o = get(&band, k);
+                set(&mut cand, k, o - step * g);
+            }
+            let c = problem.cost(&cand);
+            if c < current {
+                let rel = (current - c) / current.abs().max(1e-12);
+                current = c;
+                band = cand;
+                improved = rel > 1e-4;
+                break;
+            }
+            scale *= 0.5;
+        }
+        if !improved {
+            break;
+        }
+    }
+    band
+}
+
 impl Controller for TebFollower {
+    fn params(&self) -> serde_json::Value {
+        serde_json::to_value(&self.teb_config).unwrap_or_default()
+    }
+
+    fn set_params(&mut self, params: &serde_json::Value) -> Result<(), String> {
+        let cfg = crate::controller::merged(&self.teb_config, params)?;
+        self.set_teb_config(cfg);
+        Ok(())
+    }
+
     fn compute_control(
         &mut self,
         state: &RobotState,
@@ -456,22 +729,37 @@ impl Controller for TebFollower {
                 return cmd;
             }
         };
-        let checker = CollisionChecker::new(world, constraints, 0.0);
+        let checker = CollisionChecker::new(world, constraints, 0.0).with_spread(1.0);
+        self.axle = axle_offset(constraints);
         let holonomic = is_holonomic(constraints.steering_type);
         let v_now = current_speed(state, self.last_v);
         let vy_now = if holonomic { current_lateral_speed(state, self.last_vy) } else { 0.0 };
         let n = self.teb_config.n_poses.max(3);
+        let release = (0.5 * prep.pos_tol).max(0.05);
+        let cusp = crate::core::path::cusp_after(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length + release)
+            .unwrap_or(f64::INFINITY);
         if !self.band_initialised || self.band.x.len() != n {
-            self.initialise_band(state, prep.proj.arc_length, constraints, &checker);
+            self.initialise_band(state, prep.proj.arc_length, constraints, &checker, cusp);
         } else {
-            self.advance_band(state, constraints, &checker, v_now);
+            self.advance_band(state, constraints, &checker, v_now, cusp);
         }
 
         let (v_lo, v_hi) = speed_bounds(constraints, prep.allow_reverse);
         let total = self.cursor.total_length();
-        let target = sample(&self.base.path.waypoints, &self.cursor.cum, self.band.tail_s.min(total));
-        let waypoints = self.base.path.waypoints.clone();
-        let cum = self.cursor.cum.clone();
+        let mut target = self.path_pose(self.band.tail_s.min(total));
+        let mut waypoints = self.base.path.waypoints.clone();
+        let mut cum = self.cursor.cum.clone();
+        let mut start_segment = prep.proj.segment;
+        let obstacles: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
+        let (guide, pace) = self.detour_guide(state, prep.proj.arc_length, constraints, obstacles);
+        let guided = guide.is_some();
+        if let Some(guide) = guide {
+            cum = cumulative_lengths(&guide);
+            target = guide.last().map(|p| (p.point, yaw_of(p))).unwrap_or(target);
+            waypoints = guide;
+            start_segment = 0;
+        }
+        let v_hi_paced = v_hi * pace.clamp(0.0, 1.0);
         let cfg = self.teb_config.clone();
         let problem = Problem {
             cfg: &cfg,
@@ -482,18 +770,72 @@ impl Controller for TebFollower {
             target,
             kappa_max: max_curvature(constraints),
             v_lo,
-            v_hi,
+            v_hi: v_hi_paced,
             v_start: v_now,
+            w_start: if state.velocity_valid { state.velocity.angular } else { self.last_w },
+            steer_per_wheelbase: if is_ackermann(constraints.steering_type) && constraints.max_steering_rate > 0.0 {
+                constraints.max_steering_rate / wheelbase(constraints)
+            } else {
+                f64::INFINITY
+            },
             ackermann: is_ackermann(constraints.steering_type),
             holonomic,
+            start_segment,
+            axle: self.axle,
         };
-        self.optimise(&problem);
+        // Candidates, optimised side by side against every obstacle (homotopy-
+        // class planning): the band as warm-started; the same band at
+        // `SLOWER` times its nominal timing, which meets the obstacles later;
+        // and a band laid afresh along the shared planner's way, or the path
+        // without one, which goes round on the side that way takes and is
+        // never folded. The cheapest that stays clear is driven, the warm
+        // band if none does.
+        let mut candidates = vec![self.band.clone()];
+        if checker.has_obstacles() {
+            let mut slower = self.band.clone();
+            for dt in slower.dt.iter_mut() {
+                *dt = (cfg.dt_nominal * SLOWER).clamp(cfg.dt_min, cfg.dt_max);
+            }
+            candidates.push(slower);
+            let reversing = signed_speed_at(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length).is_some_and(|v| v < 0.0);
+            if !reversing {
+                let from = if guided { None } else { Some(prep.proj.arc_length) };
+                candidates.extend(self.laid_along(state, &waypoints, &cum, from, self.nominal_step(constraints), &checker, cusp));
+            }
+        }
+        let solved = crate::core::parallel::map_indexed(candidates.len(), |k| optimise(&problem, &cfg, candidates[k].clone()));
+        let score = |b: &Band| if problem.feasible(b, FEASIBILITY_POSES) { problem.cost(b) } else { f64::INFINITY };
+        let scores: Vec<f64> = solved.iter().map(score).collect();
+        let best = (1..solved.len()).filter(|&k| scores[k] < scores[0]).min_by(|&a, &b| scores[a].total_cmp(&scores[b])).unwrap_or(0);
+        self.band = solved.into_iter().nth(best).expect("the warm band is always a candidate");
+        // A band running into an obstacle is dropped, to be laid afresh next
+        // tick, and the robot brakes meanwhile.
+        if !problem.feasible(&self.band, FEASIBILITY_POSES) {
+            self.band_initialised = false;
+            let a_max = constraints.max_linear_acceleration.abs().max(1e-6);
+            let v = v_now.signum() * (v_now.abs() - a_max * dt).max(0.0);
+            self.base.status.mode = "teb_infeasible".into();
+            let cmd = finalize(v, 0.0, constraints, &self.base.config, prep.allow_reverse, "TEB infeasible band");
+            self.last_v = if cmd.valid { v } else { 0.0 };
+            self.last_w = 0.0;
+            return cmd;
+        }
 
         let dt0 = self.band.dt[0].max(1e-3);
         let dx = self.band.x[1] - self.band.x[0];
         let dy = self.band.y[1] - self.band.y[0];
         let yaw0 = self.band.yaw[0];
-        let w = normalize_angle(self.band.yaw[1] - self.band.yaw[0]) / dt0;
+        // The turn and speed are read over the first poses spanning
+        // `control_lookahead` seconds (teb_local_planner's control look-ahead poses),
+        // not one segment, which the last iterations of the solve jostle.
+        let (mut k, mut span, mut length) = (1, dt0, dx.hypot(dy));
+        while k + 1 < self.band.x.len() && span < self.teb_config.control_lookahead {
+            span += self.band.dt[k].max(1e-3);
+            length += (self.band.x[k + 1] - self.band.x[k]).hypot(self.band.y[k + 1] - self.band.y[k]);
+            k += 1;
+        }
+        let w_band = normalize_angle(self.band.yaw[k] - self.band.yaw[0]) / span;
+        let w = self.last_w + (w_band - self.last_w) * (dt / (self.teb_config.turn_filter + dt)).min(1.0);
         let a_max = constraints.max_linear_acceleration.abs().max(1e-6);
 
         if holonomic {
@@ -507,13 +849,20 @@ impl Controller for TebFollower {
             return cmd;
         }
 
-        let ds = dx.hypot(dy);
         let forward = (dx * yaw0.cos() + dy * yaw0.sin()).signum();
-        let v = (forward * ds / dt0).clamp(v_now - a_max * dt, v_now + a_max * dt);
-
+        // Capped to stop by the cusp, braking after the actuation delay.
+        let lead = v_now.abs() * actuation_delay(constraints);
+        // The stop holds for the cusp ahead of the pose, the band runs on past it.
+        let stop_at = crate::core::path::cusp_after(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length).unwrap_or(f64::INFINITY);
+        let stop = (2.0 * a_max * (stop_at - prep.proj.arc_length - lead).max(0.0)).sqrt();
+        // Braking to turn round, the ramp runs from the last command, not the
+        // lagging measurement.
+        let base = if forward * v_now < 0.0 { self.last_v } else { v_now };
+        let v = (forward * length / span).clamp(base - a_max * dt, base + a_max * dt).clamp(-stop, stop);
         self.base.status.mode = "teb".into();
         let cmd = finalize(v, w, constraints, &self.base.config, prep.allow_reverse, "TEB tracking");
         self.last_v = if cmd.valid { v.clamp(v_lo, v_hi) } else { 0.0 };
+        self.last_w = if cmd.valid { w } else { 0.0 };
         cmd
     }
 
@@ -529,6 +878,7 @@ impl Controller for TebFollower {
     fn reset(&mut self) {
         self.set_path(Path::default());
         self.last_v = 0.0;
+        self.last_w = 0.0;
         self.last_vy = 0.0;
     }
 
@@ -546,5 +896,87 @@ impl Controller for TebFollower {
 
     fn base_mut(&mut self) -> &mut ControllerBase {
         &mut self.base
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Band, Problem, TebConfig};
+    use crate::core::obstacles::CollisionChecker;
+    use crate::core::path::cumulative_lengths;
+    use crate::types::{GaussianMode, Obstacle, RobotConstraints, SteeringType, WorldConstraints};
+    use datapod::{Euler, Point, Pose, Quaternion};
+
+    /// A band nudged in one variable costs the same through the parts that
+    /// variable moves as costed whole, with a post and a crosser near it.
+    #[test]
+    fn a_varied_band_costs_the_same_as_costed_whole() {
+        let mut c = RobotConstraints::default();
+        c.steering_type = SteeringType::Ackermann;
+        c.wheelbase = 1.5;
+        c.max_linear_velocity = 1.5;
+        c.max_steering_angle = 0.5;
+        c.max_steering_rate = 0.3;
+        let n = 31;
+        let mode = |x: f64, y: f64, vx: f64, vy: f64| GaussianMode {
+            weight: 1.0,
+            mean_x: (0..n).map(|k| x + vx * 0.2 * k as f64).collect(),
+            mean_y: (0..n).map(|k| y + vy * 0.2 * k as f64).collect(),
+            std_x: vec![0.05; n],
+            std_y: vec![0.05; n],
+        };
+        let world = WorldConstraints {
+            obstacles: vec![Obstacle { id: 0, radius: 0.5, modes: vec![mode(3.0, 0.6, 0.0, 0.0)], dt: 0.2 }, Obstacle { id: 1, radius: 0.5, modes: vec![mode(5.0, -3.0, 0.0, 1.0)], dt: 0.2 }],
+            ..Default::default()
+        };
+        let checker = CollisionChecker::new(Some(&world), &c, 0.0).with_spread(1.0);
+        let waypoints: Vec<Pose> = (0..=40).map(|i| Pose { point: Point::new(0.25 * i as f64, 0.0, 0.0), rotation: Quaternion::from_euler(Euler::new(0.0, 0.0, 0.0)) }).collect();
+        let cum = cumulative_lengths(&waypoints);
+        let cfg = TebConfig::default();
+        let problem = Problem {
+            cfg: &cfg,
+            constraints: &c,
+            waypoints: &waypoints,
+            cum: &cum,
+            checker: &checker,
+            target: (Point::new(9.0, 0.0, 0.0), 0.0),
+            kappa_max: 0.5_f64.tan() / 1.5,
+            v_lo: 0.0,
+            v_hi: 1.5,
+            v_start: 0.8,
+            w_start: 0.0,
+            steer_per_wheelbase: 0.3 / 1.5,
+            ackermann: true,
+            holonomic: false,
+            axle: 0.4,
+            start_segment: 0,
+        };
+        let m = 12;
+        let band = Band {
+            x: (0..m).map(|i| 0.7 * i as f64).collect(),
+            y: (0..m).map(|i| 0.3 * (0.6 * i as f64).sin()).collect(),
+            yaw: (0..m).map(|i| 0.2 * (0.6 * i as f64).cos()).collect(),
+            dt: vec![0.3; m - 1],
+            tail_s: 7.7,
+        };
+        let base = problem.parts(&band);
+        let n_pose_vars = (m - 1) * 3;
+        for k in 0..n_pose_vars + (m - 1) {
+            for step in [1e-4, -1e-4, 0.05] {
+                let mut b = band.clone();
+                if k < n_pose_vars {
+                    let i = k / 3 + 1;
+                    match k % 3 {
+                        0 => b.x[i] += step,
+                        1 => b.y[i] += step,
+                        _ => b.yaw[i] += step,
+                    }
+                } else {
+                    b.dt[k - n_pose_vars] += step;
+                }
+                let (whole, varied) = (problem.cost(&b), problem.varied(&b, &base, k));
+                assert!((whole - varied).abs() <= 1e-9 * whole.abs().max(1.0), "variable {k} step {step}: {whole} whole, {varied} varied");
+            }
+        }
     }
 }

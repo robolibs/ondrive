@@ -160,6 +160,7 @@ fn obstacle(x: f64, y: f64) -> WorldConstraints {
         obstacles: vec![Obstacle {
             id: 0,
             radius: 0.3,
+            dt: 0.0,
             modes: vec![GaussianMode { weight: 1.0, mean_x: vec![x], mean_y: vec![y], std_x: vec![0.05], std_y: vec![0.05] }],
         }],
         ..Default::default()
@@ -195,6 +196,7 @@ fn apf_reports_a_local_minimum_when_forces_cancel() {
     let c = constraints(SteeringType::Differential);
     let mut cfg = ondrive::ApfConfig::default();
     cfg.k_repulse = 5.0;
+    cfg.circulation = 0.0;
     let mut apf = ApfFollower::with_apf_config(cfg);
     apf.set_config(config());
     let goal = Goal { target_pose: pose(6.0, 0.0, 0.0), tolerance_position: 0.3, tolerance_orientation: PI, ..Default::default() };
@@ -211,4 +213,31 @@ fn apf_reports_a_local_minimum_when_forces_cancel() {
         integrate(&mut state, &cmd, 0.05);
     }
     assert!(saw_minimum, "APF never reported the head-on local minimum");
+}
+
+#[test]
+fn apf_circulates_round_an_obstacle_dead_ahead() {
+    let c = constraints(SteeringType::Differential);
+    let mut cfg = ondrive::ApfConfig::default();
+    cfg.k_repulse = 5.0;
+    let mut apf = ApfFollower::with_apf_config(cfg);
+    apf.set_config(config());
+    let goal = Goal { target_pose: pose(6.0, 0.0, 0.0), tolerance_position: 0.3, tolerance_orientation: PI, ..Default::default() };
+    let world = obstacle(3.0, 0.0);
+    let mut state = RobotState { pose: pose(0.0, 0.0, 0.0), allow_move: true, ..Default::default() };
+    let mut min_d = f64::MAX;
+    let mut reached = false;
+    for _ in 0..2400 {
+        let cmd = apf.compute_control(&state, &goal, &c, 0.05, Some(&world));
+        assert!(cmd.valid);
+        assert_ne!(apf.get_status().mode, "apf_local_minimum", "stuck at ({:.2},{:.2})", state.pose.point.x, state.pose.point.y);
+        integrate(&mut state, &cmd, 0.05);
+        min_d = min_d.min((state.pose.point.x - 3.0).hypot(state.pose.point.y));
+        if apf.get_status().goal_reached {
+            reached = true;
+            break;
+        }
+    }
+    assert!(reached, "APF ended at ({:.2},{:.2})", state.pose.point.x, state.pose.point.y);
+    assert!(min_d > 0.3 + 0.36, "APF grazed the obstacle: {min_d:.2}");
 }

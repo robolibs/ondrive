@@ -84,11 +84,13 @@ struct Run {
     max_speed: f64,
     pose: Pose,
     invalid_at: Option<Pose>,
+    /// Closest the robot centre came to an obstacle centre.
+    nearest: f64,
 }
 
 fn simulate(ctrl: &mut dyn Controller, goal: &Goal, c: &RobotConstraints, start: Pose, world: Option<&WorldConstraints>) -> Run {
     let mut state = RobotState { pose: start, allow_move: true, ..Default::default() };
-    let mut run = Run { reached: false, min_speed_mid: f64::MAX, max_speed: 0.0, pose: start, invalid_at: None };
+    let mut run = Run { reached: false, min_speed_mid: f64::MAX, max_speed: 0.0, pose: start, invalid_at: None, nearest: f64::INFINITY };
     let dt = 0.05;
     for i in 0..1600 {
         let cmd = ctrl.compute_control(&state, goal, c, dt, world);
@@ -106,6 +108,9 @@ fn simulate(ctrl: &mut dyn Controller, goal: &Goal, c: &RobotConstraints, start:
         state.pose.rotation = Quaternion::from_euler(Euler::new(0.0, 0.0, yaw + cmd.angular_velocity * dt));
         state.velocity.linear = cmd.linear_velocity;
         state.velocity.angular = cmd.angular_velocity;
+        for m in world.iter().flat_map(|w| &w.obstacles).flat_map(|o| &o.modes) {
+            run.nearest = run.nearest.min((state.pose.point.x - m.mean_x[0]).hypot(state.pose.point.y - m.mean_y[0]));
+        }
         if ctrl.get_status().goal_reached {
             run.reached = true;
             break;
@@ -147,12 +152,13 @@ fn rpp_matches_pure_pursuit_on_a_straight_line() {
 }
 
 #[test]
-fn rpp_stops_before_an_obstacle_on_the_path() {
+fn rpp_goes_round_an_obstacle_on_the_path() {
     let path = line(10.0);
     let world = WorldConstraints {
         obstacles: vec![Obstacle {
             id: 0,
             radius: 0.3,
+            dt: 0.0,
             modes: vec![GaussianMode { weight: 1.0, mean_x: vec![5.0], mean_y: vec![0.0], std_x: vec![0.05], std_y: vec![0.05] }],
         }],
         ..Default::default()
@@ -162,8 +168,7 @@ fn rpp_stops_before_an_obstacle_on_the_path() {
     rpp.set_config(config());
     rpp.set_path(path.clone());
     let run = simulate(&mut rpp, &goal_at_end(&path), &c, pose(0.0, 0.0, 0.0), Some(&world));
-    let stop = run.invalid_at.expect("command should become invalid before the obstacle");
-    let d = (stop.point.x - 5.0).hypot(stop.point.y);
-    assert!(d > 0.66, "invalidated only {d:.2} m from the obstacle centre");
-    assert!(d < 3.0, "invalidated too early, {d:.2} m away");
+    assert!(run.invalid_at.is_none(), "blocked at {:?}", run.invalid_at.map(|p| p.point));
+    assert!(run.reached, "stopped at ({:.2}, {:.2})", run.pose.point.x, run.pose.point.y);
+    assert!(run.nearest > 0.66, "came within {:.2} m of the obstacle centre", run.nearest);
 }

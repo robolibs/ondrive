@@ -97,13 +97,29 @@ fn pose_regulator_reverses_to_a_goal_behind_when_allowed() {
 }
 
 #[test]
-fn pose_regulator_rejects_ackermann() {
+fn pose_regulator_brings_ackermann_to_the_pose() {
     let c = constraints(SteeringType::Ackermann);
-    let mut ctrl = PoseRegulatorFollower::new();
-    ctrl.set_config(config());
-    let goal = Goal { target_pose: pose(3.0, 0.0, 0.0), ..Default::default() };
-    let state = RobotState { pose: pose(0.0, 0.0, 0.0), allow_move: true, ..Default::default() };
-    assert!(!ctrl.compute_control(&state, &goal, &c, 0.05, None).valid);
+    for (gx, gy, gyaw) in [(3.0, 0.0, 0.0), (4.0, 2.0, PI / 2.0)] {
+        let mut ctrl = PoseRegulatorFollower::new();
+        let mut cfg = config();
+        cfg.goal_tolerance = 0.2;
+        cfg.angular_tolerance = 0.3;
+        ctrl.set_config(cfg);
+        let goal = Goal { target_pose: pose(gx, gy, gyaw), ..Default::default() };
+        let mut state = RobotState { pose: pose(0.0, 0.0, 0.0), allow_move: true, ..Default::default() };
+        let mut reached = false;
+        for _ in 0..2000 {
+            let cmd = ctrl.compute_control(&state, &goal, &c, 0.05, None);
+            assert!(cmd.valid, "goal ({gx}, {gy}): {}", cmd.status_message);
+            integrate(&mut state, &cmd, 0.05);
+            if ctrl.get_status().goal_reached {
+                reached = true;
+                break;
+            }
+        }
+        assert!(reached, "goal ({gx}, {gy}) not reached, at {:?}", state.pose.point);
+        assert!(state.pose.point.distance_to_2d(Point::new(gx, gy, 0.0)) < 0.3);
+    }
 }
 
 fn corner_path() -> Path {

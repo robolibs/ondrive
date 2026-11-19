@@ -12,7 +12,8 @@ use ondrive::{
     PidFollower, PurePursuitFollower, RobotConstraints, RobotState, SocConfig, SocFollower,
     StanleyFollower, SteeringType, TebConfig, TebFollower, Tracker, TrackerKind, CarrotFollower,
     IlqrConfig, IlqrFollower, KanayamaFollower, PoseReachFollower, PoseRegulatorFollower,
-    RegulatedPursuitFollower, VectorPursuitFollower, ApfFollower, IlcFollower,
+    RegulatedPursuitFollower, VectorPursuitFollower, ApfFollower, IlcFollower, SlipAdaptiveFollower, VelocityObstacleFollower,
+    FrenetFollower,
 };
 use std::f64::consts::{FRAC_PI_2, PI};
 
@@ -73,7 +74,8 @@ fn config(units: OutputUnits) -> ControllerConfig {
     cfg
 }
 
-const PATH_KINDS: [TrackerKind; 15] = [
+const PATH_KINDS: [TrackerKind; 16] = [
+    TrackerKind::SlipAdaptive,
     TrackerKind::Ilc,
     TrackerKind::Kanayama,
     TrackerKind::VectorPursuit,
@@ -91,7 +93,10 @@ const PATH_KINDS: [TrackerKind; 15] = [
     TrackerKind::Dwa,
 ];
 
-const ALL_KINDS: [TrackerKind; 20] = [
+const ALL_KINDS: [TrackerKind; 23] = [
+    TrackerKind::Frenet,
+    TrackerKind::VelocityObstacle,
+    TrackerKind::SlipAdaptive,
     TrackerKind::Ilc,
     TrackerKind::Apf,
     TrackerKind::Kanayama,
@@ -130,6 +135,9 @@ fn make(kind: TrackerKind) -> Box<dyn Controller> {
         TrackerKind::Kanayama => Box::new(KanayamaFollower::new()),
         TrackerKind::Apf => Box::new(ApfFollower::new()),
         TrackerKind::Ilc => Box::new(IlcFollower::default()),
+        TrackerKind::SlipAdaptive => Box::new(SlipAdaptiveFollower::new()),
+        TrackerKind::VelocityObstacle => Box::new(VelocityObstacleFollower::new()),
+        TrackerKind::Frenet => Box::new(FrenetFollower::new()),
         TrackerKind::Ilqr => {
             let mut c = IlqrConfig::default();
             c.horizon_steps = 12;
@@ -395,6 +403,7 @@ fn first_yaw_rate(kind: TrackerKind, steering: SteeringType, start: Pose) -> f64
             linear: 0.5,
             ..Default::default()
         },
+        velocity_valid: true,
         allow_move: true,
         ..Default::default()
     };

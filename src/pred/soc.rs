@@ -15,32 +15,53 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::controller::{Controller, ControllerBase};
-use crate::core::obstacles::CollisionChecker;
+use crate::core::kinematics::planning;
+use crate::core::obstacles::{CollisionChecker, robot_radius};
 use crate::core::path::PathCursor;
 use crate::pred::mppi::{
-    CostWeights, Model, Reference, build_reference, build_timed_reference, command_from_controls,
-    current_lateral_speed, current_speed, importance_weights, prepare, rollout,
-    speed_at_arc_length, update_turn_in_place,
+    Along, Choice, CostWeights, Model, Swerve, Track, plan_avoidance, command_from_controls, current_lateral_speed,
+    correlated_noise, current_speed, detour_relax, effective_sample_size, guide_paths, left_by, pursue, savitzky_golay,
+    importance_weights, integrated_noise, prepare, speed_at_arc_length, update_turn_in_place,
 };
 use crate::types::{
-    Goal, Path, RobotConstraints, RobotState, Trajectory, VelocityCommand, WorldConstraints,
+    DebugFrame, DebugLevel, Goal, Obstacle, Path, RobotConstraints, RobotState, Trajectory, VelocityCommand, WorldConstraints,
 };
 use datapod::Point;
 use rand::{SeedableRng, rngs::StdRng};
-use rand_distr::{Distribution, Normal};
 
 /// Clearance below which obstacles start contributing cost.
 const OBSTACLE_INFLUENCE: f64 = 1.0;
 /// Extra clearance treated as contact.
-const OBSTACLE_SAFETY_MARGIN: f64 = 0.2;
+const OBSTACLE_SAFETY_MARGIN: f64 = 0.6;
 
-#[derive(Clone, Debug)]
+/// Share of the gap to the best guide that the centre of the final samples
+/// moves, `1 - alpha` of SVG-MPPI with alpha 0.1.
+const GUIDE_PULL: f64 = 0.9;
+/// Weight of the pull of every control towards zero, over the configured
+/// sampling variance.
+const CONTROL_PULL: f64 = 0.05;
+/// Index of the guide that starts as the previous plan braked to a stop,
+/// followed whenever it is the cheapest.
+const BRAKE_GUIDE: usize = 1;
+/// Index of the guide that pursues the detour round the obstacles ahead, or
+/// the path when there is none; a detour is followed whenever it is the
+/// cheapest.
+const DETOUR_GUIDE: usize = 3;
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SocConfig {
     pub horizon_steps: usize,
     pub dt: f64,
 
     pub guide_samples: usize,
     pub num_samples: usize,
+    /// Share of the previous plan's cost a guide must come under to pull
+    /// the final samples toward it instead of the previous plan.
+    pub guide_switch: f64,
+    /// `guide_switch` while obstacles are in view; lower holds the plan through
+    /// traffic rather than swapping between near-equal ways round it.
+    #[serde(default = "default_guide_switch_traffic")]
+    pub guide_switch_traffic: f64,
 
     pub temperature: f64,
     pub guide_temperature: f64,
@@ -56,6 +77,8 @@ pub struct SocConfig {
     pub weight_vel: f64,
     pub weight_steering: f64,
     pub weight_acceleration: f64,
+    /// Cost per metre of path a rollout leaves undone within the horizon.
+    pub weight_progress: f64,
     pub weight_obstacle: f64,
 
     pub ref_velocity: f64,
@@ -66,19 +89,36 @@ pub struct SocConfig {
 
     pub use_covariance_adaptation: bool,
 
+    /// Share of each step's sampling noise carried over from the step before.
+    pub noise_correlation: f64,
+    /// Sample the final noise as integrated control rates (Smooth MPPI)
+    /// rather than correlated controls.
+    #[serde(default = "crate::pred::mppi::default_smooth_sampling")]
+    pub smooth_sampling: bool,
+    /// Effective-sample-size shares below and above which the temperature
+    /// rises and falls.
+    pub ess_low: f64,
+    pub ess_high: f64,
+
     pub turn_first_activation_deg: f64,
     pub turn_first_release_deg: f64,
 
     pub decel_distance: f64,
 }
 
+fn default_guide_switch_traffic() -> f64 {
+    0.95
+}
+
 impl Default for SocConfig {
     fn default() -> Self {
         Self {
-            horizon_steps: 20,
+            horizon_steps: 30,
             dt: 0.1,
-            guide_samples: 64,
+            guide_samples: 32,
             num_samples: 512,
+            guide_switch: 0.95,
+            guide_switch_traffic: default_guide_switch_traffic(),
             temperature: 1.0,
             guide_temperature: 1.0,
             steering_noise: 0.5,
@@ -86,17 +126,22 @@ impl Default for SocConfig {
             initial_steer_variance: 0.25,
             min_steer_variance: 1e-4,
             max_steer_variance: 1.0,
-            weight_cte: 50.0,
+            weight_cte: 100.0,
             weight_epsi: 100.0,
             weight_vel: 100.0,
             weight_steering: 10.0,
             weight_acceleration: 5.0,
-            weight_obstacle: 50.0,
+            weight_progress: 30.0,
+            weight_obstacle: 200.0,
             ref_velocity: 1.0,
             svgd_iterations: 3,
             svgd_step_size: 0.1,
             kernel_bandwidth: 1.0,
             use_covariance_adaptation: true,
+            noise_correlation: 0.7,
+            smooth_sampling: true,
+            ess_low: 0.01,
+            ess_high: 0.05,
             turn_first_activation_deg: 60.0,
             turn_first_release_deg: 15.0,
             decel_distance: 2.0,
@@ -117,9 +162,15 @@ pub struct SocFollower {
     last_v: f64,
     last_vy: f64,
     shift_accum: f64,
+    /// Side (+1 left, −1 right, 0 none) and pace of the last way past the
+    /// obstacles ahead: see `plan_avoidance`.
+    avoid: Choice,
+    debug_level: DebugLevel,
+    debug: DebugFrame,
     trajectory: Option<Trajectory>,
     clock: f64,
     rng: StdRng,
+    lambda: f64,
 }
 
 impl Default for SocFollower {
@@ -128,13 +179,18 @@ impl Default for SocFollower {
     }
 }
 
+/// Fraction (one in this many) of the guides drawn with no obstacles about,
+/// where there is only the path to find.
+const CLEAR_GUIDE_SHARE: usize = 4;
+
 /// Central-difference gradient of the rollout cost with respect to the
-/// flattened `[s0, a0, al0, s1, a1, al1, ...]` control vector.
+/// flattened `[s0, a0, al0, s1, a1, al1, ...]` control vector; the lateral
+/// channel, which moves only a holonomic platform, is left at zero.
 fn cost_gradient(
     model: &Model,
-    reference: &Reference,
+    reference: &Track,
     w: &CostWeights,
-    extra: &dyn Fn(usize, f64, f64, f64) -> f64,
+    extra: &(dyn Fn(usize, f64, f64, f64) -> f64 + Sync),
     steer: &mut [f64],
     accel: &mut [f64],
     accel_lat: &mut [f64],
@@ -142,32 +198,50 @@ fn cost_gradient(
     let n = steer.len();
     let eps = 1e-3;
     let mut grad = vec![0.0; 3 * n];
-    for t in 0..n {
-        let o = steer[t];
-        steer[t] = o + eps;
-        let (cp, _) = rollout(model, steer, accel, accel_lat, reference, w, extra, false);
-        steer[t] = o - eps;
-        let (cm, _) = rollout(model, steer, accel, accel_lat, reference, w, extra, false);
-        steer[t] = o;
-        grad[3 * t] = (cp - cm) / (2.0 * eps);
-
-        let o = accel[t];
-        accel[t] = o + eps;
-        let (cp, _) = rollout(model, steer, accel, accel_lat, reference, w, extra, false);
-        accel[t] = o - eps;
-        let (cm, _) = rollout(model, steer, accel, accel_lat, reference, w, extra, false);
-        accel[t] = o;
-        grad[3 * t + 1] = (cp - cm) / (2.0 * eps);
-
-        let o = accel_lat[t];
-        accel_lat[t] = o + eps;
-        let (cp, _) = rollout(model, steer, accel, accel_lat, reference, w, extra, false);
-        accel_lat[t] = o - eps;
-        let (cm, _) = rollout(model, steer, accel, accel_lat, reference, w, extra, false);
-        accel_lat[t] = o;
-        grad[3 * t + 2] = (cp - cm) / (2.0 * eps);
+    let channels = if model.holonomic { 3 } else { 2 };
+    // A control changed at step t leaves the steps before it as they were,
+    // so each difference is rolled out from where the unchanged one stood.
+    let mut stood = Vec::with_capacity(n);
+    reference.rollout_resumed(model, steer, accel, accel_lat, w, extra, None, Some(&mut stood));
+    for t in 0..n.min(stood.len()) {
+        for channel in 0..channels {
+            let mut cost_at = |by: f64| {
+                let control = match channel {
+                    0 => &mut steer[t],
+                    1 => &mut accel[t],
+                    _ => &mut accel_lat[t],
+                };
+                let o = *control;
+                *control = o + by;
+                let c = reference.rollout_resumed(model, steer, accel, accel_lat, w, extra, Some((t, &stood[t])), None);
+                match channel {
+                    0 => steer[t] = o,
+                    1 => accel[t] = o,
+                    _ => accel_lat[t] = o,
+                }
+                c
+            };
+            grad[3 * t + channel] = (cost_at(eps) - cost_at(-eps)) / (2.0 * eps);
+        }
     }
     grad
+}
+
+/// `cost_gradient` of every guide, the guides shared among the pool's
+/// threads, each on its own copy.
+fn guide_gradients(
+    model: &Model,
+    reference: &Track,
+    w: &CostWeights,
+    extra: &(dyn Fn(usize, f64, f64, f64) -> f64 + Sync),
+    guides_s: &[Vec<f64>],
+    guides_a: &[Vec<f64>],
+    guides_al: &[Vec<f64>],
+) -> Vec<Vec<f64>> {
+    crate::core::parallel::map_indexed(guides_s.len(), |i| {
+        let (mut s, mut a, mut al) = (guides_s[i].clone(), guides_a[i].clone(), guides_al[i].clone());
+        cost_gradient(model, reference, w, extra, &mut s, &mut a, &mut al)
+    })
 }
 
 impl SocFollower {
@@ -196,9 +270,13 @@ impl SocFollower {
             last_v: 0.0,
             last_vy: 0.0,
             shift_accum: 0.0,
+            avoid: Choice::default(),
+            debug_level: DebugLevel::Off,
+            debug: DebugFrame::default(),
             trajectory: None,
             clock: 0.0,
             rng,
+            lambda: cfg.temperature.max(1e-6),
             soc_config: cfg,
         }
     }
@@ -208,6 +286,7 @@ impl SocFollower {
         self.mean_steering = vec![0.0; n];
         self.mean_acceleration = vec![0.0; n];
         self.mean_accel_lateral = vec![0.0; n];
+        self.lambda = cfg.temperature.max(1e-6);
         self.soc_config = cfg;
     }
 
@@ -218,9 +297,9 @@ impl SocFollower {
     fn run_svgd(
         &self,
         model: &Model,
-        reference: &Reference,
+        reference: &Track,
         w: &CostWeights,
-        extra: &dyn Fn(usize, f64, f64, f64) -> f64,
+        extra: &(dyn Fn(usize, f64, f64, f64) -> f64 + Sync),
         guides_s: &mut [Vec<f64>],
         guides_a: &mut [Vec<f64>],
         guides_al: &mut [Vec<f64>],
@@ -234,18 +313,10 @@ impl SocFollower {
         for _ in 0..self.soc_config.svgd_iterations {
             let mut grad_log_p = vec![vec![0.0; dims]; k];
             let mut flat = vec![vec![0.0; dims]; k];
+            let grads = guide_gradients(model, reference, w, extra, guides_s, guides_a, guides_al);
             for i in 0..k {
-                let g = cost_gradient(
-                    model,
-                    reference,
-                    w,
-                    extra,
-                    &mut guides_s[i],
-                    &mut guides_a[i],
-                    &mut guides_al[i],
-                );
                 for d in 0..dims {
-                    grad_log_p[i][d] = -g[d] / temperature;
+                    grad_log_p[i][d] = -grads[i][d] / temperature;
                 }
                 for t in 0..n {
                     flat[i][3 * t] = guides_s[i][t];
@@ -310,12 +381,12 @@ impl SocFollower {
 fn obstacle_penalty<'a>(
     checker: &'a CollisionChecker<'a>,
     weight: f64,
-) -> impl Fn(usize, f64, f64, f64) -> f64 + 'a {
+) -> impl Fn(usize, f64, f64, f64) -> f64 + Sync + 'a {
     move |step: usize, x: f64, y: f64, yaw: f64| -> f64 {
         if !checker.has_obstacles() {
             return 0.0;
         }
-        let clearance = checker.clearance(step + 1, x, y, yaw);
+        let clearance = checker.clearance_within(step + 1, x, y, yaw, OBSTACLE_INFLUENCE);
         if clearance < 0.0 {
             weight * (100.0 + 10.0 * clearance.abs())
         } else if clearance < OBSTACLE_INFLUENCE {
@@ -328,6 +399,29 @@ fn obstacle_penalty<'a>(
 }
 
 impl Controller for SocFollower {
+    fn params(&self) -> serde_json::Value {
+        serde_json::to_value(&self.soc_config).unwrap_or_default()
+    }
+
+    fn set_params(&mut self, params: &serde_json::Value) -> Result<(), String> {
+        let cfg = crate::controller::merged(&self.soc_config, params)?;
+        self.set_soc_config(cfg);
+        Ok(())
+    }
+
+    fn set_seed(&mut self, seed: u64) {
+        self.rng = StdRng::seed_from_u64(seed);
+    }
+
+    fn set_debug(&mut self, level: DebugLevel) {
+        self.debug_level = level;
+        self.debug = DebugFrame::default();
+    }
+
+    fn debug_frame(&self) -> DebugFrame {
+        self.debug.clone()
+    }
+
     fn compute_control(
         &mut self,
         state: &RobotState,
@@ -343,7 +437,8 @@ impl Controller for SocFollower {
                 return cmd;
             }
         };
-        let cfg = self.soc_config.clone();
+        let mut cfg = self.soc_config.clone();
+        (cfg.horizon_steps, cfg.dt) = planning(constraints, cfg.ref_velocity.min(constraints.max_linear_velocity), cfg.horizon_steps, cfg.dt);
         let turning = update_turn_in_place(
             &mut self.is_turning_in_place,
             state,
@@ -363,26 +458,62 @@ impl Controller for SocFollower {
         let v_now = current_speed(state, self.last_v);
         let vy_now = current_lateral_speed(state, self.last_vy);
         let model = Model::new(state, constraints, v_now, vy_now, cfg.dt, prep.allow_reverse);
-        let reference = match &self.trajectory {
-            Some(traj) => build_timed_reference(traj, self.clock, n, cfg.dt),
-            None => build_reference(
-                &self.base.path,
-                &self.cursor.cum,
-                prep.proj.arc_length,
-                n,
-                cfg.dt,
-                ref_velocity.min(constraints.max_linear_velocity),
-                cfg.decel_distance,
-            ),
+        let speed = ref_velocity.min(constraints.max_linear_velocity);
+        let obstacles: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
+        let along = Along {
+            path: &self.base.path,
+            cum: &self.cursor.cum,
+            trajectory: self.trajectory.as_ref(),
+            clock: self.clock,
+            from: prep.proj.arc_length,
         };
+        let swerve = Swerve::of(constraints, speed.max(v_now.abs()));
+        let robot = (state.pose.point.x, state.pose.point.y, crate::core::math::yaw_of(&state.pose));
+        let plan = if obstacles.is_empty() {
+            self.avoid = Choice::default();
+            None
+        } else {
+            Some(plan_avoidance(&along, obstacles, robot_radius(constraints), swerve, n, cfg.dt, speed.max(v_now.abs()), robot, &mut self.avoid))
+        };
+        let pace = plan.as_ref().map_or(1.0, |p| p.pace);
+        let detour: Vec<(f64, f64)> = plan.as_ref().and_then(|p| p.guide.as_ref()).map_or(Vec::new(), |g| (0..g.x.len()).map(|i| (g.x[i], g.y[i])).collect());
+        let share = pace;
+        let mut reference = Track::new(
+            self.trajectory.as_ref(),
+            self.clock,
+            &self.base.path,
+            &self.cursor.cum,
+            prep.proj.arc_length,
+            n,
+            cfg.dt,
+            speed * share,
+            cfg.decel_distance,
+            prep.pos_tol,
+        );
+        self.debug.guides.clear();
+        let path_ahead: Vec<(f64, f64)> = {
+            let far = along.reference(2 * n, cfg.dt, speed);
+            (0..far.x.len()).map(|i| (far.x[i], far.y[i])).collect()
+        };
+        if let Some(plan) = &plan {
+            let points = plan.guide.as_ref().map_or(Vec::new(), |g| left_by(&plan.reference, g));
+            if self.debug_level >= DebugLevel::Basic {
+                self.debug.guides = match &plan.guide {
+                    Some(g) => vec![(0..g.x.len()).map(|i| Point::new(g.x[i], g.y[i], 0.0)).collect()],
+                    None => guide_paths(&plan.reference, obstacles, robot_radius(constraints), cfg.dt, swerve),
+                };
+            }
+            reference.relax_with(&detour_relax(&points, (speed * cfg.dt).max(0.3)));
+        }
         let w = CostWeights {
             cte: cfg.weight_cte,
             epsi: cfg.weight_epsi,
             vel: if turning { 50.0 } else { cfg.weight_vel },
             steering: cfg.weight_steering,
             accel: cfg.weight_acceleration,
+            progress: cfg.weight_progress,
         };
-        let checker = CollisionChecker::new(world, constraints, OBSTACLE_SAFETY_MARGIN);
+        let checker = CollisionChecker::new(world, constraints, OBSTACLE_SAFETY_MARGIN).with_step(cfg.dt).with_spread(1.0);
         let extra = obstacle_penalty(&checker, cfg.weight_obstacle);
         model.clamp_controls(
             &mut self.mean_steering,
@@ -390,36 +521,67 @@ impl Controller for SocFollower {
             &mut self.mean_accel_lateral,
         );
 
-        let k_guide = cfg.guide_samples.max(1);
+        let k_guide = if obstacles.is_empty() { (cfg.guide_samples / CLEAR_GUIDE_SHARE).max(DETOUR_GUIDE + 1) } else { cfg.guide_samples }.max(1);
         let guide_std_s = cfg.initial_steer_variance.max(1e-12).sqrt();
         let guide_std_a = cfg.acceleration_noise.max(1e-6);
-        let ds = Normal::new(0.0, guide_std_s).unwrap();
-        let da = Normal::new(0.0, guide_std_a).unwrap();
-        let dal = Normal::new(0.0, guide_std_a).unwrap();
+        let rho = cfg.noise_correlation;
+        let (mut unit_s, mut unit_a, mut unit_al) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
         let mut guides_s = vec![self.mean_steering.clone(); k_guide];
         let mut guides_a = vec![self.mean_acceleration.clone(); k_guide];
         let mut guides_al = vec![self.mean_accel_lateral.clone(); k_guide];
         for i in 1..k_guide {
+            correlated_noise(&mut unit_s, guide_std_s, rho, &mut self.rng);
+            correlated_noise(&mut unit_a, guide_std_a, rho, &mut self.rng);
+            correlated_noise(&mut unit_al, guide_std_a, rho, &mut self.rng);
             for t in 0..n {
-                guides_s[i][t] += ds.sample(&mut self.rng);
-                guides_a[i][t] += da.sample(&mut self.rng);
-                guides_al[i][t] += dal.sample(&mut self.rng);
+                guides_s[i][t] += unit_s[t];
+                guides_a[i][t] += unit_a[t];
+                guides_al[i][t] += unit_al[t];
             }
             model.clamp_controls(&mut guides_s[i], &mut guides_a[i], &mut guides_al[i]);
+        }
+        // Two guides start as the plan braked to a stop and as the plan
+        // driven straight, so giving way and holding course are always
+        // among the modes the guides explore.
+        if k_guide >= 3 {
+            let brake = -model.accel_bound() * v_now.signum();
+            guides_s[BRAKE_GUIDE] = self.mean_steering.clone();
+            guides_a[BRAKE_GUIDE] = vec![brake; n];
+            guides_al[BRAKE_GUIDE] = vec![0.0; n];
+            guides_s[2] = vec![0.0; n];
+            guides_a[2] = self.mean_acceleration.clone();
+            guides_al[2] = self.mean_accel_lateral.clone();
+            for i in 1..3 {
+                model.clamp_controls(&mut guides_s[i], &mut guides_a[i], &mut guides_al[i]);
+            }
+        }
+        // A fourth guide pursues the detour round the obstacles ahead, or the path.
+        let has_detour = k_guide > DETOUR_GUIDE && detour.len() > 1;
+        let pursued = if has_detour { &detour } else { &path_ahead };
+        if k_guide > DETOUR_GUIDE && pursued.len() > 1 {
+            pursue(&model, pursued, speed * share, &mut guides_s[DETOUR_GUIDE], &mut guides_a[DETOUR_GUIDE], &mut guides_al[DETOUR_GUIDE]);
+            model.clamp_controls(&mut guides_s[DETOUR_GUIDE], &mut guides_a[DETOUR_GUIDE], &mut guides_al[DETOUR_GUIDE]);
         }
 
         if cfg.svgd_iterations > 0 {
             self.run_svgd(&model, &reference, &w, &extra, &mut guides_s, &mut guides_a, &mut guides_al);
         }
 
-        let guide_costs: Vec<f64> = (0..k_guide)
-            .map(|i| rollout(&model, &guides_s[i], &guides_a[i], &guides_al[i], &reference, &w, &extra, false).0)
+        let keep = self.debug_level == DebugLevel::Full;
+        let rolled: Vec<(f64, Vec<Point>)> = (0..k_guide)
+            .map(|i| reference.rollout(&model, &guides_s[i], &guides_a[i], &guides_al[i], &w, &extra, keep))
             .collect();
+        let guide_costs: Vec<f64> = rolled.iter().map(|r| r.0).collect();
+        if keep {
+            (self.debug.costs, self.debug.rollouts) = rolled.into_iter().unzip();
+        }
+        let switch = if obstacles.is_empty() { cfg.guide_switch } else { cfg.guide_switch_traffic };
         let best = guide_costs
             .iter()
             .enumerate()
             .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i)
+            .filter(|&i| (i == BRAKE_GUIDE && k_guide >= 3) || (i == DETOUR_GUIDE && has_detour) || guide_costs[i] < switch * guide_costs[0])
             .unwrap_or(0);
 
         let mut std_s = vec![cfg.steering_noise.max(1e-6); n];
@@ -445,10 +607,18 @@ impl Controller for SocFollower {
         }
 
         let k = cfg.num_samples.max(1);
-        let lambda = cfg.temperature.max(1e-6);
-        let base_s = guides_s[best].clone();
-        let base_a = guides_a[best].clone();
-        let base_al = guides_al[best].clone();
+        let lambda = self.lambda.max(1e-6);
+        // Final samples centre on the previous solution moved most of the way
+        // to the best guide (SVG-MPPI, Honda et al.).
+        let (sb, ab, lb) = (model.steer_bound(), model.accel_bound(), model.accel_lat_bound());
+        let toward = |mean: &[f64], guide: &[f64], bound: f64| -> Vec<f64> {
+            mean.iter().zip(guide).map(|(m, g)| (m + GUIDE_PULL * (g - m)).clamp(-bound, bound)).collect()
+        };
+        let base_s = toward(&self.mean_steering, &guides_s[best], sb);
+        let base_a = toward(&self.mean_acceleration, &guides_a[best], ab);
+        let base_al = toward(&self.mean_accel_lateral, &guides_al[best], lb);
+        let nominal_s = cfg.steering_noise.max(1e-6).powi(2);
+        let nominal_a = cfg.acceleration_noise.max(1e-6).powi(2);
         let mut costs = vec![0.0; k];
         let mut noise_s = vec![vec![0.0; n]; k];
         let mut noise_a = vec![vec![0.0; n]; k];
@@ -456,26 +626,46 @@ impl Controller for SocFollower {
         let mut steer = vec![0.0; n];
         let mut accel = vec![0.0; n];
         let mut accel_lat = vec![0.0; n];
+        let mut drawn = vec![(vec![0.0; n], vec![0.0; n], vec![0.0; n]); k];
+        let mut control_costs = vec![0.0; k];
         for j in 0..k {
             let mut control_cost = 0.0;
+            if cfg.smooth_sampling {
+                integrated_noise(&mut unit_s, 1.0, &mut self.rng);
+                integrated_noise(&mut unit_a, 1.0, &mut self.rng);
+                integrated_noise(&mut unit_al, 1.0, &mut self.rng);
+            } else {
+                correlated_noise(&mut unit_s, 1.0, rho, &mut self.rng);
+                correlated_noise(&mut unit_a, 1.0, rho, &mut self.rng);
+                correlated_noise(&mut unit_al, 1.0, rho, &mut self.rng);
+            }
             for t in 0..n {
-                let es = Normal::new(0.0, std_s[t]).unwrap().sample(&mut self.rng);
-                let ea = Normal::new(0.0, std_a[t]).unwrap().sample(&mut self.rng);
-                let eal = Normal::new(0.0, std_al[t]).unwrap().sample(&mut self.rng);
+                steer[t] = (base_s[t] + std_s[t] * unit_s[t]).clamp(-sb, sb);
+                accel[t] = (base_a[t] + std_a[t] * unit_a[t]).clamp(-ab, ab);
+                accel_lat[t] = (base_al[t] + std_al[t] * unit_al[t]).clamp(-lb, lb);
+                let (es, ea, eal) = (steer[t] - base_s[t], accel[t] - base_a[t], accel_lat[t] - base_al[t]);
                 noise_s[j][t] = es;
                 noise_a[j][t] = ea;
                 noise_al[j][t] = eal;
-                steer[t] = base_s[t] + es;
-                accel[t] = base_a[t] + ea;
-                accel_lat[t] = base_al[t] + eal;
-                control_cost += base_s[t] * es / (std_s[t] * std_s[t])
-                    + base_a[t] * ea / (std_a[t] * std_a[t])
-                    + base_al[t] * eal / (std_al[t] * std_al[t]);
+                control_cost += CONTROL_PULL * (base_s[t] * es / nominal_s + base_a[t] * ea / nominal_a + base_al[t] * eal / nominal_a);
             }
-            let (c, _) = rollout(&model, &steer, &accel, &accel_lat, &reference, &w, &extra, false);
-            costs[j] = c + lambda * control_cost;
+            control_costs[j] = control_cost;
+            drawn[j].0.copy_from_slice(&steer);
+            drawn[j].1.copy_from_slice(&accel);
+            drawn[j].2.copy_from_slice(&accel_lat);
+        }
+        // Rollouts shared among the pool's threads, costs kept in sample order.
+        let rolled = crate::core::parallel::map_indexed(k, |j| reference.rollout(&model, &drawn[j].0, &drawn[j].1, &drawn[j].2, &w, &extra, false).0);
+        for (j, c) in rolled.into_iter().enumerate() {
+            costs[j] = c + lambda * control_costs[j];
         }
         let weights = importance_weights(&costs, lambda);
+        let ess = effective_sample_size(&weights);
+        if ess < (cfg.ess_low * k as f64).max(2.0) {
+            self.lambda = (lambda * 1.2).min(1e6);
+        } else if ess > (cfg.ess_high * k as f64).max(3.0) {
+            self.lambda = (lambda * 0.9).max(1e-6);
+        }
         for t in 0..n {
             let mut s = base_s[t];
             let mut a = base_a[t];
@@ -489,18 +679,20 @@ impl Controller for SocFollower {
             self.mean_acceleration[t] = a;
             self.mean_accel_lateral[t] = al;
         }
+        savitzky_golay(&mut self.mean_steering);
+        savitzky_golay(&mut self.mean_acceleration);
+        savitzky_golay(&mut self.mean_accel_lateral);
         model.clamp_controls(
             &mut self.mean_steering,
             &mut self.mean_acceleration,
             &mut self.mean_accel_lateral,
         );
 
-        let (_, traj) = rollout(
+        let (_, traj) = reference.rollout(
             &model,
             &self.mean_steering,
             &self.mean_acceleration,
             &self.mean_accel_lateral,
-            &reference,
             &w,
             &extra,
             true,
@@ -510,25 +702,22 @@ impl Controller for SocFollower {
         let steer0 = self.mean_steering[0];
         let accel0 = self.mean_acceleration[0];
         let accel_lat0 = self.mean_accel_lateral[0];
-        self.shift_accum += dt;
-        if self.shift_accum >= cfg.dt {
-            self.shift_accum -= cfg.dt;
-            self.mean_steering.rotate_left(1);
-            self.mean_acceleration.rotate_left(1);
-            self.mean_accel_lateral.rotate_left(1);
-            if n > 1 {
-                self.mean_steering[n - 1] = self.mean_steering[n - 2];
-                self.mean_acceleration[n - 1] = self.mean_acceleration[n - 2];
-                self.mean_accel_lateral[n - 1] = self.mean_accel_lateral[n - 2];
-            }
-        }
+        crate::pred::mppi::shift_warm_start(
+            &mut self.shift_accum,
+            dt,
+            cfg.dt,
+            [&mut self.mean_steering, &mut self.mean_acceleration, &mut self.mean_accel_lateral],
+        );
 
         let dt_apply = dt.min(cfg.dt);
         let v_cap = speed_at_arc_length(&self.base.path.speeds, &self.cursor.cum, prep.proj.arc_length)
-            .unwrap_or(f64::INFINITY);
+            .unwrap_or(f64::INFINITY)
+            .min(crate::pred::mpc::REF_SPEED_HEADROOM * ref_velocity.max(0.1))
+            * share;
         self.base.status.mode = "soc_tracking".into();
+        let v_base = crate::pred::mppi::held_speed(v_now, self.last_v, crate::pred::mppi::HELD_SPEED_SLACK);
         let cmd = command_from_controls(
-            v_now,
+            v_base,
             vy_now,
             steer0,
             accel0,
@@ -542,7 +731,7 @@ impl Controller for SocFollower {
             prep.epsi,
             "SOC tracking",
         );
-        self.last_v = (v_now + accel0 * dt_apply).clamp(-v_cap, v_cap);
+        self.last_v = (v_base + accel0 * dt_apply).clamp(-v_cap, v_cap);
         self.last_vy = vy_now + accel_lat0 * dt_apply;
         cmd
     }
@@ -576,6 +765,7 @@ impl Controller for SocFollower {
         self.set_path(Path::default());
         self.last_v = 0.0;
         self.last_vy = 0.0;
+        self.lambda = self.soc_config.temperature.max(1e-6);
     }
 
     fn get_type(&self) -> &'static str {

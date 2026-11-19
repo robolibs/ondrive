@@ -12,6 +12,7 @@ fn static_obstacle(x: f64, y: f64, radius: f64) -> ondrive::Obstacle {
     ondrive::Obstacle {
         id: 0,
         radius,
+        dt: 0.0,
         modes: vec![ondrive::GaussianMode {
             weight: 1.0,
             mean_x: vec![x; 40],

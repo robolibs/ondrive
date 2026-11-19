@@ -1,30 +1,37 @@
-//! MCA — risk-aware MPPI (DRA-MPPI, Trevisan & Alonso-Mora 2024).
+//! MCA — risk-aware MPPI (DRA-MPPI, Trevisan et al. 2025).
 //!
-//! Obstacle positions are sampled from their Gaussian-mixture predictions
-//! once per horizon step and shared by every rollout; the collision
-//! probability of a rollout point is the fraction of samples inside the
-//! combined radius. Soft cost is proportional to that probability, and a
-//! hard penalty applies above `risk_threshold`.
+//! Each rollout point's collision probability is the share of a fixed
+//! quasi-random set of obstacle positions, drawn from the obstacle's
+//! Gaussian-mixture prediction at that point's time, that falls within the
+//! combined radius of an obstacle and one of the discs covering the robot.
+//! Obstacles combine as independent events. The cost adds a soft term
+//! proportional to that probability averaged over the discs grown by every
+//! share of `robot_radius_margin`, which rises across the margin to contact
+//! rather than at its edge, and, when the bare discs' probability passes
+//! `risk_threshold`, a hard term that is larger the sooner the collision
+//! would come, so a batch whose every rollout is at risk still prefers the
+//! one that brakes or turns away.
 //!
 //! Without obstacles this is exactly MPPI.
 
 use crate::controller::{Controller, ControllerBase};
-use crate::core::obstacles::CollisionChecker;
-use crate::pred::mppi::{MppiConfig, MppiFollower};
+use crate::core::buckets::Buckets;
+use crate::core::obstacles::{CollisionChecker, ModeAt, footprint_discs, modes_at};
+
+use crate::pred::mppi::{MppiConfig, MppiFollower, detour_relax};
 use crate::types::{
-    ControllerConfig, ControllerStatus, Goal, Obstacle, Path, RobotConstraints, RobotState,
+    ControllerConfig, ControllerStatus, DebugFrame, DebugLevel, Goal, Obstacle, Path, RobotConstraints, RobotState,
     VelocityCommand, WorldConstraints,
 };
-use rand::{Rng, SeedableRng, rngs::StdRng};
-use rand_distr::{Distribution, Normal};
+use std::f64::consts::PI;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct McaConfig {
     pub horizon_steps: usize,
     pub dt: f64,
 
     pub num_samples: usize,
-    /// Obstacle position samples per obstacle per horizon step.
+    /// Quasi-random obstacle positions per mode, the same set every tick.
     pub num_mc_samples: usize,
     pub temperature: f64,
     pub steering_noise: f64,
@@ -35,13 +42,16 @@ pub struct McaConfig {
     pub weight_vel: f64,
     pub weight_steering: f64,
     pub weight_acceleration: f64,
+    /// Cost per metre of path a rollout leaves undone within the horizon.
+    pub weight_progress: f64,
 
+    /// Cost per second of a collision probability of 1.
     pub weight_soft_risk: f64,
+    /// Cost per second above `risk_threshold`, for a collision on the first
+    /// step, falling linearly to zero at the horizon.
     pub weight_hard_risk: f64,
     pub risk_threshold: f64,
 
-    pub min_velocity_scale: f64,
-    pub risk_slowdown_gain: f64,
     pub robot_radius_margin: f64,
 
     pub ref_velocity: f64,
@@ -55,23 +65,22 @@ impl Default for McaConfig {
     fn default() -> Self {
         Self {
             horizon_steps: 20,
-            dt: 0.1,
-            num_samples: 400,
-            num_mc_samples: 300,
+            dt: 0.2,
+            num_samples: 1000,
+            num_mc_samples: 64,
             temperature: 1.0,
             steering_noise: 0.5,
             acceleration_noise: 0.3,
-            weight_cte: 50.0,
+            weight_cte: 100.0,
             weight_epsi: 100.0,
-            weight_vel: 100.0,
+            weight_vel: 50.0,
             weight_steering: 10.0,
             weight_acceleration: 5.0,
-            weight_soft_risk: 50.0,
-            weight_hard_risk: 1e4,
+            weight_progress: 80.0,
+            weight_soft_risk: 2000.0,
+            weight_hard_risk: 2e4,
             risk_threshold: 0.05,
-            min_velocity_scale: 0.1,
-            risk_slowdown_gain: 5.0,
-            robot_radius_margin: 0.1,
+            robot_radius_margin: 0.6,
             ref_velocity: 1.0,
             turn_first_activation_deg: 60.0,
             turn_first_release_deg: 15.0,
@@ -94,25 +103,43 @@ impl McaConfig {
             weight_vel: self.weight_vel,
             weight_steering: self.weight_steering,
             weight_acceleration: self.weight_acceleration,
+            weight_progress: self.weight_progress,
             ref_velocity: self.ref_velocity,
             turn_first_activation_deg: self.turn_first_activation_deg,
             turn_first_release_deg: self.turn_first_release_deg,
             decel_distance: self.decel_distance,
+            ..MppiConfig::default()
         }
     }
 }
 
-/// Horizon steps whose collision probability drives the risk slowdown.
-const IMMINENT_STEPS: usize = 5;
 
-/// Sampled obstacle positions for one horizon step: `(x, y, radius)`.
-type StepSamples = Vec<Vec<(f64, f64, f64)>>;
+/// `m` standard-normal points from the Halton sequence (bases 2 and 3)
+/// through the Box–Muller transform.
+fn normal_set(m: usize) -> Vec<(f64, f64)> {
+    let halton = |mut i: usize, base: usize| {
+        let (mut f, mut r) = (1.0, 0.0);
+        while i > 0 {
+            f /= base as f64;
+            r += f * (i % base) as f64;
+            i /= base;
+        }
+        r
+    };
+    (1..=m.max(1))
+        .map(|i| {
+            let (u, v) = (halton(i, 2), halton(i, 3));
+            let r = (-2.0 * u.ln()).sqrt();
+            (r * (2.0 * PI * v).cos(), r * (2.0 * PI * v).sin())
+        })
+        .collect()
+}
 
 #[derive(Clone, Debug)]
 pub struct McaFollower {
     pub mca_config: McaConfig,
     mppi: MppiFollower,
-    rng: StdRng,
+    normals: Vec<(f64, f64)>,
 }
 
 impl Default for McaFollower {
@@ -127,82 +154,122 @@ impl McaFollower {
     }
 
     pub fn with_mca_config(cfg: McaConfig) -> Self {
-        Self {
-            mppi: MppiFollower::with_mppi_config(cfg.to_mppi()),
-            mca_config: cfg,
-            rng: StdRng::from_entropy(),
-        }
+        Self { mppi: MppiFollower::with_mppi_config(cfg.to_mppi()), normals: normal_set(cfg.num_mc_samples), mca_config: cfg }
     }
 
     pub fn with_seed(cfg: McaConfig, seed: u64) -> Self {
         Self {
             mppi: MppiFollower::with_seed(cfg.to_mppi(), seed.wrapping_add(1)),
+            normals: normal_set(cfg.num_mc_samples),
             mca_config: cfg,
-            rng: StdRng::seed_from_u64(seed),
         }
     }
 
     pub fn set_mca_config(&mut self, cfg: McaConfig) {
         self.mppi.set_mppi_config(cfg.to_mppi());
+        if cfg.num_mc_samples != self.normals.len() {
+            self.normals = normal_set(cfg.num_mc_samples);
+        }
         self.mca_config = cfg;
     }
 
     pub fn predicted_trajectory(&self) -> &[datapod::Point] {
         self.mppi.predicted_trajectory()
     }
+}
 
-    /// Draw `m` positions per obstacle for horizon steps `1..=n` from the
-    /// Gaussian mixture, holding the last predicted step when the
-    /// prediction is shorter than the horizon.
-    fn sample_obstacles(&mut self, obstacles: &[Obstacle], n: usize, m: usize) -> StepSamples {
-        let mut out: StepSamples = vec![Vec::new(); n];
-        for obs in obstacles {
-            let modes: Vec<_> = obs
-                .modes
-                .iter()
-                .filter(|md| md.weight.is_finite() && md.weight > 0.0 && !md.mean_x.is_empty() && !md.mean_y.is_empty())
-                .collect();
-            if modes.is_empty() {
-                continue;
-            }
-            let total_w: f64 = modes.iter().map(|md| md.weight).sum();
-            for (step, bucket) in out.iter_mut().enumerate() {
-                let t = step + 1;
-                for _ in 0..m {
-                    let mut pick = self.rng.r#gen::<f64>() * total_w;
-                    let mut chosen = modes[modes.len() - 1];
-                    for md in &modes {
-                        if pick < md.weight {
-                            chosen = md;
-                            break;
-                        }
-                        pick -= md.weight;
-                    }
-                    let ti = t.min(chosen.mean_x.len() - 1).min(chosen.mean_y.len() - 1);
-                    let sx = chosen.std_x.get(ti).copied().filter(|s| s.is_finite()).unwrap_or(0.0).max(0.0);
-                    let sy = chosen.std_y.get(ti).copied().filter(|s| s.is_finite()).unwrap_or(0.0).max(0.0);
-                    let x = match Normal::new(chosen.mean_x[ti], sx) {
-                        Ok(d) if sx > 0.0 => d.sample(&mut self.rng),
-                        _ => chosen.mean_x[ti],
-                    };
-                    let y = match Normal::new(chosen.mean_y[ti], sy) {
-                        Ok(d) if sy > 0.0 => d.sample(&mut self.rng),
-                        _ => chosen.mean_y[ti],
-                    };
-                    bucket.push((x, y, obs.radius.max(0.0)));
-                }
+/// The obstacle modes of one step sorted into cells, with the obstacle each
+/// belongs to and the distance from the pose past which none can be hit.
+struct Near {
+    cells: Buckets,
+    owner: Vec<u32>,
+    reach: f64,
+}
+
+impl Near {
+    fn new(obstacles: &[Vec<ModeAt>], discs: &[(f64, f64)]) -> Self {
+        let body = discs.iter().map(|&(dx, r)| dx.abs() + r).fold(0.0_f64, f64::max);
+        let (mut points, mut owner, mut widest) = (Vec::new(), Vec::new(), 0.0_f64);
+        for (k, modes) in obstacles.iter().enumerate() {
+            for m in modes {
+                points.push((m.x, m.y));
+                owner.push(k as u32);
+                widest = widest.max(m.radius + 4.0 * m.std_x.max(m.std_y));
             }
         }
-        out
+        let reach = body + widest + 1e-6;
+        Self { cells: Buckets::new(&points, (0.5 * reach).max(0.5)), owner, reach }
     }
 }
 
-fn robot_radius(constraints: &RobotConstraints, margin: f64) -> f64 {
-    let r = 0.5 * constraints.robot_width.hypot(constraints.robot_length);
-    (if r < 0.05 { 0.3 } else { r }) + margin.max(0.0)
+/// Probability that a disc of `radius` at `(x, y)` meets an obstacle mode,
+/// averaged over the disc grown by every share of `margin`: over `normals`,
+/// scaled by the mode's spread, the share of the margin each position is
+/// inside, 1 within the bare combined radius. Without a margin, the share of
+/// positions inside the combined radius.
+fn hit_probability(m: &ModeAt, x: f64, y: f64, radius: f64, margin: f64, normals: &[(f64, f64)]) -> f64 {
+    let bare = radius + m.radius;
+    let full = bare + margin;
+    let d = (m.x - x).hypot(m.y - y);
+    let spread = m.std_x.max(m.std_y);
+    if d > full + 4.0 * spread {
+        return 0.0;
+    }
+    let inside = |dist: f64| ((full - dist) / margin).clamp(0.0, 1.0);
+    if margin <= 0.0 {
+        if spread < 1e-6 {
+            return if d < bare { 1.0 } else { 0.0 };
+        }
+        let r2 = bare * bare;
+        let hits = normals
+            .iter()
+            .filter(|(zx, zy)| (m.x + m.std_x * zx - x).powi(2) + (m.y + m.std_y * zy - y).powi(2) < r2)
+            .count();
+        return hits as f64 / normals.len() as f64;
+    }
+    if spread < 1e-6 {
+        return inside(d);
+    }
+    let (b2, f2) = (bare * bare, full * full);
+    let total: f64 = normals
+        .iter()
+        .map(|(zx, zy)| {
+            let d2 = (m.x + m.std_x * zx - x).powi(2) + (m.y + m.std_y * zy - y).powi(2);
+            if d2 <= b2 {
+                1.0
+            } else if d2 >= f2 {
+                0.0
+            } else {
+                inside(d2.sqrt())
+            }
+        })
+        .sum();
+    total / normals.len() as f64
 }
 
 impl Controller for McaFollower {
+    fn params(&self) -> serde_json::Value {
+        serde_json::to_value(&self.mca_config).unwrap_or_default()
+    }
+
+    fn set_params(&mut self, params: &serde_json::Value) -> Result<(), String> {
+        let cfg = crate::controller::merged(&self.mca_config, params)?;
+        self.set_mca_config(cfg);
+        Ok(())
+    }
+
+    fn set_seed(&mut self, seed: u64) {
+        self.mppi.set_seed(seed.wrapping_add(1));
+    }
+
+    fn set_debug(&mut self, level: DebugLevel) {
+        self.mppi.set_debug(level);
+    }
+
+    fn debug_frame(&self) -> DebugFrame {
+        self.mppi.debug_frame()
+    }
+
     fn compute_control(
         &mut self,
         state: &RobotState,
@@ -211,94 +278,73 @@ impl Controller for McaFollower {
         dt: f64,
         world: Option<&WorldConstraints>,
     ) -> VelocityCommand {
-        let obstacles: Vec<Obstacle> = world
+        self.mppi.clear_guides();
+        let obstacles: Vec<&Obstacle> = world
             .map(|w| {
                 w.obstacles
                     .iter()
-                    .filter(|o| {
-                        o.modes.iter().any(|m| {
-                            m.weight.is_finite()
-                                && m.weight > 0.0
-                                && !m.mean_x.is_empty()
-                                && !m.mean_y.is_empty()
-                        })
-                    })
-                    .cloned()
+                    .filter(|o| o.modes.iter().any(|m| m.weight.is_finite() && m.weight > 0.0 && !m.mean_x.is_empty() && !m.mean_y.is_empty()))
                     .collect()
             })
             .unwrap_or_default();
         let has_grid = world.is_some_and(|w| w.grid.is_some());
         if obstacles.is_empty() && !has_grid {
-            return self.mppi.step_with(
-                state,
-                goal,
-                constraints,
-                dt,
-                &|_, _, _, _| 0.0,
-                1.0,
-                "MCA tracking",
-                "mca_tracking",
-            );
+            return self.mppi.step_with(state, goal, constraints, dt, &|_, _, _, _| 0.0, &|_, _| (1.0, 0.0, 0.0), 1.0, "MCA tracking", "mca_tracking");
         }
 
-        let n = self.mca_config.horizon_steps.max(1);
-        let m = self.mca_config.num_mc_samples.max(1);
-        let samples = self.sample_obstacles(&obstacles, n, m);
-        let per_obstacle = m as f64;
-        let robot_r = robot_radius(constraints, self.mca_config.robot_radius_margin);
-        let soft = self.mca_config.weight_soft_risk;
-        let hard = self.mca_config.weight_hard_risk;
-        let threshold = self.mca_config.risk_threshold;
-        let obstacle_count = obstacles.len();
-
-        let collision_probability = |step: usize, x: f64, y: f64| -> f64 {
-            let bucket = &samples[step.min(n - 1)];
-            if bucket.is_empty() {
-                return 0.0;
-            }
-            let mut survive = 1.0;
-            for o in 0..obstacle_count {
-                let slice = &bucket[o * m..(o + 1) * m];
-                let hits = slice
-                    .iter()
-                    .filter(|(ox, oy, r)| (x - ox).hypot(y - oy) < r + robot_r)
-                    .count();
-                survive *= 1.0 - hits as f64 / per_obstacle;
-            }
-            1.0 - survive
+        let (n, step) = self.mppi.plan_for(constraints);
+        let (n, step) = (n.max(1), step.max(1e-3));
+        let cfg = &self.mca_config;
+        let margin = cfg.robot_radius_margin.max(0.0);
+        let bare = footprint_discs(constraints);
+        let discs: Vec<(f64, f64)> = bare.iter().map(|&(x, r)| (x, r + margin)).collect();
+        let modes: Vec<Vec<Vec<ModeAt>>> = (0..n)
+            .map(|i| obstacles.iter().map(|o| modes_at(o, (i + 1) as f64 * step, step).collect()).collect())
+            .collect();
+        let normals = &self.normals;
+        let near: Vec<Near> = modes.iter().map(|at| Near::new(at, &discs)).collect();
+        let probability_of = |i: usize, x: f64, y: f64, yaw: f64, grown: f64| -> f64 {
+            let i = i.min(n - 1);
+            let (s, c) = yaw.sin_cos();
+            let near = &near[i];
+            near.cells.within_sorted(x, y, near.reach, |j| near.owner[j], |found| {
+                let mut survive = 1.0;
+                for &k in found {
+                    let k = k as usize;
+                    let (mut p, mut total) = (0.0, 0.0);
+                    for m in &modes[i][k] {
+                        let hit = bare
+                            .iter()
+                            .map(|(dx, r)| hit_probability(m, x + c * dx, y + s * dx, *r, grown, normals))
+                            .fold(0.0_f64, f64::max);
+                        p += m.weight * hit;
+                        total += m.weight;
+                    }
+                    if total > 0.0 {
+                        survive *= 1.0 - p / total;
+                    }
+                }
+                1.0 - survive
+            })
         };
-        let checker = CollisionChecker::new(world, constraints, self.mca_config.robot_radius_margin);
-        let has_grid = world.is_some_and(|w| w.grid.is_some());
-        let extra = |step: usize, x: f64, y: f64, yaw: f64| -> f64 {
-            let mut p = collision_probability(step, x, y);
-            if has_grid && checker.clearance(step + 1, x, y, yaw) < 0.0 {
-                p = 1.0;
+        let checker = CollisionChecker::new(world, constraints, margin).with_step(step);
+        let (soft, hard, threshold) = (cfg.weight_soft_risk, cfg.weight_hard_risk, cfg.risk_threshold);
+        let extra = |i: usize, x: f64, y: f64, yaw: f64| -> f64 {
+            let mut p = probability_of(i, x, y, yaw, margin);
+            let mut p_hit = probability_of(i, x, y, yaw, 0.0);
+            if has_grid && checker.grid_clearance(x, y, yaw) < 0.0 {
+                (p, p_hit) = (1.0, 1.0);
             }
-            soft * p + if p > threshold { hard } else { 0.0 }
+            let urgency = (n - i.min(n)) as f64 / n as f64;
+            soft * p + if p_hit > threshold { hard * urgency } else { 0.0 }
         };
 
-        let risk = self
-            .mppi
-            .predicted_trajectory()
-            .iter()
-            .enumerate()
-            .skip(1)
-            .take(IMMINENT_STEPS)
-            .map(|(i, p)| collision_probability(i - 1, p.x, p.y))
-            .fold(0.0_f64, f64::max);
-        let ref_scale = (1.0 - self.mca_config.risk_slowdown_gain.max(0.0) * risk)
-            .clamp(self.mca_config.min_velocity_scale.clamp(0.0, 1.0), 1.0);
-
-        self.mppi.step_with(
-            state,
-            goal,
-            constraints,
-            dt,
-            &extra,
-            ref_scale,
-            "MCA tracking",
-            "mca_tracking",
-        )
+        let reach = discs.iter().map(|d| d.1).fold(0.0_f64, f64::max);
+        let speed = self.mppi.mppi_config.ref_velocity.min(constraints.max_linear_velocity);
+        let all: &[Obstacle] = world.map_or(&[], |w| &w.obstacles);
+        let (detoured, share) = self.mppi.avoidance(state, constraints, all, reach, n, step, speed);
+        let relax = detour_relax(&detoured, (speed * step).max(0.3));
+        self.mppi.step_with(state, goal, constraints, dt, &extra, &relax, share, "MCA tracking", "mca_tracking")
     }
 
     fn set_path(&mut self, path: Path) {
